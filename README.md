@@ -1,8 +1,20 @@
 # pmux
 
-A PowerShell-focused terminal multiplexer inspired by tmux, written in Rust for Windows.
+**A terminal multiplexer for Windows** — the tmux alternative you've been waiting for.
 
-> **Note:** pmux is designed specifically for Windows with PowerShell. It also installs as `tmux` so you can use familiar tmux commands!
+pmux brings tmux-style terminal multiplexing to Windows natively. No WSL, no Cygwin, no compromises. Built in Rust for Windows Terminal, PowerShell, and cmd.exe.
+
+> 💡 **Bonus:** pmux also installs as `tmux`, so you can use your muscle memory!
+
+## Why pmux?
+
+If you've used tmux on Linux/macOS and wished you had something similar on Windows — this is it.
+
+- **Windows-native** — Built specifically for Windows 10/11
+- **Works everywhere** — Windows Terminal, PowerShell, cmd.exe, ConEmu, etc.
+- **No dependencies** — Single binary, just works
+- **tmux-compatible** — Same commands, same keybindings, zero learning curve
+- **Use as `tmux`** — Installs both `pmux` and `tmux` commands
 
 ## Features
 
@@ -12,22 +24,21 @@ A PowerShell-focused terminal multiplexer inspired by tmux, written in Rust for 
 - Mouse support for resizing panes
 - Copy mode with vim-like keybindings
 - Synchronized input to multiple panes
-- **tmux alias included** - use `tmux` or `pmux` interchangeably
 
 ## Requirements
 
-- Windows 10/11
-- PowerShell 5.1+ or PowerShell Core 7+
+- Windows 10 or Windows 11
+- PowerShell 5.1+, PowerShell Core 7+, or cmd.exe
 
 ## Installation
 
-### Using Cargo (Recommended)
+### Using Cargo
 
 ```powershell
 cargo install pmux
 ```
 
-This installs both `pmux` and `tmux` binaries, so you can use either command.
+This installs both `pmux` and `tmux` commands.
 
 ### Using Scoop
 
@@ -48,9 +59,9 @@ winget install marlocarlo.pmux
 choco install pmux
 ```
 
-### From Binary Release
+### From GitHub Releases
 
-Download the latest release from [GitHub Releases](https://github.com/marlocarlo/pmux/releases).
+Download the latest `.zip` from [GitHub Releases](https://github.com/marlocarlo/pmux/releases) and add to your PATH.
 
 ### From Source
 
@@ -62,36 +73,39 @@ cargo install --path .
 
 ## Usage
 
-You can use either `pmux` or `tmux` - they are identical:
+Use `pmux` or `tmux` — they're identical:
 
 ```powershell
 # Start a new session
 pmux
-# or
 tmux
 
 # Start a named session
-pmux new-session -s mysession
-tmux new-session -s mysession
+pmux new-session -s work
+tmux new-session -s work
 
 # List sessions
 pmux ls
 tmux ls
 
 # Attach to a session
-pmux attach -t mysession
-tmux attach -t mysession
+pmux attach -t work
+tmux attach -t work
+
+# Show help
+pmux --help
+tmux --help
 ```
 
 ## Key Bindings
 
-The default prefix key is `Ctrl+b` (like tmux).
+Default prefix: `Ctrl+b` (same as tmux)
 
 | Key | Action |
 |-----|--------|
 | `Prefix + c` | Create new window |
-| `Prefix + %` | Split pane left/right (horizontal) |
-| `Prefix + "` | Split pane top/bottom (vertical) |
+| `Prefix + %` | Split pane left/right |
+| `Prefix + "` | Split pane top/bottom |
 | `Prefix + x` | Kill current pane |
 | `Prefix + z` | Toggle pane zoom |
 | `Prefix + n` | Next window |
@@ -104,11 +118,11 @@ The default prefix key is `Ctrl+b` (like tmux).
 | `Prefix + ]` | Paste from buffer |
 | `Prefix + q` | Display pane numbers |
 | `Prefix + Arrow` | Navigate between panes |
-| `Ctrl+q` | Quit pmux |
+| `Ctrl+q` | Quit |
 
 ## Configuration
 
-Create a config file at `~/.pmux.conf`:
+Create `~/.pmux.conf`:
 
 ```
 # Change prefix key to Ctrl+a
@@ -125,13 +139,6 @@ set -g status-right "%H:%M"
 set -g cursor-style bar
 set -g cursor-blink on
 ```
-
-## Why pmux?
-
-- **Native Windows support** - No WSL or Cygwin required
-- **PowerShell integration** - Works seamlessly with PowerShell
-- **tmux compatibility** - Use the same commands you already know
-- **Lightweight** - Single binary, no dependencies
 
 ## License
 

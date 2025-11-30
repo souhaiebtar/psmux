@@ -111,7 +111,7 @@ fn get_program_name() -> String {
 
 fn print_help() {
     let prog = get_program_name();
-    println!(r#"{prog} - PowerShell Terminal Multiplexer for Windows
+    println!(r#"{prog} - Terminal multiplexer for Windows (tmux alternative)
 
 USAGE:
     {prog} [COMMAND] [OPTIONS]
@@ -161,9 +161,8 @@ ENVIRONMENT VARIABLES:
     PMUX_CURSOR_BLINK       Cursor blinking (true/false)
 
 CONFIG FILES:
-    ~/.pmux.conf            Main configuration file
-    ~/.pmuxrc               Alternative configuration file
-    ~/.pmux/pmuxrc          Session directory configuration
+    %USERPROFILE%\.pmux.conf     Main configuration file
+    %USERPROFILE%\.pmuxrc        Alternative configuration file
 
 EXAMPLES:
     {prog}                          Start or attach to default session
@@ -172,7 +171,9 @@ EXAMPLES:
     {prog} ls                       List all sessions
     {prog} split-window -h          Split current pane horizontally
 
-For more information, visit: https://github.com/marlocarlo/pmux
+NOTE: pmux installs as both 'pmux' and 'tmux' commands - use whichever you prefer!
+
+For more information: https://github.com/marlocarlo/pmux
 "#, prog = prog);
 }
 
