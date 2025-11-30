@@ -32,26 +32,13 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 
 ## Installation
 
-### Using Cargo
+### Using Cargo (Recommended)
 
 ```powershell
 cargo install pmux
 ```
 
 After installation, both `pmux` and `tmux` commands are available.
-
-### Using Scoop
-
-```powershell
-scoop bucket add extras
-scoop install pmux
-```
-
-### Using Winget
-
-```powershell
-winget install marlocarlo.pmux
-```
 
 ### Using Chocolatey
 
