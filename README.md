@@ -35,6 +35,7 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 - Session management (attach/detach)
 - Mouse support for resizing panes
 - Copy mode with vim-like keybindings
+- **Scrollback history** (1000 lines per pane)
 - Synchronized input to multiple panes
 
 ## Requirements
@@ -125,11 +126,35 @@ Default prefix: `Ctrl+b` (same as tmux)
 | `Prefix + d` | Detach from session |
 | `Prefix + ,` | Rename current window |
 | `Prefix + w` | Window/pane chooser |
-| `Prefix + [` | Enter copy mode |
+| `Prefix + [` | Enter copy/scroll mode |
+| `Prefix + {` | Enter copy/scroll mode (alternate) |
 | `Prefix + ]` | Paste from buffer |
 | `Prefix + q` | Display pane numbers |
 | `Prefix + Arrow` | Navigate between panes |
 | `Ctrl+q` | Quit |
+
+### Copy/Scroll Mode
+
+Enter copy mode with `Prefix + [` or `Prefix + {` to scroll through terminal history:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `k` | Scroll up 1 line |
+| `↓` / `j` | Scroll down 1 line |
+| `PageUp` / `b` | Scroll up 10 lines |
+| `PageDown` / `f` | Scroll down 10 lines |
+| `g` | Jump to top of scrollback |
+| `G` | Jump to bottom |
+| `←` / `h` | Move cursor left |
+| `→` / `l` | Move cursor right |
+| `v` | Start selection |
+| `y` | Yank (copy) selection |
+| `Esc` / `q` | Exit copy mode |
+
+When in copy mode:
+- The pane border turns **yellow** 
+- `[copy mode]` appears in the title
+- A scroll position indicator shows in the top-right corner
 
 ## Scripting & Automation
 

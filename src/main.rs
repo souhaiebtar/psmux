@@ -115,7 +115,7 @@ enum Mode {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum FocusDir { Left, Right, Up, Down }
 
 struct AppState {
@@ -132,6 +132,7 @@ struct AppState {
     status_right: String,
     copy_anchor: Option<(u16,u16)>,
     copy_pos: Option<(u16,u16)>,
+    copy_scroll_offset: usize,
     display_map: Vec<(usize, Vec<usize>)>,
     binds: Vec<Bind>,
     control_rx: Option<mpsc::Receiver<CtrlReq>>,
@@ -328,8 +329,43 @@ fn print_commands() {
 "#);
 }
 
+/// Clean up any stale port files (where server is not actually running)
+fn cleanup_stale_port_files() {
+    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let psmux_dir = format!("{}\\.psmux", home);
+    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "port").unwrap_or(false) {
+                if let Ok(port_str) = std::fs::read_to_string(&path) {
+                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                        let addr = format!("127.0.0.1:{}", port);
+                        // Quick check if server is alive
+                        if std::net::TcpStream::connect_timeout(
+                            &addr.parse().unwrap(),
+                            Duration::from_millis(50)
+                        ).is_err() {
+                            // Server not responding - remove stale port file
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    } else {
+                        // Invalid port file content
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
+    
+    // Clean up any stale port files at startup
+    cleanup_stale_port_files();
     
     // Parse -t flag early to set target session for all commands
     if let Some(pos) = args.iter().position(|a| a == "-t") {
@@ -453,12 +489,28 @@ fn main() -> io::Result<()> {
                 let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
                 let detached = args.iter().any(|a| a == "-d");
                 
-                // Check if session already exists
+                // Check if session already exists AND is actually running
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let port_path = format!("{}\\.psmux\\{}.port", home, name);
                 if std::path::Path::new(&port_path).exists() {
-                    eprintln!("psmux: session '{}' already exists", name);
-                    return Ok(());
+                    // Verify server is actually running
+                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                            let addr = format!("127.0.0.1:{}", port);
+                            std::net::TcpStream::connect_timeout(
+                                &addr.parse().unwrap(),
+                                Duration::from_millis(100)
+                            ).is_ok()
+                        } else { false }
+                    } else { false };
+                    
+                    if server_alive {
+                        eprintln!("psmux: session '{}' already exists", name);
+                        return Ok(());
+                    } else {
+                        // Stale port file - remove it and continue
+                        let _ = std::fs::remove_file(&port_path);
+                    }
                 }
                 
                 // Always spawn a background server first
@@ -693,10 +745,19 @@ fn main() -> io::Result<()> {
                     }
                     i += 1;
                 }
+                let session_name = target.clone().unwrap_or_else(|| {
+                    env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string())
+                });
                 if let Some(t) = target {
                     env::set_var("PSMUX_TARGET_SESSION", &t);
                 }
-                send_control("kill-session\n".to_string())?;
+                // Try to send kill command to server
+                if send_control("kill-session\n".to_string()).is_err() {
+                    // Server not responding - clean up stale port file
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
+                    let _ = std::fs::remove_file(&port_path);
+                }
                 return Ok(());
             }
             // has-session - Check if session exists (for scripting)
@@ -723,8 +784,11 @@ fn main() -> io::Result<()> {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect(addr).is_ok() {
+                        if std::net::TcpStream::connect(&addr).is_ok() {
                             std::process::exit(0);
+                        } else {
+                            // Stale port file - clean it up
+                            let _ = std::fs::remove_file(&path);
                         }
                     }
                 }
@@ -1777,7 +1841,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
             let _ = std::io::Write::write_all(&mut s, b"dump-layout\n");
             let mut buf = String::new();
             if std::io::Read::read_to_string(&mut s, &mut buf).is_ok() && !buf.is_empty() {
-                serde_json::from_str(&buf).unwrap_or(LayoutJson::Leaf { id: 0, rows: 0, cols: 0, cursor_row: 0, cursor_col: 0, content: Vec::new() })
+                serde_json::from_str(&buf).unwrap_or(LayoutJson::Leaf { id: 0, rows: 0, cols: 0, cursor_row: 0, cursor_col: 0, active: true, copy_mode: false, scroll_offset: 0, content: Vec::new() })
             } else {
                 // Server closed connection or sent no data - exit
                 break;
@@ -1811,8 +1875,15 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
 
             fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect) {
                 match node {
-                    LayoutJson::Leaf { id: _, rows: _, cols: _, cursor_row, cursor_col, content } => {
-                        let pane_block = Block::default().borders(Borders::ALL);
+                    LayoutJson::Leaf { id: _, rows: _, cols: _, cursor_row, cursor_col, active, copy_mode, scroll_offset, content } => {
+                        // Active pane gets a highlighted border, copy mode gets yellow border
+                        let pane_block = if *copy_mode && *active {
+                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("[copy mode]")
+                        } else if *active {
+                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green))
+                        } else {
+                            Block::default().borders(Borders::ALL)
+                        };
                         let inner = pane_block.inner(area);
                         let mut lines: Vec<Line> = Vec::new();
                         for r in 0..inner.height.min(content.len() as u16) {
@@ -1835,9 +1906,25 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         f.render_widget(Clear, inner);
                         let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
                         f.render_widget(para, inner);
-                        let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
-                        let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
-                        f.set_cursor(cx, cy);
+                        
+                        // Show scroll position indicator in top-right when in copy mode
+                        if *copy_mode && *active && *scroll_offset > 0 {
+                            let indicator = format!("[{}/{}]", scroll_offset, scroll_offset);
+                            let indicator_width = indicator.len() as u16;
+                            if area.width > indicator_width + 2 {
+                                let indicator_x = area.x + area.width - indicator_width - 1;
+                                let indicator_area = Rect::new(indicator_x, area.y, indicator_width, 1);
+                                let indicator_span = Span::styled(indicator, Style::default().fg(Color::Black).bg(Color::Yellow));
+                                f.render_widget(Paragraph::new(Line::from(indicator_span)), indicator_area);
+                            }
+                        }
+                        
+                        // Only set cursor for the active pane (and not in copy mode for cleaner view)
+                        if *active && !*copy_mode {
+                            let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
+                            let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
+                            f.set_cursor(cx, cy);
+                        }
                     }
                     LayoutJson::Split { kind, sizes, children } => {
                         let constraints: Vec<Constraint> = if sizes.len() == children.len() { sizes.iter().map(|p| Constraint::Percentage(*p)).collect() } else { vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()] };
@@ -1941,9 +2028,15 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::Char('"') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -v\n"); } }
                         KeyCode::Char('x') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-pane\n"); } }
                         KeyCode::Char('z') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"zoom-pane\n"); } }
-                        KeyCode::Char('[') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"copy-enter\n"); } }
+                        KeyCode::Char('[') | KeyCode::Char('{') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"copy-enter\n"); } }
                         KeyCode::Char('n') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"next-window\n"); } }
                         KeyCode::Char('p') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"previous-window\n"); } }
+                        KeyCode::Char('o') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -t :.+\n"); } }
+                        // Arrow keys to switch panes
+                        KeyCode::Up => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -U\n"); } }
+                        KeyCode::Down => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -D\n"); } }
+                        KeyCode::Left => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -L\n"); } }
+                        KeyCode::Right => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -R\n"); } }
                         KeyCode::Char('d') => { quit = true; } // Detach
                         KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
                         KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
@@ -2016,10 +2109,6 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                             }
                         }
                         KeyCode::Char('q') => { chooser = true; }
-                        KeyCode::Left => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-move -1 0\n"); } }
-                        KeyCode::Right => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-move 1 0\n"); } }
-                        KeyCode::Up => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-move 0 -1\n"); } }
-                        KeyCode::Down => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-move 0 1\n"); } }
                         KeyCode::Char('v') => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-anchor\n"); } }
                         KeyCode::Char('y') => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-yank\n"); } }
                         _ => {}
@@ -2064,6 +2153,12 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                             if let Some((_,pid)) = choices.iter().find(|(n,_)| *n==choice) { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("focus-pane {}\n", pid).as_bytes()); } chooser=false; }
                         }
                         KeyCode::Esc if chooser => { chooser=false; }
+                        KeyCode::Char(' ') => {
+                            // Space needs special handling - send as key not text
+                            if let Some(mut s) = try_connect() {
+                                let _ = std::io::Write::write_all(&mut s, b"send-key space\n");
+                            }
+                        }
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if let Some(mut s) = try_connect() {
                                 let _ = std::io::Write::write_all(&mut s, format!("send-text {}\n", c).as_bytes());
@@ -2077,6 +2172,8 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::Right => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key right\n"); } }
                         KeyCode::Up => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key up\n"); } }
                         KeyCode::Down => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key down\n"); } }
+                        KeyCode::PageUp => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pageup\n"); } }
+                        KeyCode::PageDown => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pagedown\n"); } }
                         _ => {}
                     }
                 }
@@ -2154,6 +2251,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         status_right: "%H:%M".to_string(),
         copy_anchor: None,
         copy_pos: None,
+        copy_scroll_offset: 0,
         display_map: Vec::new(),
         binds: Vec::new(),
         control_rx: None,
@@ -2458,9 +2556,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 CtrlReq::NewWindow => {
                     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, &mut app)?;
+                    resize_all_panes(&mut app);
                 }
-                CtrlReq::SplitWindow(k) => { let _ = split_active(&mut app, k); }
-                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); }
+                CtrlReq::SplitWindow(k) => { let _ = split_active(&mut app, k); resize_all_panes(&mut app); }
+                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
@@ -2495,7 +2594,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => { app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; }
+                CtrlReq::ClientSize(w, h) => { 
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
+                    resize_all_panes(&mut app);
+                }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
@@ -2543,7 +2645,7 @@ fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState) -
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
 
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair
         .master
@@ -2704,13 +2806,29 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         }
         Mode::CopyMode => {
             match key.code {
-                KeyCode::Esc | KeyCode::Char(']') => { app.mode = Mode::Passthrough; app.copy_anchor = None; app.copy_pos = None; }
-                KeyCode::Left => { move_copy_cursor(app, -1, 0); }
-                KeyCode::Right => { move_copy_cursor(app, 1, 0); }
-                KeyCode::Up => { move_copy_cursor(app, 0, -1); }
-                KeyCode::Down => { move_copy_cursor(app, 0, 1); }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
+                    app.mode = Mode::Passthrough; 
+                    app.copy_anchor = None; 
+                    app.copy_pos = None; 
+                    app.copy_scroll_offset = 0;
+                    // Reset scrollback view
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut parser) = p.term.lock() {
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => { move_copy_cursor(app, -1, 0); }
+                KeyCode::Right | KeyCode::Char('l') => { move_copy_cursor(app, 1, 0); }
+                KeyCode::Up | KeyCode::Char('k') => { scroll_copy_up(app, 1); }
+                KeyCode::Down | KeyCode::Char('j') => { scroll_copy_down(app, 1); }
+                KeyCode::PageUp | KeyCode::Char('b') => { scroll_copy_up(app, 10); }
+                KeyCode::PageDown | KeyCode::Char('f') => { scroll_copy_down(app, 10); }
+                KeyCode::Char('g') => { scroll_to_top(app); }
+                KeyCode::Char('G') => { scroll_to_bottom(app); }
                 KeyCode::Char('v') => { if let Some((r,c)) = current_prompt_pos(app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
-                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; }
+                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
                 _ => {}
             }
             Ok(false)
@@ -2908,7 +3026,7 @@ fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = detect_shell();
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     thread::spawn(move || {
@@ -3346,7 +3464,10 @@ fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
     render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area);
 }
 
-fn enter_copy_mode(app: &mut AppState) { app.mode = Mode::CopyMode; }
+fn enter_copy_mode(app: &mut AppState) { 
+    app.mode = Mode::CopyMode; 
+    app.copy_scroll_offset = 0;
+}
 
 fn cycle_top_layout(app: &mut AppState) {
     let win = &mut app.windows[app.active_idx];
@@ -3525,6 +3646,56 @@ fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>) {
     }
     let mut path = Vec::new();
     rec(node, area, &mut path, out);
+}
+
+/// Resize all panes in the current window to match their computed areas
+fn resize_all_panes(app: &mut AppState) {
+    if app.windows.is_empty() { return; }
+    let area = app.last_window_area;
+    if area.width == 0 || area.height == 0 { return; }
+    
+    // Compute rects for all panes
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, area, &mut rects);
+    
+    // Now resize each pane to match its computed area
+    fn resize_node(node: &mut Node, rects: &[(Vec<usize>, Rect)], path: &mut Vec<usize>) {
+        match node {
+            Node::Leaf(pane) => {
+                // Find our rect
+                if let Some((_, rect)) = rects.iter().find(|(p, _)| p == path) {
+                    // Account for borders (1 pixel each side)
+                    let inner_height = rect.height.saturating_sub(2).max(1);
+                    let inner_width = rect.width.saturating_sub(2).max(1);
+                    
+                    if pane.last_rows != inner_height || pane.last_cols != inner_width {
+                        let _ = pane.master.resize(PtySize { 
+                            rows: inner_height, 
+                            cols: inner_width, 
+                            pixel_width: 0, 
+                            pixel_height: 0 
+                        });
+                        if let Ok(mut parser) = pane.term.lock() {
+                            parser.screen_mut().set_size(inner_height, inner_width);
+                        }
+                        pane.last_rows = inner_height;
+                        pane.last_cols = inner_width;
+                    }
+                }
+            }
+            Node::Split { children, .. } => {
+                for (i, child) in children.iter_mut().enumerate() {
+                    path.push(i);
+                    resize_node(child, rects, path);
+                    path.pop();
+                }
+            }
+        }
+    }
+    
+    let mut path = Vec::new();
+    resize_node(&mut win.root, &rects, &mut path);
 }
 
 fn kill_all_children(node: &mut Node) {
@@ -4219,6 +4390,43 @@ fn move_copy_cursor(app: &mut AppState, dx: i16, dy: i16) {
     app.copy_pos = Some((nr,nc));
 }
 
+fn scroll_copy_up(app: &mut AppState, lines: usize) {
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    let current = parser.screen().scrollback();
+    let new_offset = current.saturating_add(lines);
+    parser.screen_mut().set_scrollback(new_offset);
+    app.copy_scroll_offset = parser.screen().scrollback();
+}
+
+fn scroll_copy_down(app: &mut AppState, lines: usize) {
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    let current = parser.screen().scrollback();
+    let new_offset = current.saturating_sub(lines);
+    parser.screen_mut().set_scrollback(new_offset);
+    app.copy_scroll_offset = parser.screen().scrollback();
+}
+
+fn scroll_to_top(app: &mut AppState) {
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    // Set to a very large number - vt100 will clamp to actual scrollback size
+    parser.screen_mut().set_scrollback(usize::MAX);
+    app.copy_scroll_offset = parser.screen().scrollback();
+}
+
+fn scroll_to_bottom(app: &mut AppState) {
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    parser.screen_mut().set_scrollback(0);
+    app.copy_scroll_offset = 0;
+}
+
 fn yank_selection(app: &mut AppState) -> io::Result<()> {
     let (anchor, pos) = match (app.copy_anchor, app.copy_pos) { (Some(a), Some(p)) => (a,p), _ => return Ok(()) };
     let win = &mut app.windows[app.active_idx];
@@ -4442,13 +4650,15 @@ fn run_server(session_name: String) -> io::Result<()> {
         escape_time_ms: 500,
         prefix_key: (KeyCode::Char('b'), KeyModifiers::CONTROL),
         drag: None,
-        last_window_area: Rect { x: 0, y: 0, width: 0, height: 0 },
+        // Use a reasonable default size so pane switching works even when detached
+        last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
         mouse_enabled: true,
         paste_buffers: Vec::new(),
         status_left: "psmux:#I".to_string(),
         status_right: "%H:%M".to_string(),
         copy_anchor: None,
         copy_pos: None,
+        copy_scroll_offset: 0,
         display_map: Vec::new(),
         binds: Vec::new(),
         control_rx: None,
@@ -4881,9 +5091,9 @@ fn run_server(session_name: String) -> io::Result<()> {
     loop {
         while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             match req {
-                CtrlReq::NewWindow => { let _ = create_window(&*pty_system, &mut app); }
-                CtrlReq::SplitWindow(k) => { let _ = split_active(&mut app, k); }
-                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); }
+                CtrlReq::NewWindow => { let _ = create_window(&*pty_system, &mut app); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k) => { let _ = split_active(&mut app, k); resize_all_panes(&mut app); }
+                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
@@ -4918,7 +5128,10 @@ fn run_server(session_name: String) -> io::Result<()> {
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => { app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; }
+                CtrlReq::ClientSize(w, h) => { 
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
+                    resize_all_panes(&mut app);
+                }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
@@ -5562,10 +5775,13 @@ enum LayoutJson {
     #[serde(rename = "split")]
     Split { kind: String, sizes: Vec<u16>, children: Vec<LayoutJson> },
     #[serde(rename = "leaf")]
-    Leaf { id: usize, rows: u16, cols: u16, cursor_row: u16, cursor_col: u16, content: Vec<Vec<CellJson>> },
+    Leaf { id: usize, rows: u16, cols: u16, cursor_row: u16, cursor_col: u16, active: bool, copy_mode: bool, scroll_offset: usize, content: Vec<Vec<CellJson>> },
 }
 
 fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
+    let in_copy_mode = matches!(app.mode, Mode::CopyMode);
+    let scroll_offset = app.copy_scroll_offset;
+    
     fn build(node: &mut Node) -> LayoutJson {
         match node {
             Node::Split { kind, sizes, children } => {
@@ -5594,12 +5810,33 @@ fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     }
                     lines.push(row);
                 }
-                LayoutJson::Leaf { id: p.id, rows: p.last_rows, cols: p.last_cols, cursor_row: cr, cursor_col: cc, content: lines }
+                LayoutJson::Leaf { id: p.id, rows: p.last_rows, cols: p.last_cols, cursor_row: cr, cursor_col: cc, active: false, copy_mode: false, scroll_offset: 0, content: lines }
             }
         }
     }
     let win = &mut app.windows[app.active_idx];
-    let root = build(&mut win.root);
+    let mut root = build(&mut win.root);
+    // Mark the active pane and set copy mode info
+    fn mark_active(node: &mut LayoutJson, path: &[usize], idx: usize, in_copy_mode: bool, scroll_offset: usize) {
+        match node {
+            LayoutJson::Leaf { active, copy_mode, scroll_offset: so, .. } => {
+                let is_active = idx >= path.len();
+                *active = is_active;
+                if is_active {
+                    *copy_mode = in_copy_mode;
+                    *so = scroll_offset;
+                }
+            }
+            LayoutJson::Split { children, .. } => {
+                if idx < path.len() {
+                    if let Some(child) = children.get_mut(path[idx]) {
+                        mark_active(child, path, idx + 1, in_copy_mode, scroll_offset);
+                    }
+                }
+            }
+        }
+    }
+    mark_active(&mut root, &win.active_path, 0, in_copy_mode, scroll_offset);
     let s = serde_json::to_string(&root).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }
@@ -5717,6 +5954,33 @@ fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
 }
 
 fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
+    // If in copy mode, handle scroll/navigation keys specially
+    if matches!(app.mode, Mode::CopyMode) {
+        match k {
+            "esc" | "q" => {
+                app.mode = Mode::Passthrough;
+                app.copy_anchor = None;
+                app.copy_pos = None;
+                app.copy_scroll_offset = 0;
+                // Reset scrollback view
+                let win = &mut app.windows[app.active_idx];
+                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                    if let Ok(mut parser) = p.term.lock() {
+                        parser.screen_mut().set_scrollback(0);
+                    }
+                }
+            }
+            "up" => { scroll_copy_up(app, 1); }
+            "down" => { scroll_copy_down(app, 1); }
+            "pageup" => { scroll_copy_up(app, 10); }
+            "pagedown" => { scroll_copy_down(app, 10); }
+            "left" => { move_copy_cursor(app, -1, 0); }
+            "right" => { move_copy_cursor(app, 1, 0); }
+            _ => {}
+        }
+        return Ok(());
+    }
+    
     let win = &mut app.windows[app.active_idx];
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
         match k {
@@ -5728,6 +5992,9 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "right" => { let _ = write!(p.master, "\x1b[C"); }
             "up" => { let _ = write!(p.master, "\x1b[A"); }
             "down" => { let _ = write!(p.master, "\x1b[B"); }
+            "pageup" => { let _ = write!(p.master, "\x1b[5~"); }
+            "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
+            "space" => { let _ = write!(p.master, " "); }
             _ => {}
         }
     }
@@ -6014,7 +6281,7 @@ fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = detect_shell();
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
