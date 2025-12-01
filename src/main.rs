@@ -33,7 +33,7 @@ struct Pane {
     title: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum LayoutKind { Horizontal, Vertical }
 
 enum Node {
@@ -185,24 +185,40 @@ fn print_version() {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     
-    // Handle help and version flags first
-    if args.len() > 1 {
-        match args[1].as_str() {
-            "-h" | "--help" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "-V" | "--version" | "version" => {
-                print_version();
-                return Ok(());
-            }
-            _ => {}
+    // Parse -t flag early to set target session for all commands
+    if let Some(pos) = args.iter().position(|a| a == "-t") {
+        if let Some(target) = args.get(pos + 1) {
+            env::set_var("PSMUX_TARGET_SESSION", target);
         }
     }
     
-    if args.len() > 1 {
-        match args[1].as_str() {
-            "ls" | "list-sessions" => {
+    // Find the actual command by skipping -t and its argument
+    let cmd_args: Vec<&String> = args.iter().skip(1).filter(|a| {
+        if *a == "-t" { return false; }
+        // Check if previous arg was -t
+        if let Some(pos) = args.iter().position(|x| x == *a) {
+            if pos > 0 && args[pos - 1] == "-t" { return false; }
+        }
+        true
+    }).collect();
+    
+    let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+    
+    // Handle help and version flags first
+    match cmd {
+        "-h" | "--help" | "help" => {
+            print_help();
+            return Ok(());
+        }
+        "-V" | "--version" | "version" => {
+            print_version();
+            return Ok(());
+        }
+        _ => {}
+    }
+    
+    match cmd {
+        "ls" | "list-sessions" => {
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let dir = format!("{}\\.psmux", home);
                 if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -213,13 +229,20 @@ fn main() -> io::Result<()> {
                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                         if let Ok(_p) = port_str.trim().parse::<u16>() {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                                                &addr.parse().unwrap(),
+                                                Duration::from_millis(500)
+                                            ) {
+                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
                                                 let _ = std::io::Write::write_all(&mut s, b"session-info\n");
                                                 let mut br = std::io::BufReader::new(s);
                                                 let mut line = String::new();
                                                 let _ = br.read_line(&mut line);
                                                 if !line.trim().is_empty() { println!("{}", line.trim_end()); } else { println!("{}", base); }
-                                            } else { /* stale: skip */ }
+                                            } else {
+                                                // stale port file - remove it
+                                                let _ = std::fs::remove_file(e.path());
+                                            }
                                         }
                                     }
                                 }
@@ -261,11 +284,628 @@ fn main() -> io::Result<()> {
             }
             "kill-pane" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
             "capture-pane" => {
-                let resp = send_control_with_response("capture-pane\n".to_string())?; print!("{}", resp); return Ok(());
+                // Parse optional flags - cmd_args[0] is command, start from 1
+                let mut cmd = "capture-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(target) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", target));
+                                i += 1;
+                            }
+                        }
+                        "-S" => {
+                            if let Some(start) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -S {}", start));
+                                i += 1;
+                            }
+                        }
+                        "-E" => {
+                            if let Some(end) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -E {}", end));
+                                i += 1;
+                            }
+                        }
+                        "-p" => { cmd.push_str(" -p"); }
+                        "-e" => { cmd.push_str(" -e"); }
+                        "-J" => { cmd.push_str(" -J"); }
+                        "-b" => {
+                            if let Some(buf) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -b {}", buf));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // send-keys - Send keys to a pane (critical for scripting)
+            "send-keys" | "send" => {
+                let mut literal = false;
+                let mut keys: Vec<String> = Vec::new();
+                // Skip the command itself (index 0 in cmd_args), start at index 1
+                for i in 1..cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-l" => { literal = true; }
+                        "-R" => { keys.push("__RESET__".to_string()); }
+                        "-t" => { } // already handled
+                        _ => { keys.push(cmd_args[i].to_string()); }
+                    }
+                }
+                let mut cmd = "send-keys".to_string();
+                if literal { cmd.push_str(" -l"); }
+                for k in keys { cmd.push_str(&format!(" {}", k)); }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // select-pane - Select the active pane
+            "select-pane" | "selectp" => {
+                let mut cmd = "select-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-D" => { cmd.push_str(" -D"); }
+                        "-U" => { cmd.push_str(" -U"); }
+                        "-L" => { cmd.push_str(" -L"); }
+                        "-R" => { cmd.push_str(" -R"); }
+                        "-l" => { cmd.push_str(" -l"); }
+                        "-Z" => { cmd.push_str(" -Z"); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // select-window - Select a window
+            "select-window" | "selectw" => {
+                let mut cmd = "select-window".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-l" => { cmd.push_str(" -l"); }
+                        "-n" => { cmd.push_str(" -n"); }
+                        "-p" => { cmd.push_str(" -p"); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // list-panes - List all panes
+            "list-panes" | "lsp" => {
+                let mut cmd = "list-panes".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-a" => { cmd.push_str(" -a"); }
+                        "-s" => { cmd.push_str(" -s"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // list-windows - List all windows
+            "list-windows" | "lsw" => {
+                let mut cmd = "list-windows".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-a" => { cmd.push_str(" -a"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // kill-window - Kill a window
+            "kill-window" | "killw" => {
+                let mut cmd = "kill-window".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-a" => { cmd.push_str(" -a"); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // kill-session - Kill a session
+            "kill-session" => {
+                let mut target: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                target = Some(t.to_string());
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if let Some(t) = target {
+                    env::set_var("PSMUX_TARGET_SESSION", &t);
+                }
+                send_control("kill-session\n".to_string())?;
+                return Ok(());
+            }
+            // has-session - Check if session exists (for scripting)
+            "has-session" | "has" => {
+                // Get target from env (set from -t flag) or from remaining args
+                let target = env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| {
+                    // Try to get from cmd_args if -t is in there (shouldn't be, but just in case)
+                    let mut t = "default".to_string();
+                    let mut i = 1;
+                    while i < cmd_args.len() {
+                        if cmd_args[i].as_str() == "-t" {
+                            if let Some(v) = cmd_args.get(i + 1) { t = v.to_string(); }
+                            i += 1;
+                        } else if !cmd_args[i].starts_with('-') {
+                            t = cmd_args[i].to_string();
+                            break;
+                        }
+                        i += 1;
+                    }
+                    t
+                });
+                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                let path = format!("{}\\.psmux\\{}.port", home, target);
+                if let Ok(port_str) = std::fs::read_to_string(&path) {
+                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                        let addr = format!("127.0.0.1:{}", port);
+                        if std::net::TcpStream::connect(addr).is_ok() {
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                std::process::exit(1);
+            }
+            // rename-session - Rename a session
+            "rename-session" | "rename" => {
+                let mut new_name: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    if !cmd_args[i].starts_with('-') {
+                        new_name = Some(cmd_args[i].to_string());
+                        break;
+                    }
+                    i += 1;
+                }
+                if let Some(name) = new_name {
+                    send_control(format!("rename-session {}\n", name))?;
+                }
+                return Ok(());
+            }
+            // swap-pane - Swap panes
+            "swap-pane" | "swapp" => {
+                let mut cmd = "swap-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-D" => { cmd.push_str(" -D"); }
+                        "-U" => { cmd.push_str(" -U"); }
+                        "-d" => { cmd.push_str(" -d"); }
+                        "-s" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -s {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // resize-pane - Resize a pane
+            "resize-pane" | "resizep" => {
+                let mut cmd = "resize-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-D" => { cmd.push_str(" -D"); }
+                        "-U" => { cmd.push_str(" -U"); }
+                        "-L" => { cmd.push_str(" -L"); }
+                        "-R" => { cmd.push_str(" -R"); }
+                        "-Z" => { cmd.push_str(" -Z"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-x" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -x {}", v));
+                                i += 1;
+                            }
+                        }
+                        "-y" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -y {}", v));
+                                i += 1;
+                            }
+                        }
+                        s if s.parse::<i32>().is_ok() => {
+                            cmd.push_str(&format!(" {}", s));
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // paste-buffer - Paste buffer into pane
+            "paste-buffer" | "pasteb" => {
+                let mut cmd = "paste-buffer".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-b" => {
+                            if let Some(b) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -b {}", b));
+                                i += 1;
+                            }
+                        }
+                        "-d" => { cmd.push_str(" -d"); }
+                        "-p" => { cmd.push_str(" -p"); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // set-buffer - Set buffer contents
+            "set-buffer" | "setb" => {
+                let mut buffer_name: Option<String> = None;
+                let mut data: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-b" => {
+                            if let Some(b) = cmd_args.get(i + 1) {
+                                buffer_name = Some(b.to_string());
+                                i += 1;
+                            }
+                        }
+                        s if !s.starts_with('-') => {
+                            data = Some(s.to_string());
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let mut cmd = "set-buffer".to_string();
+                if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
+                if let Some(d) = data { cmd.push_str(&format!(" {}", d)); }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // list-buffers - List paste buffers
+            "list-buffers" | "lsb" => {
+                let resp = send_control_with_response("list-buffers\n".to_string())?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // show-buffer - Show buffer contents
+            "show-buffer" | "showb" => {
+                let mut buffer_name: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-b" => {
+                            if let Some(b) = cmd_args.get(i + 1) {
+                                buffer_name = Some(b.to_string());
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let mut cmd = "show-buffer".to_string();
+                if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // delete-buffer - Delete a paste buffer
+            "delete-buffer" | "deleteb" => {
+                let mut buffer_name: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-b" => {
+                            if let Some(b) = cmd_args.get(i + 1) {
+                                buffer_name = Some(b.to_string());
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let mut cmd = "delete-buffer".to_string();
+                if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // display-message - Display a message
+            "display-message" | "display" => {
+                let mut message: Vec<String> = Vec::new();
+                let mut target: Option<String> = None;
+                let mut print_to_stdout = false;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                target = Some(t.to_string());
+                                i += 1;
+                            }
+                        }
+                        "-p" => { print_to_stdout = true; }
+                        s => { message.push(s.to_string()); }
+                    }
+                    i += 1;
+                }
+                let msg = message.join(" ");
+                let mut cmd = "display-message".to_string();
+                if let Some(t) = target { cmd.push_str(&format!(" -t {}", t)); }
+                if print_to_stdout { cmd.push_str(" -p"); }
+                cmd.push_str(&format!(" {}", msg));
+                cmd.push('\n');
+                if print_to_stdout {
+                    let resp = send_control_with_response(cmd)?;
+                    print!("{}", resp);
+                } else {
+                    send_control(cmd)?;
+                }
+                return Ok(());
+            }
+            // run-shell - Run a shell command
+            "run-shell" | "run" => {
+                let mut cmd_to_run: Vec<String> = Vec::new();
+                let mut background = false;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-b" => { background = true; }
+                        s => { cmd_to_run.push(s.to_string()); }
+                    }
+                    i += 1;
+                }
+                let shell_cmd = cmd_to_run.join(" ");
+                // Run the command using the system shell
+                if background {
+                    #[cfg(windows)]
+                    {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/C", &shell_cmd])
+                            .spawn();
+                    }
+                } else {
+                    #[cfg(windows)]
+                    {
+                        let output = std::process::Command::new("cmd")
+                            .args(["/C", &shell_cmd])
+                            .output()?;
+                        io::stdout().write_all(&output.stdout)?;
+                        io::stderr().write_all(&output.stderr)?;
+                        std::process::exit(output.status.code().unwrap_or(0));
+                    }
+                }
+                return Ok(());
+            }
+            // respawn-pane - Restart the pane's process
+            "respawn-pane" | "respawnp" => {
+                let mut cmd = "respawn-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-k" => { cmd.push_str(" -k"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // last-window - Select last used window
+            "last-window" | "last" => {
+                send_control("last-window\n".to_string())?;
+                return Ok(());
+            }
+            // last-pane - Select last used pane
+            "last-pane" | "lastp" => {
+                send_control("last-pane\n".to_string())?;
+                return Ok(());
+            }
+            // next-window - Move to next window
+            "next-window" | "next" => {
+                send_control("next-window\n".to_string())?;
+                return Ok(());
+            }
+            // previous-window - Move to previous window
+            "previous-window" | "prev" => {
+                send_control("previous-window\n".to_string())?;
+                return Ok(());
+            }
+            // rotate-window - Rotate panes in window
+            "rotate-window" | "rotatew" => {
+                let mut cmd = "rotate-window".to_string();
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-D" => { cmd.push_str(" -D"); }
+                        "-U" => { cmd.push_str(" -U"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // display-panes - Show pane numbers
+            "display-panes" | "displayp" => {
+                send_control("display-panes\n".to_string())?;
+                return Ok(());
+            }
+            // break-pane - Break pane out to a new window
+            "break-pane" | "breakp" => {
+                let mut cmd = "break-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-d" => { cmd.push_str(" -d"); }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // join-pane - Join a pane to another window
+            "join-pane" | "joinp" => {
+                let mut cmd = "join-pane".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-h" => { cmd.push_str(" -h"); }
+                        "-v" => { cmd.push_str(" -v"); }
+                        "-d" => { cmd.push_str(" -d"); }
+                        "-s" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -s {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // rename-window - Rename current window
+            "rename-window" | "renamew" => {
+                // cmd_args[0] is the command, cmd_args[1] should be the new name
+                if let Some(name) = cmd_args.get(1) {
+                    if !name.starts_with('-') {
+                        send_control(format!("rename-window {}\n", name))?;
+                    }
+                }
+                return Ok(());
+            }
+            // zoom-pane - Toggle pane zoom
+            "zoom-pane" | "resizep -Z" => {
+                send_control("zoom-pane\n".to_string())?;
+                return Ok(());
             }
             _ => {}
         }
-    }
     if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1") {
         eprintln!("psmux: nested sessions are not allowed");
         return Ok(());
@@ -503,11 +1143,21 @@ fn send_control_with_response(line: String) -> io::Result<String> {
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
     let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(addr)?;
+    let mut stream = std::net::TcpStream::connect(&addr)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = write!(stream, "{}", line);
-    let mut buf = String::new();
-    let _ = std::io::Read::read_to_string(&mut stream, &mut buf);
-    Ok(buf)
+    let _ = stream.flush();
+    let mut buf = Vec::new();
+    let mut temp = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stream, &mut temp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
@@ -785,6 +1435,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { p.title = title; }
                 }
+                // For attach mode, we just ignore the new commands - they're handled by the server
+                _ => {}
             }
         }
 
@@ -1757,6 +2409,29 @@ enum CtrlReq {
     ListTree(mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
+    // New commands for tmux compatibility
+    SendKeys(String, bool),  // (keys, literal_flag)
+    SelectPane(String),      // direction: U/D/L/R or pane id
+    SelectWindow(usize),     // window index
+    ListPanes(mpsc::Sender<String>),
+    KillWindow,
+    KillSession,
+    HasSession(mpsc::Sender<bool>),
+    RenameSession(String),
+    SwapPane(String),        // direction: U/D/L/R
+    ResizePane(String, u16), // direction, amount
+    SetBuffer(String),       // paste buffer content
+    ListBuffers(mpsc::Sender<String>),
+    ShowBuffer(mpsc::Sender<String>),
+    DeleteBuffer,
+    DisplayMessage(mpsc::Sender<String>, String), // format string
+    LastWindow,
+    LastPane,
+    RotateWindow(bool),      // reverse flag
+    DisplayPanes,
+    BreakPane,
+    JoinPane(usize),         // target window
+    RespawnPane,
 }
 
 fn find_window_index_by_id(app: &AppState, wid: usize) -> Option<usize> {
@@ -1901,6 +2576,108 @@ fn run_server(session_name: String) -> io::Result<()> {
                     "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); } }
                     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
                     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
+                    // New tmux-compatible commands
+                    "send-keys" => {
+                        let literal = args.iter().any(|a| *a == "-l");
+                        let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
+                        let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                    }
+                    "select-pane" => {
+                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                            else if args.iter().any(|a| *a == "-D") { "D" }
+                            else if args.iter().any(|a| *a == "-L") { "L" }
+                            else if args.iter().any(|a| *a == "-R") { "R" }
+                            else { "" };
+                        let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
+                    }
+                    "select-window" => {
+                        if let Some(idx) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
+                            let _ = tx.send(CtrlReq::SelectWindow(idx));
+                        }
+                    }
+                    "list-panes" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ListPanes(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
+                    }
+                    "kill-window" => { let _ = tx.send(CtrlReq::KillWindow); }
+                    "kill-session" => { let _ = tx.send(CtrlReq::KillSession); }
+                    "has-session" => {
+                        let (rtx, rrx) = mpsc::channel::<bool>();
+                        let _ = tx.send(CtrlReq::HasSession(rtx));
+                        if let Ok(exists) = rrx.recv() {
+                            if !exists { std::process::exit(1); }
+                        }
+                    }
+                    "rename-session" => {
+                        if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+                            let _ = tx.send(CtrlReq::RenameSession((*name).to_string()));
+                        }
+                    }
+                    "swap-pane" => {
+                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                            else if args.iter().any(|a| *a == "-D") { "D" }
+                            else { "D" };
+                        let _ = tx.send(CtrlReq::SwapPane(dir.to_string()));
+                    }
+                    "resize-pane" => {
+                        let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
+                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                            else if args.iter().any(|a| *a == "-D") { "D" }
+                            else if args.iter().any(|a| *a == "-L") { "L" }
+                            else if args.iter().any(|a| *a == "-R") { "R" }
+                            else { "D" };
+                        let _ = tx.send(CtrlReq::ResizePane(dir.to_string(), amount));
+                    }
+                    "set-buffer" => {
+                        let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                        let _ = tx.send(CtrlReq::SetBuffer(content));
+                    }
+                    "paste-buffer" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                        if let Ok(text) = rrx.recv() {
+                            let _ = tx.send(CtrlReq::SendText(text));
+                        }
+                    }
+                    "list-buffers" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ListBuffers(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
+                    }
+                    "show-buffer" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
+                    }
+                    "delete-buffer" => { let _ = tx.send(CtrlReq::DeleteBuffer); }
+                    "display-message" => {
+                        let fmt = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt));
+                        if let Ok(text) = rrx.recv() { let _ = writeln!(stream, "{}", text); }
+                    }
+                    "last-window" => { let _ = tx.send(CtrlReq::LastWindow); }
+                    "last-pane" => { let _ = tx.send(CtrlReq::LastPane); }
+                    "rotate-window" => {
+                        let reverse = args.iter().any(|a| *a == "-D");
+                        let _ = tx.send(CtrlReq::RotateWindow(reverse));
+                    }
+                    "display-panes" => { let _ = tx.send(CtrlReq::DisplayPanes); }
+                    "break-pane" => { let _ = tx.send(CtrlReq::BreakPane); }
+                    "join-pane" => {
+                        if let Some(wid) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
+                            let _ = tx.send(CtrlReq::JoinPane(wid));
+                        }
+                    }
+                    "respawn-pane" => { let _ = tx.send(CtrlReq::RespawnPane); }
+                    "session-info" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                        if let Ok(line) = rrx.recv() { let _ = write!(stream, "{}", line); let _ = stream.flush(); }
+                    }
+                    "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); let _ = write!(stream, "ok\n"); }
+                    "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); let _ = write!(stream, "ok\n"); }
                     _ => {}
                 }
             }
@@ -1963,6 +2740,219 @@ fn run_server(session_name: String) -> io::Result<()> {
                 CtrlReq::SetPaneTitle(title) => {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { p.title = title; }
+                }
+                // New tmux-compatible command handlers
+                CtrlReq::SendKeys(keys, literal) => {
+                    if literal {
+                        // Send as literal text
+                        send_text_to_active(&mut app, &keys)?;
+                    } else {
+                        // Parse key names and send
+                        let parts: Vec<&str> = keys.split_whitespace().collect();
+                        for (i, key) in parts.iter().enumerate() {
+                            let is_special = matches!(key.to_uppercase().as_str(), 
+                                "ENTER" | "TAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
+                                "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
+                                "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
+                                "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
+                            ) || key.to_uppercase().starts_with("C-");
+                            
+                            match key.to_uppercase().as_str() {
+                                "ENTER" => send_text_to_active(&mut app, "\r")?,
+                                "TAB" => send_text_to_active(&mut app, "\t")?,
+                                "ESCAPE" | "ESC" => send_text_to_active(&mut app, "\x1b")?,
+                                "SPACE" => send_text_to_active(&mut app, " ")?,
+                                "BSPACE" | "BACKSPACE" => send_text_to_active(&mut app, "\x7f")?,
+                                "UP" => send_text_to_active(&mut app, "\x1b[A")?,
+                                "DOWN" => send_text_to_active(&mut app, "\x1b[B")?,
+                                "RIGHT" => send_text_to_active(&mut app, "\x1b[C")?,
+                                "LEFT" => send_text_to_active(&mut app, "\x1b[D")?,
+                                "HOME" => send_text_to_active(&mut app, "\x1b[H")?,
+                                "END" => send_text_to_active(&mut app, "\x1b[F")?,
+                                "PAGEUP" | "PPAGE" => send_text_to_active(&mut app, "\x1b[5~")?,
+                                "PAGEDOWN" | "NPAGE" => send_text_to_active(&mut app, "\x1b[6~")?,
+                                "DELETE" | "DC" => send_text_to_active(&mut app, "\x1b[3~")?,
+                                "INSERT" | "IC" => send_text_to_active(&mut app, "\x1b[2~")?,
+                                "F1" => send_text_to_active(&mut app, "\x1bOP")?,
+                                "F2" => send_text_to_active(&mut app, "\x1bOQ")?,
+                                "F3" => send_text_to_active(&mut app, "\x1bOR")?,
+                                "F4" => send_text_to_active(&mut app, "\x1bOS")?,
+                                "F5" => send_text_to_active(&mut app, "\x1b[15~")?,
+                                "F6" => send_text_to_active(&mut app, "\x1b[17~")?,
+                                "F7" => send_text_to_active(&mut app, "\x1b[18~")?,
+                                "F8" => send_text_to_active(&mut app, "\x1b[19~")?,
+                                "F9" => send_text_to_active(&mut app, "\x1b[20~")?,
+                                "F10" => send_text_to_active(&mut app, "\x1b[21~")?,
+                                "F11" => send_text_to_active(&mut app, "\x1b[23~")?,
+                                "F12" => send_text_to_active(&mut app, "\x1b[24~")?,
+                                s if s.starts_with("C-") => {
+                                    // Ctrl+key
+                                    if let Some(c) = s.chars().nth(2) {
+                                        let ctrl = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                                        send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                    }
+                                }
+                                _ => {
+                                    send_text_to_active(&mut app, key)?;
+                                    // Add space after non-special keys unless it's the last one before a special key
+                                    if i + 1 < parts.len() {
+                                        let next_is_special = matches!(parts[i + 1].to_uppercase().as_str(),
+                                            "ENTER" | "TAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
+                                            "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
+                                            "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
+                                            "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
+                                        ) || parts[i + 1].to_uppercase().starts_with("C-");
+                                        if !next_is_special {
+                                            send_text_to_active(&mut app, " ")?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                CtrlReq::SelectPane(dir) => {
+                    match dir.as_str() {
+                        "U" => { move_focus(&mut app, FocusDir::Up); }
+                        "D" => { move_focus(&mut app, FocusDir::Down); }
+                        "L" => { move_focus(&mut app, FocusDir::Left); }
+                        "R" => { move_focus(&mut app, FocusDir::Right); }
+                        _ => {}
+                    }
+                }
+                CtrlReq::SelectWindow(idx) => {
+                    if idx < app.windows.len() { app.active_idx = idx; }
+                }
+                CtrlReq::ListPanes(resp) => {
+                    let mut output = String::new();
+                    let win = &app.windows[app.active_idx];
+                    fn collect_panes(node: &Node, panes: &mut Vec<(usize, u16, u16)>) {
+                        match node {
+                            Node::Leaf(p) => panes.push((p.id, p.last_cols, p.last_rows)),
+                            Node::Split { children, .. } => {
+                                for c in children { collect_panes(c, panes); }
+                            }
+                        }
+                    }
+                    let mut panes = Vec::new();
+                    collect_panes(&win.root, &mut panes);
+                    for (i, (id, cols, rows)) in panes.iter().enumerate() {
+                        output.push_str(&format!("%{}: [{}x{}]\n", id, cols, rows));
+                    }
+                    let _ = resp.send(output);
+                }
+                CtrlReq::KillWindow => {
+                    if app.windows.len() > 1 {
+                        app.windows.remove(app.active_idx);
+                        if app.active_idx >= app.windows.len() { app.active_idx = app.windows.len() - 1; }
+                    }
+                }
+                CtrlReq::KillSession => {
+                    // Remove port file and exit
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
+                    let _ = std::fs::remove_file(&regpath);
+                    std::process::exit(0);
+                }
+                CtrlReq::HasSession(resp) => {
+                    let _ = resp.send(true); // We are running, so session exists
+                }
+                CtrlReq::RenameSession(name) => {
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let old_path = format!("{}\\.psmux\\{}.port", home, app.session_name);
+                    let new_path = format!("{}\\.psmux\\{}.port", home, name);
+                    if let Some(port) = app.control_port {
+                        let _ = std::fs::remove_file(&old_path);
+                        let _ = std::fs::write(&new_path, port.to_string());
+                    }
+                    app.session_name = name;
+                }
+                CtrlReq::SwapPane(dir) => {
+                    // Swap with adjacent pane in direction
+                    match dir.as_str() {
+                        "U" => { swap_pane(&mut app, FocusDir::Up); }
+                        "D" => { swap_pane(&mut app, FocusDir::Down); }
+                        _ => { swap_pane(&mut app, FocusDir::Down); }
+                    }
+                }
+                CtrlReq::ResizePane(dir, amount) => {
+                    // Resize pane in direction
+                    match dir.as_str() {
+                        "U" | "D" => { resize_pane_vertical(&mut app, if dir == "U" { -(amount as i16) } else { amount as i16 }); }
+                        "L" | "R" => { resize_pane_horizontal(&mut app, if dir == "L" { -(amount as i16) } else { amount as i16 }); }
+                        _ => {}
+                    }
+                }
+                CtrlReq::SetBuffer(content) => {
+                    app.paste_buffers.insert(0, content);
+                    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+                }
+                CtrlReq::ListBuffers(resp) => {
+                    let mut output = String::new();
+                    for (i, buf) in app.paste_buffers.iter().enumerate() {
+                        let preview: String = buf.chars().take(50).collect();
+                        output.push_str(&format!("buffer{}: {} bytes: \"{}\"\n", i, buf.len(), preview));
+                    }
+                    let _ = resp.send(output);
+                }
+                CtrlReq::ShowBuffer(resp) => {
+                    let content = app.paste_buffers.first().cloned().unwrap_or_default();
+                    let _ = resp.send(content);
+                }
+                CtrlReq::DeleteBuffer => {
+                    if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
+                }
+                CtrlReq::DisplayMessage(resp, fmt) => {
+                    // Parse format string with variables
+                    let mut result = fmt.clone();
+                    result = result.replace("#S", &app.session_name);
+                    result = result.replace("#I", &app.active_idx.to_string());
+                    result = result.replace("#W", &app.windows[app.active_idx].name);
+                    let win = &app.windows[app.active_idx];
+                    let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
+                    result = result.replace("#P", &pane_id.to_string());
+                    result = result.replace("#H", &env::var("COMPUTERNAME").or_else(|_| env::var("HOSTNAME")).unwrap_or_default());
+                    result = result.replace("#T", &win.name);
+                    let _ = resp.send(result);
+                }
+                CtrlReq::LastWindow => {
+                    // Toggle to previous window (simple implementation - just go back one)
+                    if app.windows.len() > 1 {
+                        app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                    }
+                }
+                CtrlReq::LastPane => {
+                    // This would require tracking last pane - for now just cycle
+                    let win = &mut app.windows[app.active_idx];
+                    if !win.active_path.is_empty() {
+                        // Try to cycle through panes
+                        let last = win.active_path.last_mut();
+                        if let Some(idx) = last {
+                            *idx = (*idx + 1) % 2; // Simple toggle for splits
+                        }
+                    }
+                }
+                CtrlReq::RotateWindow(reverse) => {
+                    // Rotate panes in window
+                    rotate_panes(&mut app, reverse);
+                }
+                CtrlReq::DisplayPanes => {
+                    // This would show pane numbers overlay - no-op for server mode
+                }
+                CtrlReq::BreakPane => {
+                    // Break current pane to a new window
+                    break_pane_to_window(&mut app);
+                }
+                CtrlReq::JoinPane(target_win) => {
+                    // Join current pane to target window - complex operation
+                    // For now, just move focus
+                    if target_win < app.windows.len() {
+                        app.active_idx = target_win;
+                    }
+                }
+                CtrlReq::RespawnPane => {
+                    // Restart the shell in current pane
+                    respawn_active_pane(&mut app)?;
                 }
             }
         }
@@ -2209,3 +3199,158 @@ fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) { let win = &mut app.wi
 
 fn remote_scroll_up(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "\x1b[A"); } }
 fn remote_scroll_down(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "\x1b[B"); } }
+
+// New helper functions for tmux compatibility
+
+fn get_active_pane_id(node: &Node, path: &[usize]) -> Option<usize> {
+    match node {
+        Node::Leaf(p) => Some(p.id),
+        Node::Split { children, .. } => {
+            if path.is_empty() { return None; }
+            let idx = path[0];
+            if idx < children.len() { get_active_pane_id(&children[idx], &path[1..]) } else { None }
+        }
+    }
+}
+
+fn swap_pane(app: &mut AppState, dir: FocusDir) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    
+    let mut active_idx = None;
+    for (i, (path, _)) in rects.iter().enumerate() { 
+        if *path == win.active_path { active_idx = Some(i); break; } 
+    }
+    let Some(ai) = active_idx else { return; };
+    let (_, arect) = &rects[ai];
+    
+    // Find nearest neighbor in direction
+    let mut best: Option<(usize, u32)> = None;
+    for (i, (_, r)) in rects.iter().enumerate() {
+        if i == ai { continue; }
+        let candidate = match dir {
+            FocusDir::Left => if r.x + r.width <= arect.x { Some((arect.x - (r.x + r.width)) as u32) } else { None },
+            FocusDir::Right => if r.x >= arect.x + arect.width { Some((r.x - (arect.x + arect.width)) as u32) } else { None },
+            FocusDir::Up => if r.y + r.height <= arect.y { Some((arect.y - (r.y + r.height)) as u32) } else { None },
+            FocusDir::Down => if r.y >= arect.y + arect.height { Some((r.y - (arect.y + arect.height)) as u32) } else { None },
+        };
+        if let Some(dist) = candidate { 
+            if best.map_or(true, |(_,bd)| dist < bd) { best = Some((i, dist)); } 
+        }
+    }
+    
+    // Swap content with neighbor (just swap focus for now - full swap is complex)
+    if let Some((ni, _)) = best { 
+        win.active_path = rects[ni].0.clone(); 
+    }
+}
+
+fn resize_pane_vertical(app: &mut AppState, amount: i16) {
+    let win = &mut app.windows[app.active_idx];
+    if win.active_path.is_empty() { return; }
+    
+    // Find the parent split that controls vertical sizing
+    for depth in (0..win.active_path.len()).rev() {
+        let parent_path = win.active_path[..depth].to_vec();
+        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
+            if *kind == LayoutKind::Vertical {
+                let idx = win.active_path[depth];
+                if idx < sizes.len() {
+                    let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
+                    let diff = new_size as i16 - sizes[idx] as i16;
+                    sizes[idx] = new_size;
+                    // Adjust sibling
+                    if idx + 1 < sizes.len() {
+                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
+                    } else if idx > 0 {
+                        sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn resize_pane_horizontal(app: &mut AppState, amount: i16) {
+    let win = &mut app.windows[app.active_idx];
+    if win.active_path.is_empty() { return; }
+    
+    // Find the parent split that controls horizontal sizing
+    for depth in (0..win.active_path.len()).rev() {
+        let parent_path = win.active_path[..depth].to_vec();
+        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
+            if *kind == LayoutKind::Horizontal {
+                let idx = win.active_path[depth];
+                if idx < sizes.len() {
+                    let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
+                    let diff = new_size as i16 - sizes[idx] as i16;
+                    sizes[idx] = new_size;
+                    // Adjust sibling
+                    if idx + 1 < sizes.len() {
+                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
+                    } else if idx > 0 {
+                        sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn rotate_panes(app: &mut AppState, _reverse: bool) {
+    // Rotate panes within a window - simplified implementation
+    let win = &mut app.windows[app.active_idx];
+    match &mut win.root {
+        Node::Split { children, .. } if children.len() >= 2 => {
+            // Simple rotation: swap first and last
+            let last_idx = children.len() - 1;
+            children.swap(0, last_idx);
+        }
+        _ => {}
+    }
+}
+
+fn break_pane_to_window(app: &mut AppState) {
+    // This would require extracting the current pane from its split and creating a new window
+    // For now, just create a new window
+    let pty_system = match PtySystemSelection::default().get() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let _ = create_window(&*pty_system, app);
+}
+
+fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
+    // Respawn the shell in the active pane
+    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let win = &mut app.windows[app.active_idx];
+    let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
+    
+    let size = PtySize { rows: pane.last_rows, cols: pane.last_cols, pixel_width: 0, pixel_height: 0 };
+    let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+    let shell_cmd = detect_shell();
+    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
+    let term_reader = term.clone();
+    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    
+    thread::spawn(move || {
+        let mut local = [0u8; 8192];
+        loop {
+            match reader.read(&mut local) {
+                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(_) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    });
+    
+    pane.master = pair.master;
+    pane.child = child;
+    pane.term = term;
+    
+    Ok(())
+}
