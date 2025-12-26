@@ -2039,6 +2039,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::Char('%') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -h\n"); } }
                         KeyCode::Char('"') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -v\n"); } }
                         KeyCode::Char('x') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-pane\n"); } }
+                        KeyCode::Char('&') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-window\n"); } }
                         KeyCode::Char('z') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"zoom-pane\n"); } }
                         KeyCode::Char('[') | KeyCode::Char('{') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"copy-enter\n"); } }
                         KeyCode::Char('n') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"next-window\n"); } }
