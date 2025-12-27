@@ -3132,7 +3132,16 @@ fn detect_shell() -> CommandBuilder {
     let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
     let cmd = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
     match pwsh.or(cmd) {
-        Some(path) => CommandBuilder::new(path),
+        Some(path) => {
+            let mut builder = CommandBuilder::new(&path);
+            // If it's PowerShell, disable inline predictions (ghost text) which doesn't render well in PTY
+            if path.to_lowercase().contains("pwsh") {
+                // Use -NoExit with a command to disable predictions, then continue interactive
+                builder.args(["-NoLogo", "-NoExit", "-Command", 
+                    "Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
+            }
+            builder
+        }
         None => CommandBuilder::new("pwsh.exe"),
     }
 }
