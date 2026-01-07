@@ -2174,9 +2174,15 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         }
                         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
-                            let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
                             if let Some(mut s) = try_connect() {
-                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-{}\n", c).as_bytes());
+                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-{}\n", c.to_ascii_lowercase()).as_bytes());
+                            }
+                        }
+                        // Handle raw control characters (0x01-0x1A) that Windows may send
+                        KeyCode::Char(c) if (c as u8) >= 0x01 && (c as u8) <= 0x1A => {
+                            let ctrl_letter = ((c as u8) + b'a' - 1) as char;
+                            if let Some(mut s) = try_connect() {
+                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-{}\n", ctrl_letter).as_bytes());
                             }
                         }
                         KeyCode::Char(c) => {
@@ -3029,6 +3035,10 @@ fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
             let _ = active.master.write_all(&[ctrl_char]);
         }
+        // Handle raw control characters (0x01-0x1A) that Windows may send
+        KeyCode::Char(c) if (c as u8) >= 0x01 && (c as u8) <= 0x1A => {
+            let _ = active.master.write_all(&[c as u8]);
+        }
         KeyCode::Char(c) => {
             let _ = write!(active.master, "{}", c);
         }
@@ -3306,7 +3316,8 @@ fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
         }
         "kill-window" | "killw" => {
             if app.windows.len() > 1 {
-                app.windows.remove(app.active_idx);
+                let mut win = app.windows.remove(app.active_idx);
+                kill_all_children(&mut win.root);
                 if app.active_idx >= app.windows.len() {
                     app.active_idx = app.windows.len() - 1;
                 }
@@ -3660,6 +3671,19 @@ fn kill_leaf(node: &mut Node, path: &Vec<usize>) {
     *node = remove_node(std::mem::replace(node, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] }), path);
 }
 
+/// Kill a node and all its child processes before dropping it
+fn kill_node(mut n: Node) {
+    match &mut n {
+        Node::Leaf(p) => { let _ = p.child.kill(); }
+        Node::Split { children, .. } => {
+            for child in children.iter_mut() {
+                kill_all_children(child);
+            }
+        }
+    }
+    // Node is dropped here, after child processes have been killed
+}
+
 fn remove_node(n: Node, path: &Vec<usize>) -> Node {
     match n {
         Node::Leaf(p) => {
@@ -3673,7 +3697,10 @@ fn remove_node(n: Node, path: &Vec<usize>) -> Node {
             for (i, child) in children.into_iter().enumerate() {
                 if i == idx {
                     if path.len() > 1 { new_children.push(remove_node(child, &path[1..].to_vec())); }
-                    // else: drop this child (removed)
+                    else {
+                        // Kill child process(es) before dropping the node
+                        kill_node(child);
+                    }
                 } else { new_children.push(child); }
             }
             if new_children.len() == 1 { new_children.into_iter().next().unwrap() }
@@ -5311,7 +5338,8 @@ fn run_server(session_name: String) -> io::Result<()> {
                 }
                 CtrlReq::KillWindow => {
                     if app.windows.len() > 1 {
-                        app.windows.remove(app.active_idx);
+                        let mut win = app.windows.remove(app.active_idx);
+                        kill_all_children(&mut win.root);
                         if app.active_idx >= app.windows.len() { app.active_idx = app.windows.len() - 1; }
                     }
                 }
@@ -5559,7 +5587,8 @@ fn run_server(session_name: String) -> io::Result<()> {
                 CtrlReq::UnlinkWindow => {
                     // Unlink window - in single session model, just remove the window
                     if app.windows.len() > 1 {
-                        app.windows.remove(app.active_idx);
+                        let mut win = app.windows.remove(app.active_idx);
+                        kill_all_children(&mut win.root);
                         if app.active_idx >= app.windows.len() {
                             app.active_idx = app.windows.len() - 1;
                         }
