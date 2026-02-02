@@ -479,18 +479,22 @@ fn main() -> io::Result<()> {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map(|e| e == "port").unwrap_or(false) {
-                        if let Ok(port_str) = std::fs::read_to_string(&path) {
-                            if let Ok(port) = port_str.trim().parse::<u16>() {
-                                let addr = format!("127.0.0.1:{}", port);
-                                if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-                                    let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
-                                    sessions_killed += 1;
-                                } else {
-                                    let _ = std::fs::remove_file(&path);
+                        if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            if let Ok(port_str) = std::fs::read_to_string(&path) {
+                                if let Ok(port) = port_str.trim().parse::<u16>() {
+                                    let addr = format!("127.0.0.1:{}", port);
+                                    let sess_key = read_session_key(session_name).unwrap_or_default();
+                                    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+                                        let _ = write!(stream, "AUTH {}\n", sess_key);
+                                        let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
+                                        sessions_killed += 1;
+                                    } else {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
                                 }
+                            } else {
+                                let _ = std::fs::remove_file(&path);
                             }
-                        } else {
-                            let _ = std::fs::remove_file(&path);
                         }
                     }
                 }
@@ -516,11 +520,25 @@ fn main() -> io::Result<()> {
                                                 Duration::from_millis(50)
                                             ) {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                                // Read session key and authenticate
+                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
+                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
+                                                }
                                                 let _ = std::io::Write::write_all(&mut s, b"session-info\n");
                                                 let mut br = std::io::BufReader::new(s);
                                                 let mut line = String::new();
+                                                // Skip "OK" response from AUTH
                                                 let _ = br.read_line(&mut line);
-                                                if !line.trim().is_empty() { println!("{}", line.trim_end()); } else { println!("{}", base); }
+                                                if line.trim() == "OK" {
+                                                    line.clear();
+                                                    let _ = br.read_line(&mut line);
+                                                }
+                                                if !line.trim().is_empty() && line.trim() != "ERROR: Authentication required" { 
+                                                    println!("{}", line.trim_end()); 
+                                                } else { 
+                                                    println!("{}", base); 
+                                                }
                                             } else {
                                                 // stale port file - remove it
                                                 let _ = std::fs::remove_file(e.path());
@@ -1888,7 +1906,10 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     let path = format!("{}\\.psmux\\{}.port", home, name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
     let addr = format!("127.0.0.1:{}", port);
+    let session_key = read_session_key(&name).unwrap_or_default();
     let mut stream = std::net::TcpStream::connect(addr.clone())?;
+    // Authenticate first
+    let _ = write!(stream, "AUTH {}\n", session_key);
     let _ = std::io::Write::write_all(&mut stream, b"client-attach\n");
     let last_path = format!("{}\\.psmux\\last_session", home);
     let _ = std::fs::write(&last_path, &name);
@@ -1909,9 +1930,12 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     let mut session_selected: usize = 0;
     let current_session = name.clone();
     
-    // Helper to connect to server - returns None if connection fails
+    // Helper to connect to server with auth - returns None if connection fails
     let try_connect = || -> Option<std::net::TcpStream> {
-        std::net::TcpStream::connect(&addr).ok()
+        std::net::TcpStream::connect(&addr).ok().map(|mut s| {
+            let _ = write!(s, "AUTH {}\n", session_key);
+            s
+        })
     };
     
     // Struct to hold window info for status bar
@@ -1922,9 +1946,14 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
         // Fetch layout BEFORE draw - this also serves as liveness check
         let root: LayoutJson = if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
             let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+            let _ = write!(s, "AUTH {}\n", session_key);
             let _ = std::io::Write::write_all(&mut s, b"dump-layout\n");
+            let mut br = std::io::BufReader::new(&mut s);
+            // Skip AUTH "OK" line
+            let mut auth_line = String::new();
+            let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
             let mut buf = String::new();
-            if std::io::Read::read_to_string(&mut s, &mut buf).is_ok() && !buf.is_empty() {
+            if std::io::Read::read_to_string(&mut br, &mut buf).is_ok() && !buf.is_empty() {
                 serde_json::from_str(&buf).unwrap_or(LayoutJson::Leaf { id: 0, rows: 0, cols: 0, cursor_row: 0, cursor_col: 0, active: true, copy_mode: false, scroll_offset: 0, content: Vec::new() })
             } else {
                 // Server closed connection or sent no data - exit
@@ -1938,9 +1967,14 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
         // Fetch window list for status bar
         let windows: Vec<WinStatus> = if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
             let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+            let _ = write!(s, "AUTH {}\n", session_key);
             let _ = std::io::Write::write_all(&mut s, b"list-windows\n");
+            let mut br = std::io::BufReader::new(&mut s);
+            // Skip AUTH "OK" line
+            let mut auth_line = String::new();
+            let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
             let mut buf = String::new();
-            if std::io::Read::read_to_string(&mut s, &mut buf).is_ok() {
+            if std::io::Read::read_to_string(&mut br, &mut buf).is_ok() {
                 serde_json::from_str(&buf).unwrap_or_default()
             } else {
                 Vec::new()
@@ -1954,6 +1988,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
             let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(1), Constraint::Length(1)].as_ref()).split(area);
             // update server with client size
             if let Ok(mut cs) = std::net::TcpStream::connect(addr.clone()) {
+                let _ = write!(cs, "AUTH {}\n", session_key);
                 let _ = std::io::Write::write_all(&mut cs, format!("client-size {} {}\n", chunks[0].width, chunks[0].height).as_bytes());
             }
 
@@ -2121,21 +2156,21 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                 else if prefix_armed {
                     // tmux-like prefix mappings
                     match key.code {
-                        KeyCode::Char('c') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"new-window\n"); } }
-                        KeyCode::Char('%') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -h\n"); } }
-                        KeyCode::Char('"') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -v\n"); } }
-                        KeyCode::Char('x') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-pane\n"); } }
-                        KeyCode::Char('&') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-window\n"); } }
-                        KeyCode::Char('z') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"zoom-pane\n"); } }
-                        KeyCode::Char('[') | KeyCode::Char('{') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"copy-enter\n"); } }
-                        KeyCode::Char('n') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"next-window\n"); } }
-                        KeyCode::Char('p') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"previous-window\n"); } }
-                        KeyCode::Char('o') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -t :.+\n"); } }
+                        KeyCode::Char('c') => { let _ = send_auth_cmd(&addr, &session_key, b"new-window\n"); }
+                        KeyCode::Char('%') => { let _ = send_auth_cmd(&addr, &session_key, b"split-window -h\n"); }
+                        KeyCode::Char('"') => { let _ = send_auth_cmd(&addr, &session_key, b"split-window -v\n"); }
+                        KeyCode::Char('x') => { let _ = send_auth_cmd(&addr, &session_key, b"kill-pane\n"); }
+                        KeyCode::Char('&') => { let _ = send_auth_cmd(&addr, &session_key, b"kill-window\n"); }
+                        KeyCode::Char('z') => { let _ = send_auth_cmd(&addr, &session_key, b"zoom-pane\n"); }
+                        KeyCode::Char('[') | KeyCode::Char('{') => { let _ = send_auth_cmd(&addr, &session_key, b"copy-enter\n"); }
+                        KeyCode::Char('n') => { let _ = send_auth_cmd(&addr, &session_key, b"next-window\n"); }
+                        KeyCode::Char('p') => { let _ = send_auth_cmd(&addr, &session_key, b"previous-window\n"); }
+                        KeyCode::Char('o') => { let _ = send_auth_cmd(&addr, &session_key, b"select-pane -t :.+\n"); }
                         // Arrow keys to switch panes
-                        KeyCode::Up => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -U\n"); } }
-                        KeyCode::Down => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -D\n"); } }
-                        KeyCode::Left => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -L\n"); } }
-                        KeyCode::Right => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -R\n"); } }
+                        KeyCode::Up => { let _ = send_auth_cmd(&addr, &session_key, b"select-pane -U\n"); }
+                        KeyCode::Down => { let _ = send_auth_cmd(&addr, &session_key, b"select-pane -D\n"); }
+                        KeyCode::Left => { let _ = send_auth_cmd(&addr, &session_key, b"select-pane -L\n"); }
+                        KeyCode::Right => { let _ = send_auth_cmd(&addr, &session_key, b"select-pane -R\n"); }
                         KeyCode::Char('d') => { quit = true; } // Detach
                         KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
                         KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
@@ -2143,10 +2178,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                             tree_chooser = true; 
                             tree_entries.clear(); 
                             tree_selected = 0; 
-                            if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { 
-                                let _ = std::io::Write::write_all(&mut s, b"list-tree\n"); 
-                                let mut buf = String::new(); 
-                                let _ = std::io::Read::read_to_string(&mut s, &mut buf); 
+                            if let Ok(buf) = send_auth_cmd_response(&addr, &session_key, b"list-tree\n") {
                                 let infos: Vec<WinTree> = serde_json::from_str(&buf).unwrap_or(Vec::new()); 
                                 for wi in infos.into_iter() { 
                                     tree_entries.push((true, wi.id, 0, wi.name)); 
@@ -2154,7 +2186,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                         tree_entries.push((false, wi.id, pi.id, pi.title)); 
                                     } 
                                 } 
-                            } 
+                            }
                         }
                         KeyCode::Char('s') => {
                             // Session chooser - list all available sessions
@@ -2170,14 +2202,18 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                                 if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                                     if let Ok(p) = port_str.trim().parse::<u16>() {
                                                         let sess_addr = format!("127.0.0.1:{}", p);
+                                                        let sess_key = read_session_key(base).unwrap_or_default();
                                                         // Try to get session info quickly
                                                         let info = if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
                                                             &sess_addr.parse().unwrap(),
                                                             Duration::from_millis(25)
                                                         ) {
                                                             let _ = ss.set_read_timeout(Some(Duration::from_millis(25)));
+                                                            let _ = write!(ss, "AUTH {}\n", sess_key);
                                                             let _ = std::io::Write::write_all(&mut ss, b"session-info\n");
                                                             let mut br = std::io::BufReader::new(ss);
+                                                            let mut auth_line = String::new();
+                                                            let _ = br.read_line(&mut auth_line); // Skip OK
                                                             let mut line = String::new();
                                                             if br.read_line(&mut line).is_ok() && !line.trim().is_empty() {
                                                                 line.trim().to_string()
@@ -2223,7 +2259,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 if sname != &current_session {
                                     // Switch to selected session
                                     // First, detach from current session
-                                    let _ = std::net::TcpStream::connect(addr.clone()).and_then(|mut s| { let _ = std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
+                                    let _ = std::net::TcpStream::connect(addr.clone()).and_then(|mut s| { let _ = write!(s, "AUTH {}\n", session_key); let _ = std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
                                     
                                     // Store the target session name for re-attach after exiting this loop
                                     env::set_var("PSMUX_SWITCH_TO", sname);
@@ -2307,20 +2343,54 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
         if reap_children_placeholder()? { /* no-op */ }
         if quit { break; }
     }
-    let _ = std::net::TcpStream::connect(addr).and_then(|mut s| { std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
+    let _ = std::net::TcpStream::connect(&addr).and_then(|mut s| { let _ = write!(s, "AUTH {}\n", session_key); std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
     Ok(())
 }
 
 fn reap_children_placeholder() -> io::Result<bool> { Ok(false) }
+
+/// Read the session key from the key file
+fn read_session_key(session: &str) -> io::Result<String> {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let keypath = format!("{}\\.psmux\\{}.key", home, session);
+    std::fs::read_to_string(&keypath).map(|s| s.trim().to_string())
+}
+
+/// Send an authenticated command to a server - used by remote attach client
+fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
+    if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+        let _ = write!(s, "AUTH {}\n", key);
+        let _ = std::io::Write::write_all(&mut s, cmd);
+    }
+    Ok(())
+}
+
+/// Send an authenticated command and get response - used by remote attach client
+fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
+    let mut s = std::net::TcpStream::connect(addr)?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = write!(s, "AUTH {}\n", key);
+    let _ = std::io::Write::write_all(&mut s, cmd);
+    // Skip "OK" line from AUTH
+    let mut br = std::io::BufReader::new(&mut s);
+    let mut auth_line = String::new();
+    let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
+    // Read the actual response
+    let mut buf = String::new();
+    let _ = std::io::Read::read_to_string(&mut br, &mut buf);
+    Ok(buf)
+}
 
 fn send_control(line: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
+    let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(addr)?;
-    let _ = write!(stream, "{}", line);
+    // Send AUTH first, then the command
+    let _ = write!(stream, "AUTH {}\n{}", session_key, line);
     Ok(())
 }
 
@@ -2329,10 +2399,12 @@ fn send_control_with_response(line: String) -> io::Result<String> {
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
+    let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    let _ = write!(stream, "{}", line);
+    // Send AUTH first, then the command
+    let _ = write!(stream, "AUTH {}\n{}", session_key, line);
     let _ = stream.flush();
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
@@ -5048,14 +5120,68 @@ fn run_server(session_name: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let dir = format!("{}\\.psmux", home);
     let _ = std::fs::create_dir_all(&dir);
+    
+    // Generate a random session key for security
+    let session_key: String = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let s = RandomState::new();
+        let mut h = s.build_hasher();
+        h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
+        h.write_u64(std::process::id() as u64);
+        format!("{:016x}", h.finish())
+    };
+    
+    // Write port and key to files
     let regpath = format!("{}\\{}.port", dir, app.session_name);
     let _ = std::fs::write(&regpath, port.to_string());
+    let keypath = format!("{}\\{}.key", dir, app.session_name);
+    let _ = std::fs::write(&keypath, &session_key);
+    
+    // Try to set file permissions to user-only (Windows)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Recreate key file with restricted permissions
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&keypath)
+            .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
+    }
+    
+    let session_key_clone = session_key.clone();
     thread::spawn(move || {
         for conn in listener.incoming() {
             if let Ok(mut stream) = conn {
-                let mut line = String::new();
+                // First, read the authentication line
+                let mut auth_line = String::new();
                 let mut r = io::BufReader::new(stream.try_clone().unwrap());
-                let _ = r.read_line(&mut line);
+                if r.read_line(&mut auth_line).is_err() {
+                    continue;
+                }
+                
+                // Verify session key
+                let auth_line = auth_line.trim();
+                if !auth_line.starts_with("AUTH ") {
+                    // Legacy client without auth - reject for security
+                    let _ = std::io::Write::write_all(&mut stream, b"ERROR: Authentication required\n");
+                    continue;
+                }
+                let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
+                if provided_key != session_key_clone {
+                    let _ = std::io::Write::write_all(&mut stream, b"ERROR: Invalid session key\n");
+                    continue;
+                }
+                // Auth successful - send OK
+                let _ = std::io::Write::write_all(&mut stream, b"OK\n");
+                
+                // Auth successful, now read the command
+                let mut line = String::new();
+                if r.read_line(&mut line).is_err() {
+                    continue;
+                }
                 // Use quote-aware parser to preserve arguments with spaces
                 let parsed = parse_command_line(&line);
                 let cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
@@ -5621,10 +5747,12 @@ fn run_server(session_name: String) -> io::Result<()> {
                     }
                 }
                 CtrlReq::KillSession => {
-                    // Remove port file and exit
+                    // Remove port and key files and exit
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
+                    let keypath = format!("{}\\.psmux\\{}.key", home, app.session_name);
                     let _ = std::fs::remove_file(&regpath);
+                    let _ = std::fs::remove_file(&keypath);
                     std::process::exit(0);
                 }
                 CtrlReq::HasSession(resp) => {
@@ -5633,10 +5761,17 @@ fn run_server(session_name: String) -> io::Result<()> {
                 CtrlReq::RenameSession(name) => {
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let old_path = format!("{}\\.psmux\\{}.port", home, app.session_name);
+                    let old_keypath = format!("{}\\.psmux\\{}.key", home, app.session_name);
                     let new_path = format!("{}\\.psmux\\{}.port", home, name);
+                    let new_keypath = format!("{}\\.psmux\\{}.key", home, name);
                     if let Some(port) = app.control_port {
                         let _ = std::fs::remove_file(&old_path);
                         let _ = std::fs::write(&new_path, port.to_string());
+                        // Also move the key file
+                        if let Ok(key) = std::fs::read_to_string(&old_keypath) {
+                            let _ = std::fs::remove_file(&old_keypath);
+                            let _ = std::fs::write(&new_keypath, key);
+                        }
                     }
                     app.session_name = name;
                 }
@@ -6010,10 +6145,12 @@ fn run_server(session_name: String) -> io::Result<()> {
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
-                    // Kill this server
+                    // Kill this server - remove port and key files
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
+                    let keypath = format!("{}\\.psmux\\{}.key", home, app.session_name);
                     let _ = std::fs::remove_file(&regpath);
+                    let _ = std::fs::remove_file(&keypath);
                     std::process::exit(0);
                 }
                 CtrlReq::WaitFor(channel, op) => {
