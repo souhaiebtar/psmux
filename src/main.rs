@@ -394,6 +394,114 @@ fn print_commands() {
 "#);
 }
 
+/// Parsed target specification from -t argument.
+/// Supports formats like: session, session:window, session:window.pane, :window, :window.pane, .pane
+/// Returns (session_name, window_index, pane_index)
+#[derive(Debug, Clone, Default)]
+struct ParsedTarget {
+    session: Option<String>,
+    window: Option<usize>,  // window index
+    pane: Option<usize>,    // pane index (or pane ID if pane_is_id is true)
+    pane_is_id: bool,       // true if pane is a direct ID (%N format), false if index
+    window_is_id: bool,     // true if window is a direct ID (@N format), false if index
+}
+
+/// Parse a tmux-style target specification (e.g., "dev:0.1", "dev:0", "dev", ":0", ":0.1", ".1")
+/// 
+/// Supported formats:
+/// - "session" - just session name
+/// - "session:window" - session and window index
+/// - "session:window.pane" - session, window, and pane index
+/// - ":window" - window index in current/default session
+/// - ":window.pane" - window and pane in current/default session
+/// - ".pane" - pane index in current window
+/// - "%pane_id" - direct pane ID reference (tmux format)
+/// - "@window_id" - direct window ID reference (tmux format)
+fn parse_target(target: &str) -> ParsedTarget {
+    let mut result = ParsedTarget::default();
+    
+    // Handle special tmux ID formats at the top level
+    if target.starts_with('%') {
+        // Pane ID format: %123 -> pane ID 123
+        if let Ok(pid) = target[1..].parse::<usize>() {
+            result.pane = Some(pid);
+            result.pane_is_id = true;
+        }
+        return result;
+    }
+    if target.starts_with('@') {
+        // Window ID format: @123 -> window ID 123
+        if let Ok(wid) = target[1..].parse::<usize>() {
+            result.window = Some(wid);
+            result.window_is_id = true;
+        }
+        return result;
+    }
+    
+    // Split by ':' to separate session from window.pane
+    let (session_part, window_pane_part) = if let Some(colon_pos) = target.find(':') {
+        let session = if colon_pos == 0 { None } else { Some(target[..colon_pos].to_string()) };
+        (session, Some(&target[colon_pos + 1..]))
+    } else if target.starts_with('.') {
+        // Just ".pane" format
+        (None, Some(target))
+    } else {
+        // No ':' and doesn't start with '.' - could be just session name
+        // Or could be a window index (number only)
+        if target.parse::<usize>().is_ok() {
+            // It's a number, treat as window index in default session
+            (None, Some(target))
+        } else {
+            // It's a session name
+            (Some(target.to_string()), None)
+        }
+    };
+    
+    result.session = session_part;
+    
+    // Parse window.pane part
+    if let Some(wp) = window_pane_part {
+        // Check for %pane_id format within the window.pane part
+        if wp.starts_with('%') {
+            if let Ok(pid) = wp[1..].parse::<usize>() {
+                result.pane = Some(pid);
+                result.pane_is_id = true;
+            }
+        } else if wp.starts_with('@') {
+            if let Ok(wid) = wp[1..].parse::<usize>() {
+                result.window = Some(wid);
+                result.window_is_id = true;
+            }
+        } else if let Some(dot_pos) = wp.find('.') {
+            // Has pane component
+            if dot_pos > 0 {
+                // window.pane format
+                if let Ok(w) = wp[..dot_pos].parse::<usize>() {
+                    result.window = Some(w);
+                }
+            }
+            // Parse pane index after the dot
+            if let Ok(p) = wp[dot_pos + 1..].parse::<usize>() {
+                result.pane = Some(p);
+            }
+        } else {
+            // Just window index
+            if let Ok(w) = wp.parse::<usize>() {
+                result.window = Some(w);
+            }
+        }
+    }
+    
+    result
+}
+
+/// Extract the session name from a target string (for port file lookup)
+/// Returns the session part of targets like "dev:0.1" -> "dev"
+fn extract_session_from_target(target: &str) -> String {
+    let parsed = parse_target(target);
+    parsed.session.unwrap_or_else(|| "default".to_string())
+}
+
 /// Clean up any stale port files (where server is not actually running)
 fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
@@ -433,9 +541,16 @@ fn main() -> io::Result<()> {
     cleanup_stale_port_files();
     
     // Parse -t flag early to set target session for all commands
+    // Supports session:window.pane format (e.g., "dev:0.1")
+    // PSMUX_TARGET_SESSION stores just the session name (for port file lookup)
+    // PSMUX_TARGET_FULL stores the full target (session:window.pane) for the server
     if let Some(pos) = args.iter().position(|a| a == "-t") {
         if let Some(target) = args.get(pos + 1) {
-            env::set_var("PSMUX_TARGET_SESSION", target);
+            // Store the full target for the server to parse
+            env::set_var("PSMUX_TARGET_FULL", target);
+            // Extract just the session name for port file lookup
+            let session = extract_session_from_target(target);
+            env::set_var("PSMUX_TARGET_SESSION", &session);
         }
     }
     
@@ -2428,6 +2543,7 @@ fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<Strin
     let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = write!(s, "AUTH {}\n", key);
     let _ = std::io::Write::write_all(&mut s, cmd);
+    let _ = s.flush();
     // Skip "OK" line from AUTH
     let mut br = std::io::BufReader::new(&mut s);
     let mut auth_line = String::new();
@@ -2441,27 +2557,38 @@ fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<Strin
 fn send_control(line: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(addr)?;
-    // Send AUTH first, then the command
-    let _ = write!(stream, "AUTH {}\n{}", session_key, line);
+    // Send AUTH first, optionally TARGET, then the command
+    let _ = write!(stream, "AUTH {}\n", session_key);
+    if let Some(ref ft) = full_target {
+        let _ = write!(stream, "TARGET {}\n", ft);
+    }
+    let _ = write!(stream, "{}", line);
+    let _ = stream.flush();
     Ok(())
 }
 
 fn send_control_with_response(line: String) -> io::Result<String> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    // Send AUTH first, then the command
-    let _ = write!(stream, "AUTH {}\n{}", session_key, line);
+    // Send AUTH first, optionally TARGET, then the command
+    let _ = write!(stream, "AUTH {}\n", session_key);
+    if let Some(ref ft) = full_target {
+        let _ = write!(stream, "TARGET {}\n", ft);
+    }
+    let _ = write!(stream, "{}", line);
     let _ = stream.flush();
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
@@ -2534,20 +2661,42 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 let mut line = String::new();
                 let mut r = io::BufReader::new(stream.try_clone().unwrap());
                 let _ = r.read_line(&mut line);
+                
+                // Check for optional TARGET line (for session:window.pane addressing)
+                let mut global_target_win: Option<usize> = None;
+                let mut global_target_pane: Option<usize> = None;
+                let mut global_pane_is_id = false;
+                if line.trim().starts_with("TARGET ") {
+                    let target_spec = line.trim().strip_prefix("TARGET ").unwrap_or("");
+                    let parsed = parse_target(target_spec);
+                    global_target_win = parsed.window;
+                    global_target_pane = parsed.pane;
+                    global_pane_is_id = parsed.pane_is_id;
+                    // Now read the actual command line
+                    line.clear();
+                    let _ = r.read_line(&mut line);
+                }
+                
                 let mut parts = line.split_whitespace();
                 let cmd = parts.next().unwrap_or("");
                 // parse optional target specifier
-                let mut args: Vec<&str> = parts.by_ref().collect();
-                let mut target_win: Option<usize> = None;
-                let mut target_pane: Option<usize> = None;
+                let args: Vec<&str> = parts.by_ref().collect();
+                let mut target_win: Option<usize> = global_target_win;
+                let mut target_pane: Option<usize> = global_target_pane;
+                let mut pane_is_id = global_pane_is_id;
                 let mut start_line: Option<u16> = None;
                 let mut end_line: Option<u16> = None;
                 let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-t" {
                         if let Some(v) = args.get(i+1) {
-                            if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
-                            else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
+                            // Parse using parse_target for consistent handling
+                            let pt = parse_target(v);
+                            if pt.window.is_some() { target_win = pt.window; }
+                            if pt.pane.is_some() { 
+                                target_pane = pt.pane;
+                                pane_is_id = pt.pane_is_id;
+                            }
                         }
                         i += 2; continue;
                     } else if args[i] == "-S" {
@@ -2560,7 +2709,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     i += 1;
                 }
                 if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-                if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
+                if let Some(pid) = target_pane { 
+                    if pane_is_id {
+                        let _ = tx.send(CtrlReq::FocusPane(pid));
+                    } else {
+                        let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+                    }
+                }
                 match cmd {
                     "new-window" => {
                         // Parse optional command - find first non-flag argument after command
@@ -2822,6 +2977,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 }
                 CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); }
+                CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { "(attached)" } else { "(detached)" };
                     let windows = app.windows.len();
@@ -5033,6 +5189,7 @@ enum CtrlReq {
     CapturePane(mpsc::Sender<String>),
     FocusWindow(usize),
     FocusPane(usize),
+    FocusPaneByIndex(usize),  // Focus pane by index (0, 1, 2...) within current window
     SessionInfo(mpsc::Sender<String>),
     CapturePaneRange(mpsc::Sender<String>, Option<u16>, Option<u16>),
     ClientAttach,
@@ -5149,6 +5306,30 @@ fn focus_pane_by_id(app: &mut AppState, pid: usize) {
     let mut found = None;
     rec(&win.root, &mut Vec::new(), &mut found, pid);
     if let Some(p) = found { win.active_path = p; }
+}
+
+/// Focus a pane by its index (0, 1, 2...) within the current window.
+/// Panes are ordered left-to-right, top-to-bottom within the tree.
+fn focus_pane_by_index(app: &mut AppState, idx: usize) {
+    let win = &mut app.windows[app.active_idx];
+    // Collect all panes with their paths
+    fn collect_pane_paths(node: &Node, path: &mut Vec<usize>, panes: &mut Vec<Vec<usize>>) {
+        match node {
+            Node::Leaf(_) => panes.push(path.clone()),
+            Node::Split { children, .. } => {
+                for (i, c) in children.iter().enumerate() {
+                    path.push(i);
+                    collect_pane_paths(c, path, panes);
+                    path.pop();
+                }
+            }
+        }
+    }
+    let mut pane_paths = Vec::new();
+    collect_pane_paths(&win.root, &mut Vec::new(), &mut pane_paths);
+    if let Some(path) = pane_paths.get(idx) {
+        win.active_path = path.clone();
+    }
 }
 
 /// Parse a command line string, respecting quoted arguments.
@@ -5291,30 +5472,62 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                 // Auth successful - send OK
                 let _ = std::io::Write::write_all(&mut stream, b"OK\n");
                 
-                // Auth successful, now read the command
+                // Check for optional TARGET line (for session:window.pane addressing)
+                let mut global_target_win: Option<usize> = None;
+                let mut global_target_pane: Option<usize> = None;
+                let mut global_pane_is_id = false;
                 let mut line = String::new();
                 if r.read_line(&mut line).is_err() {
                     continue;
                 }
+                
+                // Check if this line is a TARGET specification
+                if line.trim().starts_with("TARGET ") {
+                    let target_spec = line.trim().strip_prefix("TARGET ").unwrap_or("");
+                    let parsed = parse_target(target_spec);
+                    global_target_win = parsed.window;
+                    global_target_pane = parsed.pane;
+                    global_pane_is_id = parsed.pane_is_id;
+                    // Now read the actual command line
+                    line.clear();
+                    if r.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                }
+                
                 // Use quote-aware parser to preserve arguments with spaces
                 let parsed = parse_command_line(&line);
                 let cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
                 let args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
-                let mut target_win: Option<usize> = None;
-                let mut target_pane: Option<usize> = None;
+                
+                // Parse -t argument from command line (takes precedence over global TARGET)
+                let mut target_win: Option<usize> = global_target_win;
+                let mut target_pane: Option<usize> = global_target_pane;
+                let mut pane_is_id = global_pane_is_id;
                 let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-t" {
                         if let Some(v) = args.get(i+1) {
-                            if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
-                            else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
+                            // Parse the -t value using parse_target for consistent handling
+                            let pt = parse_target(v);
+                            if pt.window.is_some() { target_win = pt.window; }
+                            if pt.pane.is_some() { 
+                                target_pane = pt.pane;
+                                pane_is_id = pt.pane_is_id;
+                            }
                         }
                         i += 2; continue;
                     }
                     i += 1;
                 }
                 if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-                if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
+                if let Some(pid) = target_pane { 
+                    if pane_is_id {
+                        let _ = tx.send(CtrlReq::FocusPane(pid));
+                    } else {
+                        let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+                    }
+                }
                 match cmd {
                     "new-window" => {
                         // Parse optional command - find first non-flag argument
@@ -5724,6 +5937,7 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                 }
                 CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); }
+                CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { "(attached)" } else { "(detached)" };
                     let windows = app.windows.len();
