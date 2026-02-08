@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 #[cfg(windows)]
 use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use crate::types::*;
 use crate::tree::*;
@@ -12,11 +14,13 @@ pub fn enter_copy_mode(app: &mut AppState) {
 
 #[cfg(windows)]
 fn copy_to_system_clipboard(text: &str) {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     if let Ok(mut child) = Command::new("cmd")
         .args(["/C", "clip"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
     {
         if let Some(stdin) = child.stdin.as_mut() {

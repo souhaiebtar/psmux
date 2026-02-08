@@ -29,7 +29,21 @@ pub enum LayoutJson {
     #[serde(rename = "split")]
     Split { kind: String, sizes: Vec<u16>, children: Vec<LayoutJson> },
     #[serde(rename = "leaf")]
-    Leaf { id: usize, rows: u16, cols: u16, cursor_row: u16, cursor_col: u16, active: bool, copy_mode: bool, scroll_offset: usize, content: Vec<Vec<CellJson>> },
+    Leaf {
+        id: usize,
+        rows: u16,
+        cols: u16,
+        cursor_row: u16,
+        cursor_col: u16,
+        active: bool,
+        copy_mode: bool,
+        scroll_offset: usize,
+        sel_start_row: Option<u16>,
+        sel_start_col: Option<u16>,
+        sel_end_row: Option<u16>,
+        sel_end_col: Option<u16>,
+        content: Vec<Vec<CellJson>>,
+    },
 }
 
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
@@ -64,33 +78,90 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     }
                     lines.push(row);
                 }
-                LayoutJson::Leaf { id: p.id, rows: p.last_rows, cols: p.last_cols, cursor_row: cr, cursor_col: cc, active: false, copy_mode: false, scroll_offset: 0, content: lines }
+                LayoutJson::Leaf {
+                    id: p.id,
+                    rows: p.last_rows,
+                    cols: p.last_cols,
+                    cursor_row: cr,
+                    cursor_col: cc,
+                    active: false,
+                    copy_mode: false,
+                    scroll_offset: 0,
+                    sel_start_row: None,
+                    sel_start_col: None,
+                    sel_end_row: None,
+                    sel_end_col: None,
+                    content: lines,
+                }
             }
         }
     }
     let win = &mut app.windows[app.active_idx];
     let mut root = build(&mut win.root);
     // Mark the active pane and set copy mode info
-    fn mark_active(node: &mut LayoutJson, path: &[usize], idx: usize, in_copy_mode: bool, scroll_offset: usize) {
+    fn mark_active(
+        node: &mut LayoutJson,
+        path: &[usize],
+        idx: usize,
+        in_copy_mode: bool,
+        scroll_offset: usize,
+        copy_anchor: Option<(u16, u16)>,
+        copy_pos: Option<(u16, u16)>,
+    ) {
         match node {
-            LayoutJson::Leaf { active, copy_mode, scroll_offset: so, .. } => {
+            LayoutJson::Leaf {
+                active,
+                copy_mode,
+                scroll_offset: so,
+                sel_start_row,
+                sel_start_col,
+                sel_end_row,
+                sel_end_col,
+                ..
+            } => {
                 let is_active = idx >= path.len();
                 *active = is_active;
                 if is_active {
                     *copy_mode = in_copy_mode;
                     *so = scroll_offset;
+                    if in_copy_mode {
+                        if let (Some((ar, ac)), Some((pr, pc))) = (copy_anchor, copy_pos) {
+                            *sel_start_row = Some(ar.min(pr));
+                            *sel_start_col = Some(ac.min(pc));
+                            *sel_end_row = Some(ar.max(pr));
+                            *sel_end_col = Some(ac.max(pc));
+                        } else {
+                            *sel_start_row = None;
+                            *sel_start_col = None;
+                            *sel_end_row = None;
+                            *sel_end_col = None;
+                        }
+                    } else {
+                        *sel_start_row = None;
+                        *sel_start_col = None;
+                        *sel_end_row = None;
+                        *sel_end_col = None;
+                    }
                 }
             }
             LayoutJson::Split { children, .. } => {
                 if idx < path.len() {
                     if let Some(child) = children.get_mut(path[idx]) {
-                        mark_active(child, path, idx + 1, in_copy_mode, scroll_offset);
+                        mark_active(child, path, idx + 1, in_copy_mode, scroll_offset, copy_anchor, copy_pos);
                     }
                 }
             }
         }
     }
-    mark_active(&mut root, &win.active_path, 0, in_copy_mode, scroll_offset);
+    mark_active(
+        &mut root,
+        &win.active_path,
+        0,
+        in_copy_mode,
+        scroll_offset,
+        app.copy_anchor,
+        app.copy_pos,
+    );
     let s = serde_json::to_string(&root).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }

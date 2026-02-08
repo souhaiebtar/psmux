@@ -357,7 +357,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
             fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool) {
                 match node {
-                    LayoutJson::Leaf { id: _, rows: _, cols: _, cursor_row, cursor_col, active, copy_mode, scroll_offset, content } => {
+                    LayoutJson::Leaf {
+                        id: _,
+                        rows: _,
+                        cols: _,
+                        cursor_row,
+                        cursor_col,
+                        active,
+                        copy_mode,
+                        scroll_offset,
+                        sel_start_row,
+                        sel_start_col,
+                        sel_end_row,
+                        sel_end_col,
+                        content,
+                    } => {
                         let pane_block = if *copy_mode && *active {
                             Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("[copy mode]")
                         } else if *active {
@@ -377,10 +391,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 let mut fg = map_color(&cell.fg);
                                 let mut bg = map_color(&cell.bg);
                                 if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
+                                let in_selection = if *copy_mode && *active {
+                                    if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
+                                        r >= *sr && r <= *er && c >= *sc && c <= *ec
+                                    } else { false }
+                                } else { false };
                                 if *active && dim_preds && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col)) {
                                     fg = dim_color(fg);
                                 }
                                 let mut style = Style::default().fg(fg).bg(bg);
+                                if in_selection {
+                                    style = style.fg(Color::Black).bg(Color::LightYellow);
+                                }
                                 if cell.dim { style = style.add_modifier(Modifier::DIM); }
                                 if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                 if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
