@@ -163,7 +163,7 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
 pub fn expand_status(fmt: &str, app: &AppState, time_str: &str) -> String {
     let mut s = fmt.to_string();
     let window = &app.windows[app.active_idx];
-    s = s.replace("#I", &(app.active_idx + 1).to_string());
+    s = s.replace("#I", &(app.active_idx + app.window_base_index).to_string());
     s = s.replace("#W", &window.name);
     s = s.replace("#S", "psmux");
     s = s.replace("%H:%M", time_str);

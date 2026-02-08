@@ -115,6 +115,7 @@ pub struct AppState {
     pub paste_buffers: Vec<String>,
     pub status_left: String,
     pub status_right: String,
+    pub window_base_index: usize,
     pub copy_anchor: Option<(u16,u16)>,
     pub copy_pos: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,

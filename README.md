@@ -199,7 +199,7 @@ psmux select-pane -L           # Select pane to the left
 psmux select-pane -R           # Select pane to the right
 
 # Navigate windows
-psmux select-window -t 0       # Select window by index
+psmux select-window -t 1       # Select window by index (default base-index is 1)
 psmux next-window              # Go to next window
 psmux previous-window          # Go to previous window
 psmux last-window              # Go to last active window
@@ -317,6 +317,9 @@ set -g prefix C-a
 
 # Enable mouse
 set -g mouse on
+
+# Window numbering base (default is 1)
+set -g base-index 1
 
 # Customize status bar
 set -g status-left "[#S]"

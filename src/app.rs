@@ -44,6 +44,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         paste_buffers: Vec::new(),
         status_left: "psmux:#I".to_string(),
         status_right: "%H:%M".to_string(),
+        window_base_index: 1,
         copy_anchor: None,
         copy_pos: None,
         copy_scroll_offset: 0,
@@ -204,7 +205,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let time_str = Local::now().format("%H:%M").to_string();
             let mut windows_list = String::new();
             for (i, _) in app.windows.iter().enumerate() {
-                if i == app.active_idx { windows_list.push_str(&format!(" #[{}]", i+1)); } else { windows_list.push_str(&format!(" {}", i+1)); }
+                let display_idx = i + app.window_base_index;
+                if i == app.active_idx { windows_list.push_str(&format!(" #[{}]", display_idx)); } else { windows_list.push_str(&format!(" {}", display_idx)); }
             }
             let status_spans = parse_status(&app.status_left, &app, &time_str);
             let mut right_spans = parse_status(&app.status_right, &app, &time_str);

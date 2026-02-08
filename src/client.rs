@@ -72,6 +72,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool }
+    
+    fn default_base_index() -> usize { 1 }
 
     #[derive(serde::Deserialize)]
     struct DumpState {
@@ -81,6 +83,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         prefix: Option<String>,
         #[serde(default)]
         tree: Vec<WinTree>,
+        #[serde(default = "default_base_index")]
+        base_index: usize,
     }
 
     loop {
@@ -333,6 +337,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         let root = state.layout;
         let windows = state.windows;
         last_tree = state.tree;
+        let base_index = state.base_index;
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
@@ -542,9 +547,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 Span::styled(format!("[{}] ", name), Style::default().fg(Color::Black).bg(Color::Green)),
             ];
             for (i, w) in windows.iter().enumerate() {
+                let display_idx = i + base_index;
                 if w.active {
                     status_spans.push(Span::styled(
-                        format!("{}: {} ", i, w.name),
+                        format!("{}: {} ", display_idx, w.name),
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Yellow)
@@ -552,7 +558,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     ));
                 } else {
                     status_spans.push(Span::styled(
-                        format!("{}: {} ", i, w.name),
+                        format!("{}: {} ", display_idx, w.name),
                         Style::default().fg(Color::Black).bg(Color::Green),
                     ));
                 }
