@@ -70,11 +70,13 @@ irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/uninstall.
 cargo install psmux
 ```
 
-### Using Chocolatey
+### Using Scoop
 
 ```powershell
-choco install psmux
+scoop install https://raw.githubusercontent.com/marlocarlo/psmux/master/scoop/psmux.json
 ```
+
+This installs `psmux`, `pmux`, and `tmux` from the Scoop manifest stored in this repository.
 
 ### From GitHub Releases
 

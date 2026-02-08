@@ -74,9 +74,9 @@ jobs:
             irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/install.ps1 | iex
             ```
             
-            **Via Chocolatey:**
+            **Via Scoop:**
             ```powershell
-            choco install psmux
+            scoop install https://raw.githubusercontent.com/${{ github.repository }}/master/scoop/psmux.json
             ```
             
             **Manual Installation:**
@@ -92,51 +92,3 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  chocolatey:
-    name: Publish to Chocolatey
-    needs: release
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Download release asset
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}"
-          $url = "https://github.com/marlocarlo/psmux/releases/download/$version/psmux-$version-windows-x64.zip"
-          Invoke-WebRequest -Uri $url -OutFile "psmux.zip"
-          
-      - name: Calculate checksum and update install script
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}"
-          $checksum = (Get-FileHash -Path "psmux.zip" -Algorithm SHA256).Hash
-          $url = "https://github.com/marlocarlo/psmux/releases/download/$version/psmux-$version-windows-x64.zip"
-          
-          # Update chocolateyinstall.ps1 with correct URL and checksum
-          $installScript = Get-Content "packages/chocolatey/tools/chocolateyinstall.ps1" -Raw
-          $installScript = $installScript -replace 'url\s*=\s*"[^"]*"', "url = `"$url`""
-          $installScript = $installScript -replace 'checksum\s*=\s*"[^"]*"', "checksum = `"$checksum`""
-          Set-Content "packages/chocolatey/tools/chocolateyinstall.ps1" $installScript
-          
-          # Update nuspec version
-          $versionNum = $version -replace '^v', ''
-          $nuspec = Get-Content "packages/chocolatey/psmux.nuspec" -Raw
-          $nuspec = $nuspec -replace '<version>[^<]*</version>', "<version>$versionNum</version>"
-          Set-Content "packages/chocolatey/psmux.nuspec" $nuspec
-          
-      - name: Pack Chocolatey package
-        shell: pwsh
-        run: |
-          cd packages/chocolatey
-          choco pack
-          
-      - name: Push to Chocolatey
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}" -replace '^v', ''
-          cd packages/chocolatey
-          choco push "psmux.$version.nupkg" --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
-        env:
-          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
