@@ -28,8 +28,8 @@ pub struct CellJson { pub text: String, pub fg: String, pub bg: String, pub bold
 #[derive(Serialize, Deserialize)]
 pub struct CellRunJson {
     pub text: String,
-    pub fg: String,
-    pub bg: String,
+    pub fg: u32,
+    pub bg: u32,
     pub flags: u8,
     pub width: u16,
 }
@@ -67,12 +67,27 @@ pub enum LayoutJson {
     },
 }
 
+fn encode_color(c: vt100::Color) -> u32 {
+    match c {
+        vt100::Color::Default => 0,
+        vt100::Color::Idx(i) => 0x01_00_00_00 | i as u32,
+        vt100::Color::Rgb(r, g, b) => {
+            0x02_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        }
+    }
+}
+
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode);
     let scroll_offset = app.copy_scroll_offset;
     const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(250);
     
-    fn build(node: &mut Node, cur_path: &mut Vec<usize>, active_path: &[usize], include_full_content: bool) -> LayoutJson {
+    fn build(
+        node: &mut Node,
+        cur_path: &mut Vec<usize>,
+        active_path: &[usize],
+        include_full_content: bool,
+    ) -> LayoutJson {
         match node {
             Node::Split { kind, sizes, children } => {
                 let k = match *kind { LayoutKind::Horizontal => "Horizontal".to_string(), LayoutKind::Vertical => "Vertical".to_string() };
@@ -120,17 +135,25 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     let mut runs: Vec<CellRunJson> = Vec::new();
                     let mut c = 0;
                     while c < p.last_cols {
-                        let mut fg = "default".to_string();
-                        let mut bg = "default".to_string();
                         let mut text = " ".to_string();
+                        let mut fg_code = encode_color(vt100::Color::Default);
+                        let mut bg_code = encode_color(vt100::Color::Default);
+                        let mut fg_name = String::new();
+                        let mut bg_name = String::new();
                         let mut bold = false;
                         let mut italic = false;
                         let mut underline = false;
                         let mut inverse = false;
                         let mut dim = false;
                         if let Some(cell) = screen.cell(r, c) {
-                            fg = crate::util::color_to_name(cell.fgcolor());
-                            bg = crate::util::color_to_name(cell.bgcolor());
+                            let fg = cell.fgcolor();
+                            let bg = cell.bgcolor();
+                            fg_code = encode_color(fg);
+                            bg_code = encode_color(bg);
+                            if need_full_content {
+                                fg_name = crate::util::color_to_name(fg);
+                                bg_name = crate::util::color_to_name(bg);
+                            }
                             text = cell.contents().to_string();
                             if text.is_empty() {
                                 text = " ".to_string();
@@ -155,21 +178,23 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         if inverse { flags |= FLAG_INVERSE; }
 
                         if let Some(last) = runs.last_mut() {
-                            if last.fg == fg && last.bg == bg && last.flags == flags {
+                            if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
                                 last.text.push_str(&text);
                                 last.width = last.width.saturating_add(width);
                             } else {
-                                runs.push(CellRunJson { text: text.clone(), fg: fg.clone(), bg: bg.clone(), flags, width });
+                                runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
                             }
                         } else {
-                            runs.push(CellRunJson { text: text.clone(), fg: fg.clone(), bg: bg.clone(), flags, width });
+                            runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
                         }
 
                         if need_full_content {
+                            let fg = if fg_name.is_empty() { "default" } else { fg_name.as_str() };
+                            let bg = if bg_name.is_empty() { "default" } else { bg_name.as_str() };
                             row.push(CellJson {
                                 text: text.clone(),
-                                fg: fg.clone(),
-                                bg: bg.clone(),
+                                fg: fg.to_string(),
+                                bg: bg.to_string(),
                                 bold,
                                 italic,
                                 underline,
@@ -179,8 +204,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                             for _ in 1..width {
                                 row.push(CellJson {
                                     text: String::new(),
-                                    fg: fg.clone(),
-                                    bg: bg.clone(),
+                                    fg: fg.to_string(),
+                                    bg: bg.to_string(),
                                     bold,
                                     italic,
                                     underline,

@@ -475,8 +475,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 let mut c: u16 = 0;
                                 for run in &rows_v2[r as usize].runs {
                                     if c >= inner.width { break; }
-                                    let mut fg = map_color(&run.fg);
-                                    let mut bg = map_color(&run.bg);
+                                    let mut fg = map_color_code(run.fg);
+                                    let mut bg = map_color_code(run.bg);
                                     if run.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
                                     if *active && dim_preds && !*alternate_screen
                                         && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))

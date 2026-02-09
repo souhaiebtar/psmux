@@ -236,6 +236,19 @@ pub fn map_color(name: &str) -> Color {
     Color::Reset
 }
 
+pub fn map_color_code(code: u32) -> Color {
+    match code >> 24 {
+        0 => Color::Reset,
+        1 => Color::Indexed((code & 0xff) as u8),
+        2 => Color::Rgb(
+            ((code >> 16) & 0xff) as u8,
+            ((code >> 8) & 0xff) as u8,
+            (code & 0xff) as u8,
+        ),
+        _ => Color::Reset,
+    }
+}
+
 pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
