@@ -1,41 +1,7 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
-/// Spawn a PTY reader thread with output coalescing.
-///
-/// After each read, the thread sleeps briefly (2ms) and drains any additional
-/// pending data before acquiring the parser lock. This batches rapid sequential
-/// PTY writes (e.g. from htop / pstop doing full-screen redraws) into a single
-/// parser update, reducing frame tearing when psmux renders between chunks.
-fn spawn_pty_reader(mut reader: Box<dyn Read + Send>, term: Arc<Mutex<vt100::Parser>>) {
-    thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        let mut accum: Vec<u8> = Vec::with_capacity(65536);
-        loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    accum.extend_from_slice(&buf[..n]);
-                    // Coalesce: sleep briefly then drain any additional pending data.
-                    thread::sleep(Duration::from_millis(2));
-                    for _ in 0..3 {
-                        match reader.read(&mut buf) {
-                            Ok(n2) if n2 > 0 => accum.extend_from_slice(&buf[..n2]),
-                            _ => break,
-                        }
-                    }
-                    // Process entire batch under one lock.
-                    let mut parser = term.lock().unwrap();
-                    parser.process(&accum);
-                    accum.clear();
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
-}
 
 use portable_pty::{CommandBuilder, PtySize, PtySystemSelection};
 
@@ -55,12 +21,25 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
-    let reader = pair
+    let term_reader = term.clone();
+    let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    spawn_pty_reader(reader, term.clone());
+    thread::spawn(move || {
+        let mut local = [0u8; 8192];
+        loop {
+            match reader.read(&mut local) {
+                Ok(n) if n > 0 => {
+                    let mut parser = term_reader.lock().unwrap();
+                    parser.process(&local[..n]);
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    });
 
     let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
     app.next_pane_id += 1;
@@ -88,12 +67,25 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
-    let reader = pair
+    let term_reader = term.clone();
+    let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    spawn_pty_reader(reader, term.clone());
+    thread::spawn(move || {
+        let mut local = [0u8; 8192];
+        loop {
+            match reader.read(&mut local) {
+                Ok(n) if n > 0 => {
+                    let mut parser = term_reader.lock().unwrap();
+                    parser.process(&local[..n]);
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    });
 
     let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
     app.next_pane_id += 1;
@@ -110,8 +102,18 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let shell_cmd = build_command(command);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
-    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
-    spawn_pty_reader(reader, term.clone());
+    let term_reader = term.clone();
+    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    thread::spawn(move || {
+        let mut local = [0u8; 8192];
+        loop {
+            match reader.read(&mut local) {
+                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(_) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    });
     let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
