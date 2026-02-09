@@ -2,12 +2,17 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, PtySystemSelection};
 
 use crate::types::*;
 use crate::tree::*;
+
+fn initial_title_infer_time() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_millis(300)).unwrap_or(now)
+}
 
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>) -> io::Result<()> {
     let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
@@ -50,6 +55,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         child,
         term,
         output_dirty,
+        last_title_infer_at: initial_title_infer_time(),
         last_rows: size.rows,
         last_cols: size.cols,
         id: app.next_pane_id,
@@ -108,6 +114,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         child,
         term,
         output_dirty,
+        last_title_infer_at: initial_title_infer_time(),
         last_rows: size.rows,
         last_cols: size.cols,
         id: app.next_pane_id,
@@ -150,6 +157,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         child,
         term,
         output_dirty,
+        last_title_infer_at: initial_title_infer_time(),
         last_rows: size.rows,
         last_cols: size.cols,
         id: app.next_pane_id,

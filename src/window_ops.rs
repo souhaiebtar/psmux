@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{PtySize, PtySystemSelection};
 use ratatui::prelude::*;
@@ -314,6 +314,8 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     pane.child = child;
     pane.term = term;
     pane.output_dirty = output_dirty;
+    let now = Instant::now();
+    pane.last_title_infer_at = now.checked_sub(Duration::from_millis(300)).unwrap_or(now);
     
     Ok(())
 }

@@ -1,4 +1,5 @@
 use std::io;
+use std::time::{Duration, Instant};
 
 use serde::{Serialize, Deserialize};
 use unicode_width::UnicodeWidthStr;
@@ -69,6 +70,7 @@ pub enum LayoutJson {
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode);
     let scroll_offset = app.copy_scroll_offset;
+    const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(250);
     
     fn build(node: &mut Node, cur_path: &mut Vec<usize>, active_path: &[usize], include_full_content: bool) -> LayoutJson {
         match node {
@@ -93,7 +95,15 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                 let screen = parser.screen();
                 let (cr, cc) = screen.cursor_position();
                 let alternate_screen = screen.alternate_screen();
-                if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) { p.title = t; }
+                let now = Instant::now();
+                if !alternate_screen && now.duration_since(p.last_title_infer_at) >= TITLE_INFER_INTERVAL {
+                    if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
+                        if t != p.title {
+                            p.title = t;
+                        }
+                    }
+                    p.last_title_infer_at = now;
+                }
                 let need_full_content = include_full_content && *cur_path == active_path;
                 let mut lines: Vec<Vec<CellJson>> = if need_full_content {
                     Vec::with_capacity(p.last_rows as usize)

@@ -13,6 +13,7 @@ pub struct Pane {
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     pub output_dirty: Arc<std::sync::atomic::AtomicBool>,
+    pub last_title_infer_at: Instant,
     pub last_rows: u16,
     pub last_cols: u16,
     pub id: usize,
