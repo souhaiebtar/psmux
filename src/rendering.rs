@@ -217,25 +217,23 @@ pub fn map_color(name: &str) -> Color {
         }
     }
     if let Some(rgb_str) = name.strip_prefix("rgb:") {
-        let parts: Vec<&str> = rgb_str.split(',').collect();
-        if parts.len() == 3 {
-            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
+        let mut it = rgb_str.split(',');
+        if let (Some(r), Some(g), Some(b), None) = (it.next(), it.next(), it.next(), it.next()) {
+            if let (Ok(r), Ok(g), Ok(b)) = (r.parse::<u8>(), g.parse::<u8>(), b.parse::<u8>()) {
                 return Color::Rgb(r, g, b);
             }
         }
     }
-    match name.to_lowercase().as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "white" => Color::White,
-        "default" => Color::Reset,
-        _ => Color::Reset,
-    }
+    if name.eq_ignore_ascii_case("black") { return Color::Black; }
+    if name.eq_ignore_ascii_case("red") { return Color::Red; }
+    if name.eq_ignore_ascii_case("green") { return Color::Green; }
+    if name.eq_ignore_ascii_case("yellow") { return Color::Yellow; }
+    if name.eq_ignore_ascii_case("blue") { return Color::Blue; }
+    if name.eq_ignore_ascii_case("magenta") { return Color::Magenta; }
+    if name.eq_ignore_ascii_case("cyan") { return Color::Cyan; }
+    if name.eq_ignore_ascii_case("white") { return Color::White; }
+    if name.eq_ignore_ascii_case("default") { return Color::Reset; }
+    Color::Reset
 }
 
 pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
