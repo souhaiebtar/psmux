@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::env;
@@ -284,7 +285,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if !persistent { break; }
                     }
                     "dump-state" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let (rtx, rrx) = mpsc::channel::<Arc<str>>();
                         let _ = tx.send(CtrlReq::DumpState(rtx));
                         if let Ok(text) = rrx.recv() { 
                             let _ = write!(write_stream, "{}\n", text); 
@@ -676,7 +677,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         }
     });
     let mut state_dirty = true;
-    let mut cached_dump_state = String::new();
+    let mut cached_dump_state: Arc<str> = Arc::from("");
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         let mut sent_pty_input = false;
@@ -741,7 +742,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let windows_json = list_windows_json(&app)?;
                     let tree_json = list_tree_json(&app)?;
                     let prefix_str = format_key_binding(&app.prefix_key);
-                    let combined = format!(
+                    let combined: Arc<str> = format!(
                         "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"refresh_ms\":{}}}",
                         layout_json,
                         windows_json,
@@ -750,7 +751,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         app.window_base_index,
                         app.prediction_dimming,
                         app.refresh_interval_ms
-                    );
+                    )
+                    .into();
                     cached_dump_state = combined.clone();
                     last_dump_build = std::time::Instant::now();
                     state_dirty = false;

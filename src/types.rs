@@ -193,7 +193,7 @@ pub enum CtrlReq {
     ClientAttach,
     ClientDetach,
     DumpLayout(mpsc::Sender<String>),
-    DumpState(mpsc::Sender<String>),
+    DumpState(mpsc::Sender<Arc<str>>),
     SendText(String),
     SendKey(String),
     SendPaste(String),
