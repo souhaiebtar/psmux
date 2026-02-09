@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "0.2.2"
+version = "0.2.7"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
@@ -11,6 +11,12 @@ categories = ["command-line-utilities"]
 
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+] }
 
 [[bin]]
 name = "psmux"

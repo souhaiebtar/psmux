@@ -36,6 +36,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         mode: Mode::Passthrough,
         escape_time_ms: 500,
         prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+        prediction_dimming: crate::rendering::dim_predictions_enabled(),
         drag: None,
         // Use a reasonable default size so pane switching works even when detached
         last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
@@ -43,6 +44,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         paste_buffers: Vec::new(),
         status_left: "psmux:#I".to_string(),
         status_right: "%H:%M".to_string(),
+        window_base_index: 1,
         copy_anchor: None,
         copy_pos: None,
         copy_scroll_offset: 0,
@@ -234,6 +236,20 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     i += 1;
                 }
+                // Build args without -t and its value so command handlers get clean positional args
+                let args: Vec<&str> = {
+                    let mut filtered = Vec::new();
+                    let mut i = 0;
+                    while i < args.len() {
+                        if args[i] == "-t" {
+                            i += 2; // skip -t and its value
+                            continue;
+                        }
+                        filtered.push(args[i]);
+                        i += 1;
+                    }
+                    filtered
+                };
                 if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
                 if let Some(pid) = target_pane { 
                     if pane_is_id {
@@ -327,8 +343,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "mouse-up" => {
                         if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUp(x,y)); } }
                     }
-                    "scroll-up" => { let _ = tx.send(CtrlReq::ScrollUp); }
-                    "scroll-down" => { let _ = tx.send(CtrlReq::ScrollDown); }
+                    "scroll-up" => {
+                        let x = args.get(0).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        let y = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        let _ = tx.send(CtrlReq::ScrollUp(x, y));
+                    }
+                    "scroll-down" => {
+                        let x = args.get(0).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        let y = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        let _ = tx.send(CtrlReq::ScrollDown(x, y));
+                    }
                     "next-window" => { let _ = tx.send(CtrlReq::NextWindow); }
                     "previous-window" => { let _ = tx.send(CtrlReq::PrevWindow); }
                     "rename-window" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
@@ -664,9 +688,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             }
         }
     });
+    let mut state_dirty = true;
+    let mut cached_dump_state = String::new();
+    let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         let mut sent_pty_input = false;
         while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
             match req {
                 CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
@@ -700,6 +728,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = resp.send(json);
                 }
                 CtrlReq::DumpState(resp) => {
+                    if !state_dirty
+                        && !cached_dump_state.is_empty()
+                        && last_dump_build.elapsed() < Duration::from_millis(120)
+                    {
+                        let _ = resp.send(cached_dump_state.clone());
+                        continue;
+                    }
                     // Brief yield to let ConPTY + PSReadLine finish rendering after input
                     // Without this, dump-state can capture an intermediate render state
                     // (e.g., PSReadLine mid-redraw showing prediction artifacts)
@@ -710,7 +745,19 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let windows_json = list_windows_json(&app)?;
                     let tree_json = list_tree_json(&app)?;
                     let prefix_str = format_key_binding(&app.prefix_key);
-                    let combined = format!("{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{}}}", layout_json, windows_json, prefix_str, tree_json);
+                    let combined = format!(
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{}}}",
+                        layout_json,
+                        windows_json,
+                        prefix_str,
+                        tree_json,
+                        app.window_base_index,
+                        app.prediction_dimming
+                    );
+                    cached_dump_state = combined.clone();
+                    last_dump_build = std::time::Instant::now();
+                    state_dirty = false;
+                    sent_pty_input = false;
                     let _ = resp.send(combined);
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; sent_pty_input = true; }
@@ -729,9 +776,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
                 CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
-                CtrlReq::MouseUp(_,_) => { app.drag = None; }
-                CtrlReq::ScrollUp => { remote_scroll_up(&mut app); }
-                CtrlReq::ScrollDown => { remote_scroll_down(&mut app); }
+                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
+                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
+                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; }
@@ -831,7 +878,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                 }
                 CtrlReq::SelectWindow(idx) => {
-                    if idx < app.windows.len() { app.active_idx = idx; }
+                    if idx >= app.window_base_index {
+                        let internal_idx = idx - app.window_base_index;
+                        if internal_idx < app.windows.len() {
+                            app.active_idx = internal_idx;
+                        }
+                    }
                 }
                 CtrlReq::ListPanes(resp) => {
                     let mut output = String::new();
@@ -921,7 +973,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::DisplayMessage(resp, fmt) => {
                     let mut result = fmt.clone();
                     result = result.replace("#S", &app.session_name);
-                    result = result.replace("#I", &app.active_idx.to_string());
+                    result = result.replace("#I", &(app.active_idx + app.window_base_index).to_string());
                     result = result.replace("#W", &app.windows[app.active_idx].name);
                     let win = &app.windows[app.active_idx];
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
@@ -994,6 +1046,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     match option.as_str() {
                         "status-left" => { app.status_left = value; }
                         "status-right" => { app.status_right = value; }
+                        "base-index" => {
+                            if let Ok(idx) = value.parse::<usize>() {
+                                app.window_base_index = idx;
+                            }
+                        }
                         "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
                         "prefix" => {
                             if let Some(kc) = parse_key_string(&value) {
@@ -1005,6 +1062,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.escape_time_ms = ms;
                             }
                         }
+                        "prediction-dimming" | "dim-predictions" => {
+                            app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
+                        }
                         _ => {}
                     }
                 }
@@ -1012,9 +1072,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let mut output = String::new();
                     output.push_str(&format!("status-left \"{}\"\n", app.status_left));
                     output.push_str(&format!("status-right \"{}\"\n", app.status_right));
+                    output.push_str(&format!("base-index {}\n", app.window_base_index));
                     output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
                     output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
+                    output.push_str(&format!(
+                        "prediction-dimming {}\n",
+                        if app.prediction_dimming { "on" } else { "off" }
+                    ));
                     let _ = resp.send(output);
                 }
                 CtrlReq::SourceFile(path) => {
@@ -1032,9 +1097,17 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                             match *opt {
                                                 "status-left" => { app.status_left = parts[opt_idx + 1..].join(" ").trim_matches('"').to_string(); }
                                                 "status-right" => { app.status_right = parts[opt_idx + 1..].join(" ").trim_matches('"').to_string(); }
+                                                "base-index" => {
+                                                    if let Ok(idx) = val.parse::<usize>() {
+                                                        app.window_base_index = idx;
+                                                    }
+                                                }
                                                 "mouse" => { app.mouse_enabled = *val == "on" || *val == "true" || *val == "1"; }
                                                 "prefix" => { if let Some(kc) = parse_key_string(val) { app.prefix_key = kc; } }
                                                 "escape-time" => { if let Ok(ms) = val.parse::<u64>() { app.escape_time_ms = ms; } }
+                                                "prediction-dimming" | "dim-predictions" => {
+                                                    app.prediction_dimming = !matches!(*val, "off" | "false" | "0");
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -1098,7 +1171,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let mut output = String::new();
                     for (i, win) in app.windows.iter().enumerate() {
                         if win.name.contains(&pattern) {
-                            output.push_str(&format!("{}: {} []\n", i, win.name));
+                            output.push_str(&format!("{}: {} []\n", i + app.window_base_index, win.name));
                         }
                     }
                     let _ = resp.send(output);
@@ -1302,12 +1375,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     };
                 }
             }
+            if mutates_state {
+                state_dirty = true;
+            }
         }
         // Check if all windows/panes have exited
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
         if any_pruned {
-            // A pane exited naturally — resize remaining panes to fill the space
+            // A pane exited naturally - resize remaining panes to fill the space
             resize_all_panes(&mut app);
+            state_dirty = true;
         }
         if all_empty {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();

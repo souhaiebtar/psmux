@@ -38,12 +38,14 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         mode: Mode::Passthrough,
         escape_time_ms: 500,
         prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+        prediction_dimming: crate::rendering::dim_predictions_enabled(),
         drag: None,
         last_window_area: Rect { x: 0, y: 0, width: 0, height: 0 },
         mouse_enabled: true,
         paste_buffers: Vec::new(),
         status_left: "psmux:#I".to_string(),
         status_right: "%H:%M".to_string(),
+        window_base_index: 1,
         copy_anchor: None,
         copy_pos: None,
         copy_scroll_offset: 0,
@@ -204,7 +206,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let time_str = Local::now().format("%H:%M").to_string();
             let mut windows_list = String::new();
             for (i, _) in app.windows.iter().enumerate() {
-                if i == app.active_idx { windows_list.push_str(&format!(" #[{}]", i+1)); } else { windows_list.push_str(&format!(" {}", i+1)); }
+                let display_idx = i + app.window_base_index;
+                if i == app.active_idx { windows_list.push_str(&format!(" #[{}]", display_idx)); } else { windows_list.push_str(&format!(" {}", display_idx)); }
             }
             let status_spans = parse_status(&app.status_left, &app, &time_str);
             let mut right_spans = parse_status(&app.status_right, &app, &time_str);
@@ -437,9 +440,9 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
                 CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
-                CtrlReq::MouseUp(_,_) => { app.drag = None; }
-                CtrlReq::ScrollUp => { remote_scroll_up(&mut app); }
-                CtrlReq::ScrollDown => { remote_scroll_down(&mut app); }
+                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
+                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
+                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; }

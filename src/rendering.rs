@@ -70,11 +70,19 @@ pub fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {
 }
 
 pub fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
+    let dim_preds = app.prediction_dimming;
     let win = &mut app.windows[app.active_idx];
-    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area);
+    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds);
 }
 
-pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur_path: &mut Vec<usize>, area: Rect) {
+pub fn render_node(
+    f: &mut Frame,
+    node: &mut Node,
+    active_path: &Vec<usize>,
+    cur_path: &mut Vec<usize>,
+    area: Rect,
+    dim_preds: bool,
+) {
     match node {
         Node::Leaf(pane) => {
             let is_active = *cur_path == *active_path;
@@ -93,7 +101,6 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
             let parser = pane.term.lock().unwrap();
             let screen = parser.screen();
             let (cur_r, cur_c) = screen.cursor_position();
-            let dim_preds = dim_predictions_enabled();
             let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);
             for r in 0..target_rows {
                 let mut spans: Vec<Span> = Vec::with_capacity(target_cols as usize);
@@ -103,7 +110,9 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
                         let mut fg = vt_to_color(cell.fgcolor());
                         let mut bg = vt_to_color(cell.bgcolor());
                         if cell.inverse() { std::mem::swap(&mut fg, &mut bg); }
-                        if dim_preds && (r > cur_r || (r == cur_r && c >= cur_c)) {
+                        if dim_preds && !screen.alternate_screen()
+                            && (r > cur_r || (r == cur_r && c >= cur_c))
+                        {
                             fg = dim_color(fg);
                         }
                         let mut style = Style::default().fg(fg).bg(bg);
@@ -153,7 +162,7 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
             };
             for (i, child) in children.iter_mut().enumerate() {
                 cur_path.push(i);
-                render_node(f, child, active_path, cur_path, rects[i]);
+                render_node(f, child, active_path, cur_path, rects[i], dim_preds);
                 cur_path.pop();
             }
         }
@@ -163,7 +172,7 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
 pub fn expand_status(fmt: &str, app: &AppState, time_str: &str) -> String {
     let mut s = fmt.to_string();
     let window = &app.windows[app.active_idx];
-    s = s.replace("#I", &(app.active_idx + 1).to_string());
+    s = s.replace("#I", &(app.active_idx + app.window_base_index).to_string());
     s = s.replace("#W", &window.name);
     s = s.replace("#S", "psmux");
     s = s.replace("%H:%M", time_str);

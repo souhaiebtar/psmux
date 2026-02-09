@@ -73,12 +73,18 @@ pub fn send_control(line: String) -> io::Result<()> {
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(addr)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
+    // Read the "OK" response to drain the receive buffer before closing.
+    // This prevents Windows from sending RST (due to unread data) which
+    // could cause the server to lose the command.
+    let mut buf = [0u8; 64];
+    let _ = std::io::Read::read(&mut stream, &mut buf);
     Ok(())
 }
 

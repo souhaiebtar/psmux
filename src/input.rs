@@ -46,7 +46,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Down => { move_focus(app, FocusDir::Down); true }
                 KeyCode::Char(d) if d.is_ascii_digit() => {
                     let idx = d.to_digit(10).unwrap() as usize;
-                    if idx > 0 && idx <= app.windows.len() { app.active_idx = idx - 1; }
+                    if idx >= app.window_base_index {
+                        let internal_idx = idx - app.window_base_index;
+                        if internal_idx < app.windows.len() {
+                            app.active_idx = internal_idx;
+                        }
+                    }
                     true
                 }
                 KeyCode::Char('c') => {
@@ -362,18 +367,42 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
     Ok(())
 }
 
+fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
+    // Convert global terminal coordinates to 1-based pane-local coordinates.
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+
+    let col = x
+        .saturating_sub(inner_x)
+        .min(inner_w.saturating_sub(1))
+        .saturating_add(1);
+    let row = y
+        .saturating_sub(inner_y)
+        .min(inner_h.saturating_sub(1))
+        .saturating_add(1);
+    (col, row)
+}
+
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, window_area, &mut rects);
     let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
     compute_split_borders(&win.root, window_area, &mut borders);
+    let mut active_area = rects
+        .iter()
+        .find(|(path, _)| *path == win.active_path)
+        .map(|(_, area)| *area);
 
     use crossterm::event::{MouseEventKind, MouseButton};
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             for (path, area) in rects.iter() {
-                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) { win.active_path = path.clone(); }
+                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
+                    win.active_path = path.clone();
+                }
             }
             let tol = 1u16;
             for (path, kind, idx, pos) in borders.iter() {
@@ -404,10 +433,32 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
         }
         MouseEventKind::Up(MouseButton::Left) => { app.drag = None; }
         MouseEventKind::ScrollUp => {
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(active.master, "\x1b[A"); }
+            if matches!(app.mode, Mode::CopyMode) {
+                scroll_copy_up(app, 3);
+                return Ok(());
+            }
+            if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x: me.column, y: me.row })) {
+                win.active_path = path.clone();
+                active_area = Some(*area);
+            }
+            let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let _ = write!(active.master, "\x1b[<64;{};{}M", col, row);
+            }
         }
         MouseEventKind::ScrollDown => {
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(active.master, "\x1b[B"); }
+            if matches!(app.mode, Mode::CopyMode) {
+                scroll_copy_down(app, 3);
+                return Ok(());
+            }
+            if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x: me.column, y: me.row })) {
+                win.active_path = path.clone();
+                active_area = Some(*area);
+            }
+            let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let _ = write!(active.master, "\x1b[<65;{};{}M", col, row);
+            }
         }
         _ => {}
     }

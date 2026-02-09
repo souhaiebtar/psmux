@@ -64,6 +64,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
     let mut last_event_time = Instant::now();
+    let mut last_dump_time = Instant::now() - Duration::from_millis(250);
+    let mut force_dump = true;
     let mut last_tree: Vec<WinTree> = Vec::new();
     // Default prefix is Ctrl+B, updated dynamically from server config
     let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
@@ -72,6 +74,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool }
+    
+    fn default_base_index() -> usize { 1 }
+    fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
 
     #[derive(serde::Deserialize)]
     struct DumpState {
@@ -81,18 +86,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         prefix: Option<String>,
         #[serde(default)]
         tree: Vec<WinTree>,
+        #[serde(default = "default_base_index")]
+        base_index: usize,
+        #[serde(default = "default_prediction_dimming")]
+        prediction_dimming: bool,
     }
 
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
         // Fast polling when typing (1ms), relaxed when idle (16ms ≈ 60fps)
         let since_last = last_event_time.elapsed().as_millis();
-        let poll_ms = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 16 };
+        let poll_ms = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 25 };
 
         let mut cmd_batch: Vec<String> = Vec::new();
+        let mut had_input_event = false;
         if event::poll(Duration::from_millis(poll_ms))? {
             last_event_time = Instant::now();
             loop {
+                had_input_event = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -114,6 +125,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Char('[') | KeyCode::Char('{') => { cmd_batch.push("copy-enter\n".into()); }
                                 KeyCode::Char('n') => { cmd_batch.push("next-window\n".into()); }
                                 KeyCode::Char('p') => { cmd_batch.push("previous-window\n".into()); }
+                                KeyCode::Char(d) if d.is_ascii_digit() => {
+                                    let idx = d.to_digit(10).unwrap() as usize;
+                                    cmd_batch.push(format!("select-window {}\n", idx));
+                                }
                                 KeyCode::Char('o') => { cmd_batch.push("select-pane -t :.+\n".into()); }
                                 KeyCode::Up => { cmd_batch.push("select-pane -U\n".into()); }
                                 KeyCode::Down => { cmd_batch.push("select-pane -D\n".into()); }
@@ -278,8 +293,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             MouseEventKind::Down(MouseButton::Left) => { cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row)); }
                             MouseEventKind::Drag(MouseButton::Left) => { cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row)); }
                             MouseEventKind::Up(MouseButton::Left) => { cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row)); }
-                            MouseEventKind::ScrollUp => { cmd_batch.push("scroll-up\n".into()); }
-                            MouseEventKind::ScrollDown => { cmd_batch.push("scroll-down\n".into()); }
+                            MouseEventKind::ScrollUp => { cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row)); }
+                            MouseEventKind::ScrollDown => { cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row)); }
                             _ => {}
                         }
                     }
@@ -292,11 +307,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
         // ── STEP 2: Send commands + dump-state on persistent connection ──
         // Send client-size if changed
+        let mut size_changed = false;
         {
             let ts = terminal.size()?;
             let new_size = (ts.width, ts.height.saturating_sub(1));
             if new_size != last_sent_size {
                 last_sent_size = new_size;
+                size_changed = true;
                 if writer.write_all(format!("client-size {} {}\n", new_size.0, new_size.1).as_bytes()).is_err() {
                     break; // Connection lost
                 }
@@ -308,6 +325,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             if writer.write_all(cmd.as_bytes()).is_err() {
                 break; // Connection lost
             }
+        }
+
+        // Avoid full-state roundtrips every loop when idle.
+        let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
+        let idle_refresh_ms = if overlays_active { 33 } else { 120 };
+        let should_dump = force_dump
+            || had_input_event
+            || size_changed
+            || !cmd_batch.is_empty()
+            || last_dump_time.elapsed() >= Duration::from_millis(idle_refresh_ms);
+        if !should_dump {
+            continue;
         }
 
         // Send dump-state and flush (server responds with one line of JSON)
@@ -323,12 +352,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
         let state: DumpState = match serde_json::from_str(&buf) {
             Ok(s) => s,
-            Err(_) => continue, // Skip frame on parse error
+            Err(_) => {
+                force_dump = true;
+                continue; // Skip frame on parse error
+            }
         };
 
         let root = state.layout;
         let windows = state.windows;
         last_tree = state.tree;
+        let base_index = state.base_index;
+        let dim_preds = state.prediction_dimming;
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
@@ -353,7 +387,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
             fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool) {
                 match node {
-                    LayoutJson::Leaf { id: _, rows: _, cols: _, cursor_row, cursor_col, active, copy_mode, scroll_offset, content } => {
+                    LayoutJson::Leaf {
+                        id: _,
+                        rows: _,
+                        cols: _,
+                        cursor_row,
+                        cursor_col,
+                        alternate_screen,
+                        active,
+                        copy_mode,
+                        scroll_offset,
+                        sel_start_row,
+                        sel_start_col,
+                        sel_end_row,
+                        sel_end_col,
+                        content,
+                        rows_v2,
+                    } => {
                         let pane_block = if *copy_mode && *active {
                             Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("[copy mode]")
                         } else if *active {
@@ -363,34 +413,72 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         };
                         let inner = pane_block.inner(area);
                         let mut lines: Vec<Line> = Vec::new();
-                        for r in 0..inner.height.min(content.len() as u16) {
-                            let mut spans: Vec<Span> = Vec::new();
-                            let row = &content[r as usize];
-                            let max_c = inner.width.min(row.len() as u16);
-                            let mut c: u16 = 0;
-                            while c < max_c {
-                                let cell = &row[c as usize];
-                                let mut fg = map_color(&cell.fg);
-                                let mut bg = map_color(&cell.bg);
-                                if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
-                                if *active && dim_preds && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col)) {
-                                    fg = dim_color(fg);
+                        let use_full_cells = *copy_mode && *active && !content.is_empty();
+                        if use_full_cells || rows_v2.is_empty() {
+                            for r in 0..inner.height.min(content.len() as u16) {
+                                let mut spans: Vec<Span> = Vec::new();
+                                let row = &content[r as usize];
+                                let max_c = inner.width.min(row.len() as u16);
+                                let mut c: u16 = 0;
+                                while c < max_c {
+                                    let cell = &row[c as usize];
+                                    let mut fg = map_color(&cell.fg);
+                                    let mut bg = map_color(&cell.bg);
+                                    if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
+                                    let in_selection = if *copy_mode && *active {
+                                        if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
+                                            r >= *sr && r <= *er && c >= *sc && c <= *ec
+                                        } else { false }
+                                    } else { false };
+                                    if *active && dim_preds && !*alternate_screen
+                                        && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
+                                    {
+                                        fg = dim_color(fg);
+                                    }
+                                    let mut style = Style::default().fg(fg).bg(bg);
+                                    if in_selection {
+                                        style = style.fg(Color::Black).bg(Color::LightYellow);
+                                    }
+                                    if cell.dim { style = style.add_modifier(Modifier::DIM); }
+                                    if cell.bold { style = style.add_modifier(Modifier::BOLD); }
+                                    if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
+                                    if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
+                                    let char_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+                                    spans.push(Span::styled(text, style));
+                                    if char_width >= 2 {
+                                        c += 2; // skip continuation cell after wide character
+                                    } else {
+                                        c += 1;
+                                    }
                                 }
-                                let mut style = Style::default().fg(fg).bg(bg);
-                                if cell.dim { style = style.add_modifier(Modifier::DIM); }
-                                if cell.bold { style = style.add_modifier(Modifier::BOLD); }
-                                if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
-                                if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
-                                let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
-                                let char_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
-                                spans.push(Span::styled(text, style));
-                                if char_width >= 2 {
-                                    c += 2; // skip continuation cell after wide character
-                                } else {
-                                    c += 1;
-                                }
+                                lines.push(Line::from(spans));
                             }
-                            lines.push(Line::from(spans));
+                        } else {
+                            for r in 0..inner.height.min(rows_v2.len() as u16) {
+                                let mut spans: Vec<Span> = Vec::new();
+                                let mut c: u16 = 0;
+                                for run in &rows_v2[r as usize].runs {
+                                    if c >= inner.width { break; }
+                                    let mut fg = map_color(&run.fg);
+                                    let mut bg = map_color(&run.bg);
+                                    if run.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
+                                    if *active && dim_preds && !*alternate_screen
+                                        && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
+                                    {
+                                        fg = dim_color(fg);
+                                    }
+                                    let mut style = Style::default().fg(fg).bg(bg);
+                                    if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
+                                    if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
+                                    if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
+                                    if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    let text = if run.text.is_empty() { " ".to_string() } else { run.text.clone() };
+                                    spans.push(Span::styled(text, style));
+                                    c = c.saturating_add(run.width.max(1));
+                                }
+                                lines.push(Line::from(spans));
+                            }
                         }
                         f.render_widget(pane_block, area);
                         f.render_widget(Clear, inner);
@@ -430,7 +518,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 }
             }
 
-            let dim_preds = dim_predictions_enabled();
             render_json(f, &root, chunks[0], dim_preds);
 
             if session_chooser {
@@ -516,11 +603,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 Span::styled(format!("[{}] ", name), Style::default().fg(Color::Black).bg(Color::Green)),
             ];
             for (i, w) in windows.iter().enumerate() {
-                let win_text = format!("{}:{}", i, w.name);
+                let display_idx = i + base_index;
                 if w.active {
-                    status_spans.push(Span::styled(format!("{}* ", win_text), Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)));
+                    status_spans.push(Span::styled(
+                        format!("{}: {} ", display_idx, w.name),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 } else {
-                    status_spans.push(Span::styled(format!("{} ", win_text), Style::default().fg(Color::Black).bg(Color::Green)));
+                    status_spans.push(Span::styled(
+                        format!("{}: {} ", display_idx, w.name),
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    ));
                 }
             }
             let status_bar = Paragraph::new(Line::from(status_spans)).style(Style::default().bg(Color::Green).fg(Color::Black));
@@ -543,6 +639,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 f.render_widget(para, overlay.inner(oa));
             }
         })?;
+        last_dump_time = Instant::now();
+        force_dump = false;
     }
 
     // Clean disconnect on persistent connection
