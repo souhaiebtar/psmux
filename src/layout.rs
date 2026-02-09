@@ -78,6 +78,11 @@ fn encode_color(c: vt100::Color) -> u32 {
 }
 
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
+    let (json, _) = dump_layout_json_with_title_changes(app)?;
+    Ok(json)
+}
+
+pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(String, bool)> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode);
     let scroll_offset = app.copy_scroll_offset;
     const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(250);
@@ -87,6 +92,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
         cur_path: &mut Vec<usize>,
         active_path: &[usize],
         include_full_content: bool,
+        title_changed: &mut bool,
     ) -> LayoutJson {
         match node {
             Node::Split { kind, sizes, children } => {
@@ -94,7 +100,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                 let mut ch: Vec<LayoutJson> = Vec::new();
                 for (i, c) in children.iter_mut().enumerate() {
                     cur_path.push(i);
-                    ch.push(build(c, cur_path, active_path, include_full_content));
+                    ch.push(build(c, cur_path, active_path, include_full_content, title_changed));
                     cur_path.pop();
                 }
                 LayoutJson::Split { kind: k, sizes: sizes.clone(), children: ch }
@@ -115,6 +121,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
                         if t != p.title {
                             p.title = t;
+                            *title_changed = true;
                         }
                     }
                     p.last_title_infer_at = now;
@@ -256,7 +263,14 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
     }
     let win = &mut app.windows[app.active_idx];
     let mut path = Vec::new();
-    let mut root = build(&mut win.root, &mut path, &win.active_path, in_copy_mode);
+    let mut title_changed = false;
+    let mut root = build(
+        &mut win.root,
+        &mut path,
+        &win.active_path,
+        in_copy_mode,
+        &mut title_changed,
+    );
     // Mark the active pane and set copy mode info
     fn mark_active(
         node: &mut LayoutJson,
@@ -322,7 +336,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
         app.copy_pos,
     );
     let s = serde_json::to_string(&root).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
-    Ok(s)
+    Ok((s, title_changed))
 }
 
 /// Apply a named layout to the current window

@@ -677,12 +677,61 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         }
     });
     let mut state_dirty = true;
+    let mut metadata_dirty = true;
     let mut cached_dump_state: Arc<str> = Arc::from("");
+    let mut cached_windows_json = String::new();
+    let mut cached_tree_json = String::new();
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         let mut sent_pty_input = false;
         while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
+            let metadata_mutation = mutates_state
+                && !matches!(
+                    &req,
+                    CtrlReq::DumpLayout(_)
+                        | CtrlReq::CapturePane(_)
+                        | CtrlReq::CapturePaneRange(_, _, _)
+                        | CtrlReq::SessionInfo(_)
+                        | CtrlReq::SendText(_)
+                        | CtrlReq::SendKey(_)
+                        | CtrlReq::SendPaste(_)
+                        | CtrlReq::CopyEnter
+                        | CtrlReq::CopyMove(_, _)
+                        | CtrlReq::CopyAnchor
+                        | CtrlReq::CopyYank
+                        | CtrlReq::CopyModePageUp
+                        | CtrlReq::ClearHistory
+                        | CtrlReq::ListWindows(_)
+                        | CtrlReq::ListTree(_)
+                        | CtrlReq::ListPanes(_)
+                        | CtrlReq::ListBuffers(_)
+                        | CtrlReq::ShowBuffer(_)
+                        | CtrlReq::DisplayMessage(_, _)
+                        | CtrlReq::HasSession(_)
+                        | CtrlReq::ListKeys(_)
+                        | CtrlReq::ShowOptions(_)
+                        | CtrlReq::FindWindow(_, _)
+                        | CtrlReq::ListClients(_)
+                        | CtrlReq::ShowEnvironment(_)
+                        | CtrlReq::ShowHooks(_)
+                        | CtrlReq::SetOption(_, _)
+                        | CtrlReq::SourceFile(_)
+                        | CtrlReq::RefreshClient
+                        | CtrlReq::SuspendClient
+                        | CtrlReq::SetBuffer(_)
+                        | CtrlReq::DeleteBuffer
+                        | CtrlReq::SaveBuffer(_)
+                        | CtrlReq::LoadBuffer(_)
+                        | CtrlReq::SetEnvironment(_, _)
+                        | CtrlReq::SetHook(_, _)
+                        | CtrlReq::RemoveHook(_)
+                        | CtrlReq::WaitFor(_, _)
+                        | CtrlReq::DisplayPopup(_, _, _, _)
+                        | CtrlReq::ConfirmBefore(_, _)
+                        | CtrlReq::PipePane(_, _, _)
+                        | CtrlReq::LockClient
+                );
             match req {
                 CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
@@ -738,16 +787,24 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     if sent_pty_input {
                         std::thread::sleep(Duration::from_micros(500));
                     }
-                    let layout_json = dump_layout_json(&mut app)?;
-                    let windows_json = list_windows_json(&app)?;
-                    let tree_json = list_tree_json(&app)?;
+                    let (layout_json, title_changed) = dump_layout_json_with_title_changes(&mut app)?;
+                    if title_changed {
+                        metadata_dirty = true;
+                    }
+                    if metadata_dirty || cached_windows_json.is_empty() {
+                        cached_windows_json = list_windows_json(&app)?;
+                    }
+                    if metadata_dirty || cached_tree_json.is_empty() {
+                        cached_tree_json = list_tree_json(&app)?;
+                    }
+                    metadata_dirty = false;
                     let prefix_str = format_key_binding(&app.prefix_key);
                     let combined: Arc<str> = format!(
                         "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"refresh_ms\":{}}}",
                         layout_json,
-                        windows_json,
+                        cached_windows_json,
                         prefix_str,
-                        tree_json,
+                        cached_tree_json,
                         app.window_base_index,
                         app.prediction_dimming,
                         app.refresh_interval_ms
@@ -1388,6 +1445,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             if mutates_state {
                 state_dirty = true;
             }
+            if metadata_mutation {
+                metadata_dirty = true;
+            }
         }
         // PTY reader threads update pane parsers asynchronously. When new output arrives,
         // mark state dirty so dump-state reflects streaming apps promptly.
@@ -1400,6 +1460,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             // A pane exited naturally - resize remaining panes to fill the space
             resize_all_panes(&mut app);
             state_dirty = true;
+            metadata_dirty = true;
         }
         if all_empty {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
