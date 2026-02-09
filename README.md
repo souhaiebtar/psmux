@@ -393,6 +393,50 @@ set -g history-limit 2000
 set -g prediction-dimming off
 ```
 
+### `.psmux.conf` Settings Reference
+
+These `set -g` options are currently supported:
+
+| Option | Default | Allowed values | Effect |
+|--------|---------|----------------|--------|
+| `prefix` | `C-b` | key string (`C-a`, `C-b`, etc.) | Changes prefix key |
+| `mouse` | `on` | `on/off`, `true/false`, `1/0` | Enables mouse pane selection/resize/scroll handling |
+| `base-index` | `1` | integer `0..100` | Window numbering base shown in status bar and selectors |
+| `status-left` | `psmux:#I` | string | Left side of status bar |
+| `status-right` | `%H:%M` | string | Right side of status bar |
+| `escape-time` | `500` | integer milliseconds | Prefix timeout behavior |
+| `refresh-interval` | `40` | integer milliseconds, clamped to `16..250` | Client redraw/update pacing |
+| `history-limit` | `1000` | integer lines, clamped to `100..100000` | Per-pane scrollback size for newly created panes |
+| `prediction-dimming` | `on` | `on/off`, `true/false`, `1/0` | Dims text after cursor in active pane |
+| `dim-predictions` | `on` | alias of `prediction-dimming` | Same as above |
+| `cursor-style` | `bar` | `bar`, `block`, `underline` | Cursor shape |
+| `cursor-blink` | `on` | `on/off`, `true/false`, `1/0` | Cursor blink behavior |
+
+You can also use these commands in `~/.psmux.conf`:
+
+- `bind-key ...` or `bind ...` to define keybindings
+- `unbind-key ...` or `unbind ...` to remove keybindings
+- `source-file <path>` or `source <path>` to load additional config files
+
+Example feature-focused config:
+
+```tmux
+# Faster feel for interactive tools
+set -g refresh-interval 16
+set -g history-limit 1000
+
+# Better visual behavior for full-screen apps
+set -g prediction-dimming off
+set -g cursor-style block
+
+# Input/navigation behavior
+set -g mouse on
+set -g prefix C-a
+
+# Custom keybinding
+bind-key C-t new-window
+```
+
 ### Environment Variables
 
 ```powershell
