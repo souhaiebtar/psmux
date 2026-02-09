@@ -1,4 +1,5 @@
 use std::io::{self, Write, BufRead, BufReader};
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 use std::env;
 
@@ -453,8 +454,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                     if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                     if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
-                                    let char_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+                                    let text: Cow<'_, str> = if cell.text.is_empty() {
+                                        Cow::Borrowed(" ")
+                                    } else {
+                                        Cow::Borrowed(cell.text.as_str())
+                                    };
+                                    let char_width = unicode_width::UnicodeWidthStr::width(text.as_ref()) as u16;
                                     spans.push(Span::styled(text, style));
                                     if char_width >= 2 {
                                         c += 2; // skip continuation cell after wide character
@@ -483,7 +488,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                                     if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
                                     if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text = if run.text.is_empty() { " ".to_string() } else { run.text.clone() };
+                                    let text: Cow<'_, str> = if run.text.is_empty() {
+                                        Cow::Borrowed(" ")
+                                    } else {
+                                        Cow::Borrowed(run.text.as_str())
+                                    };
                                     spans.push(Span::styled(text, style));
                                     c = c.saturating_add(run.width.max(1));
                                 }
