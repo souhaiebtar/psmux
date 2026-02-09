@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::atomic::Ordering;
 use ratatui::prelude::*;
 
 use crate::types::*;
@@ -321,6 +322,15 @@ pub fn focus_pane_by_index(app: &mut AppState, idx: usize) {
     collect_pane_paths(&win.root, &mut path, &mut pane_paths);
     if let Some(path) = pane_paths.get(idx) {
         win.active_path = path.clone();
+    }
+}
+
+/// Consume and clear output-dirty flags for all panes in a tree.
+/// Returns true if at least one pane had fresh output since the last check.
+pub fn consume_output_dirty(node: &Node) -> bool {
+    match node {
+        Node::Leaf(p) => p.output_dirty.swap(false, Ordering::Relaxed),
+        Node::Split { children, .. } => children.iter().any(consume_output_dirty),
     }
 }
 

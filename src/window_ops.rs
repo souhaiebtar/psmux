@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -290,13 +291,19 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
+    let output_dirty = Arc::new(AtomicBool::new(true));
+    let dirty_reader = output_dirty.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
     thread::spawn(move || {
         let mut local = [0u8; 8192];
         loop {
             match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(n) if n > 0 => {
+                    let mut parser = term_reader.lock().unwrap();
+                    parser.process(&local[..n]);
+                    dirty_reader.store(true, Ordering::Relaxed);
+                }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
@@ -306,6 +313,7 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     pane.master = pair.master;
     pane.child = child;
     pane.term = term;
+    pane.output_dirty = output_dirty;
     
     Ok(())
 }

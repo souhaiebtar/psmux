@@ -71,12 +71,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
     // Precompute the raw control character for the default prefix
     let mut prefix_raw_char: Option<char> = Some('\x02');
+    let mut target_idle_refresh_ms: u64 = 40;
 
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
+    fn default_refresh_ms() -> u64 { 40 }
 
     #[derive(serde::Deserialize)]
     struct DumpState {
@@ -90,13 +92,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         base_index: usize,
         #[serde(default = "default_prediction_dimming")]
         prediction_dimming: bool,
+        #[serde(default = "default_refresh_ms")]
+        refresh_ms: u64,
     }
 
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
         // Fast polling when typing (1ms), relaxed when idle (16ms ≈ 60fps)
         let since_last = last_event_time.elapsed().as_millis();
-        let poll_ms = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 25 };
+        let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
+        let idle_refresh_ms = if overlays_active { 33 } else { target_idle_refresh_ms.clamp(16, 250) };
+        let base_poll_ms: u64 = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 25 };
+        let elapsed_since_dump = last_dump_time.elapsed().as_millis() as u64;
+        let until_dump_deadline = idle_refresh_ms.saturating_sub(elapsed_since_dump);
+        let poll_ms = base_poll_ms.min(until_dump_deadline.max(1));
 
         let mut cmd_batch: Vec<String> = Vec::new();
         let mut had_input_event = false;
@@ -329,7 +338,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
         // Avoid full-state roundtrips every loop when idle.
         let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
-        let idle_refresh_ms = if overlays_active { 33 } else { 120 };
+        let idle_refresh_ms = if overlays_active { 33 } else { target_idle_refresh_ms.clamp(16, 250) };
         let should_dump = force_dump
             || had_input_event
             || size_changed
@@ -363,6 +372,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         last_tree = state.tree;
         let base_index = state.base_index;
         let dim_preds = state.prediction_dimming;
+        target_idle_refresh_ms = state.refresh_ms.clamp(16, 250);
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {

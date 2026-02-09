@@ -380,6 +380,9 @@ set -g status-right "%H:%M"
 set -g cursor-style bar
 set -g cursor-blink on
 
+# Client refresh interval in ms (default: 40, lower = smoother but more CPU)
+set -g refresh-interval 16
+
 # Prediction dimming is enabled by default. Disable it for apps like Neovim.
 set -g prediction-dimming off
 ```
@@ -408,6 +411,16 @@ You can also disable it for the current shell only:
 $env:PSMUX_DIM_PREDICTIONS = "0"
 psmux
 ```
+
+### Interactive Tool Performance (Codex, Aider, etc.)
+
+For highly interactive terminal apps, reduce refresh interval in `~/.psmux.conf`:
+
+```tmux
+set -g refresh-interval 16
+```
+
+This improves perceived responsiveness at the cost of higher CPU usage.
 
 To make it persistent for new shells:
 

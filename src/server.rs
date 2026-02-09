@@ -35,6 +35,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         active_idx: 0,
         mode: Mode::Passthrough,
         escape_time_ms: 500,
+        refresh_interval_ms: 40,
         prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
         prediction_dimming: crate::rendering::dim_predictions_enabled(),
         drag: None,
@@ -714,9 +715,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = resp.send(json);
                 }
                 CtrlReq::DumpState(resp) => {
+                    let dump_age = last_dump_build.elapsed();
                     if !state_dirty
                         && !cached_dump_state.is_empty()
-                        && last_dump_build.elapsed() < Duration::from_millis(120)
+                        && dump_age < Duration::from_millis(120)
+                    {
+                        let _ = resp.send(cached_dump_state.clone());
+                        continue;
+                    }
+                    // Cap expensive state rebuilds to ~60 FPS when output is very chatty.
+                    if state_dirty
+                        && !cached_dump_state.is_empty()
+                        && dump_age < Duration::from_millis(16)
                     {
                         let _ = resp.send(cached_dump_state.clone());
                         continue;
@@ -732,13 +742,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let tree_json = list_tree_json(&app)?;
                     let prefix_str = format_key_binding(&app.prefix_key);
                     let combined = format!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"refresh_ms\":{}}}",
                         layout_json,
                         windows_json,
                         prefix_str,
                         tree_json,
                         app.window_base_index,
-                        app.prediction_dimming
+                        app.prediction_dimming,
+                        app.refresh_interval_ms
                     );
                     cached_dump_state = combined.clone();
                     last_dump_build = std::time::Instant::now();
@@ -1048,6 +1059,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.escape_time_ms = ms;
                             }
                         }
+                        "refresh-interval" => {
+                            if let Ok(ms) = value.parse::<u64>() {
+                                app.refresh_interval_ms = ms.clamp(16, 250);
+                            }
+                        }
                         "prediction-dimming" | "dim-predictions" => {
                             app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
                         }
@@ -1062,6 +1078,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
                     output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
+                    output.push_str(&format!("refresh-interval {}\n", app.refresh_interval_ms));
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
@@ -1091,6 +1108,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                                 "mouse" => { app.mouse_enabled = *val == "on" || *val == "true" || *val == "1"; }
                                                 "prefix" => { if let Some(kc) = parse_key_string(val) { app.prefix_key = kc; } }
                                                 "escape-time" => { if let Ok(ms) = val.parse::<u64>() { app.escape_time_ms = ms; } }
+                                                "refresh-interval" => {
+                                                    if let Ok(ms) = val.parse::<u64>() {
+                                                        app.refresh_interval_ms = ms.clamp(16, 250);
+                                                    }
+                                                }
                                                 "prediction-dimming" | "dim-predictions" => {
                                                     app.prediction_dimming = !matches!(*val, "off" | "false" | "0");
                                                 }
@@ -1364,6 +1386,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             if mutates_state {
                 state_dirty = true;
             }
+        }
+        // PTY reader threads update pane parsers asynchronously. When new output arrives,
+        // mark state dirty so dump-state reflects streaming apps promptly.
+        if app.windows.iter().any(|w| consume_output_dirty(&w.root)) {
+            state_dirty = true;
         }
         // Check if all windows/panes have exited
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
