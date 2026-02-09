@@ -142,7 +142,7 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                     let mut runs: Vec<CellRunJson> = Vec::new();
                     let mut c = 0;
                     while c < p.last_cols {
-                        let mut text = " ".to_string();
+                        let mut text = String::new();
                         let mut fg_code = encode_color(vt100::Color::Default);
                         let mut bg_code = encode_color(vt100::Color::Default);
                         let mut fg_name = String::new();
@@ -163,13 +163,15 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                             }
                             text = cell.contents().to_string();
                             if text.is_empty() {
-                                text = " ".to_string();
+                                text.push(' ');
                             }
                             bold = cell.bold();
                             italic = cell.italic();
                             underline = cell.underline();
                             inverse = cell.inverse();
                             dim = cell.dim();
+                        } else {
+                            text.push(' ');
                         }
 
                         let mut width = UnicodeWidthStr::width(text.as_str()) as u16;
@@ -184,22 +186,21 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                         if underline { flags |= FLAG_UNDERLINE; }
                         if inverse { flags |= FLAG_INVERSE; }
 
-                        if let Some(last) = runs.last_mut() {
-                            if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
-                                last.text.push_str(&text);
-                                last.width = last.width.saturating_add(width);
+                        if need_full_content {
+                            if let Some(last) = runs.last_mut() {
+                                if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
+                                    last.text.push_str(text.as_str());
+                                    last.width = last.width.saturating_add(width);
+                                } else {
+                                    runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
+                                }
                             } else {
                                 runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
                             }
-                        } else {
-                            runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
-                        }
-
-                        if need_full_content {
                             let fg = if fg_name.is_empty() { "default" } else { fg_name.as_str() };
                             let bg = if bg_name.is_empty() { "default" } else { bg_name.as_str() };
                             row.push(CellJson {
-                                text: text.clone(),
+                                text,
                                 fg: fg.to_string(),
                                 bg: bg.to_string(),
                                 bold,
@@ -220,6 +221,15 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                                     dim,
                                 });
                             }
+                        } else if let Some(last) = runs.last_mut() {
+                            if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
+                                last.text.push_str(text.as_str());
+                                last.width = last.width.saturating_add(width);
+                            } else {
+                                runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
+                            }
+                        } else {
+                            runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
                         }
 
                         c = c.saturating_add(width.max(1));

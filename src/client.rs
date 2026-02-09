@@ -97,16 +97,40 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         refresh_ms: u64,
     }
 
+    fn trim_dump_line(buf: &mut Vec<u8>) {
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+    }
+
+    #[cfg(feature = "simd-json")]
+    fn parse_dump_state(buf: &mut Vec<u8>) -> Option<DumpState> {
+        simd_json::serde::from_slice::<DumpState>(buf.as_mut_slice()).ok()
+    }
+
+    #[cfg(not(feature = "simd-json"))]
+    fn parse_dump_state(buf: &mut Vec<u8>) -> Option<DumpState> {
+        serde_json::from_slice::<DumpState>(buf.as_slice()).ok()
+    }
+
+    let mut state_buf: Vec<u8> = Vec::with_capacity(262_144);
+    let mut last_state_buf: Vec<u8> = Vec::with_capacity(262_144);
+
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
         // Fast polling when typing (1ms), relaxed when idle (16ms ≈ 60fps)
         let since_last = last_event_time.elapsed().as_millis();
         let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
         let idle_refresh_ms = if overlays_active { 33 } else { target_idle_refresh_ms.clamp(16, 250) };
-        let base_poll_ms: u64 = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 25 };
         let elapsed_since_dump = last_dump_time.elapsed().as_millis() as u64;
         let until_dump_deadline = idle_refresh_ms.saturating_sub(elapsed_since_dump);
-        let poll_ms = base_poll_ms.min(until_dump_deadline.max(1));
+        let poll_ms: u64 = if since_last < 50 {
+            1
+        } else if since_last < 200 {
+            5
+        } else {
+            until_dump_deadline.max(1)
+        };
 
         let mut cmd_batch: Vec<String> = Vec::new();
         let mut had_input_event = false;
@@ -353,16 +377,28 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         if writer.write_all(b"dump-state\n").is_err() { break; }
         if writer.flush().is_err() { break; }
 
-        // Read one line of JSON response
-        let mut buf = String::new();
-        match reader.read_line(&mut buf) {
+        // Read one line of JSON response into a reusable byte buffer.
+        state_buf.clear();
+        match reader.read_until(b'\n', &mut state_buf) {
             Ok(0) => break, // EOF - server disconnected
             Err(_) => break, // Error
             Ok(_) => {}
         }
-        let state: DumpState = match serde_json::from_str(&buf) {
-            Ok(s) => s,
-            Err(_) => {
+        trim_dump_line(&mut state_buf);
+        let can_skip_same_frame = !force_dump
+            && !had_input_event
+            && !size_changed
+            && cmd_batch.is_empty()
+            && !overlays_active;
+        if can_skip_same_frame && state_buf == last_state_buf {
+            last_dump_time = Instant::now();
+            continue;
+        }
+        last_state_buf.clear();
+        last_state_buf.extend_from_slice(&state_buf);
+        let state: DumpState = match parse_dump_state(&mut state_buf) {
+            Some(s) => s,
+            None => {
                 force_dump = true;
                 continue; // Skip frame on parse error
             }
@@ -423,11 +459,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             Block::default().borders(Borders::ALL)
                         };
                         let inner = pane_block.inner(area);
-                        let mut lines: Vec<Line> = Vec::new();
+                        let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
                         if use_full_cells || rows_v2.is_empty() {
                             for r in 0..inner.height.min(content.len() as u16) {
-                                let mut spans: Vec<Span> = Vec::new();
+                                let mut spans: Vec<Span> = Vec::with_capacity(inner.width as usize);
                                 let row = &content[r as usize];
                                 let max_c = inner.width.min(row.len() as u16);
                                 let mut c: u16 = 0;
@@ -471,9 +507,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             }
                         } else {
                             for r in 0..inner.height.min(rows_v2.len() as u16) {
-                                let mut spans: Vec<Span> = Vec::new();
+                                let row_runs = &rows_v2[r as usize].runs;
+                                let mut spans: Vec<Span> = Vec::with_capacity(row_runs.len());
                                 let mut c: u16 = 0;
-                                for run in &rows_v2[r as usize].runs {
+                                let mut merged_style: Option<Style> = None;
+                                let mut merged_text = String::with_capacity(inner.width as usize);
+                                for run in row_runs {
                                     if c >= inner.width { break; }
                                     let mut fg = map_color_code(run.fg);
                                     let mut bg = map_color_code(run.bg);
@@ -488,19 +527,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                                     if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
                                     if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text: Cow<'_, str> = if run.text.is_empty() {
-                                        Cow::Borrowed(" ")
-                                    } else {
-                                        Cow::Borrowed(run.text.as_str())
-                                    };
-                                    spans.push(Span::styled(text, style));
+                                    let text = if run.text.is_empty() { " " } else { run.text.as_str() };
+                                    match merged_style {
+                                        Some(prev) if prev == style => {
+                                            merged_text.push_str(text);
+                                        }
+                                        Some(prev) => {
+                                            spans.push(Span::styled(std::mem::take(&mut merged_text), prev));
+                                            merged_text.push_str(text);
+                                            merged_style = Some(style);
+                                        }
+                                        None => {
+                                            merged_text.push_str(text);
+                                            merged_style = Some(style);
+                                        }
+                                    }
                                     c = c.saturating_add(run.width.max(1));
+                                }
+                                if let Some(style) = merged_style {
+                                    spans.push(Span::styled(merged_text, style));
                                 }
                                 lines.push(Line::from(spans));
                             }
                         }
                         f.render_widget(pane_block, area);
-                        f.render_widget(Clear, inner);
                         let para = Paragraph::new(Text::from(lines));
                         f.render_widget(para, inner);
 
