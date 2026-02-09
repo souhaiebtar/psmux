@@ -111,6 +111,7 @@ pub struct AppState {
     pub mode: Mode,
     pub escape_time_ms: u64,
     pub refresh_interval_ms: u64,
+    pub scrollback_lines: usize,
     pub prefix_key: (KeyCode, KeyModifiers),
     pub prediction_dimming: bool,
     pub drag: Option<DragState>,

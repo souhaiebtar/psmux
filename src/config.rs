@@ -130,7 +130,11 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "renumber-windows" => {}
         "mode-keys" => {}
         "status-keys" => {}
-        "history-limit" => {}
+        "history-limit" => {
+            if let Ok(lines) = value.parse::<usize>() {
+                app.scrollback_lines = lines.clamp(100, 100_000);
+            }
+        }
         "pane-border-style" => {}
         "pane-active-border-style" => {}
         "window-status-format" => {}

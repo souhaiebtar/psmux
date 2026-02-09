@@ -1,7 +1,6 @@
-use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Write};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{PtySize, PtySystemSelection};
@@ -9,7 +8,7 @@ use ratatui::prelude::*;
 
 use crate::types::*;
 use crate::tree::*;
-use crate::pane::{create_window, detect_shell};
+use crate::pane::{create_window, detect_shell, spawn_pty_reader_thread};
 use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
 
 pub fn toggle_zoom(app: &mut AppState) {
@@ -289,26 +288,14 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = detect_shell();
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+    let term: Arc<Mutex<vt100::Parser>> =
+        Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.scrollback_lines)));
     let term_reader = term.clone();
     let output_dirty = Arc::new(AtomicBool::new(true));
     let dirty_reader = output_dirty.clone();
-    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
-    
-    thread::spawn(move || {
-        let mut local = [0u8; 8192];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    dirty_reader.store(true, Ordering::Relaxed);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+
+    spawn_pty_reader_thread(reader, term_reader, dirty_reader);
     
     pane.master = pair.master;
     pane.child = child;

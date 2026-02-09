@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,6 +14,33 @@ fn initial_title_infer_time() -> Instant {
     now.checked_sub(Duration::from_millis(300)).unwrap_or(now)
 }
 
+pub fn spawn_pty_reader_thread<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    term_reader: Arc<Mutex<vt100::Parser>>,
+    dirty_reader: Arc<AtomicBool>,
+) {
+    let _ = thread::Builder::new()
+        .name("psmux-pty-reader".to_string())
+        .spawn(move || {
+            let mut local = [0u8; 8192];
+            loop {
+                match reader.read(&mut local) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut parser = term_reader.lock().unwrap();
+                        parser.process(&local[..n]);
+                        dirty_reader.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+}
+
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>) -> io::Result<()> {
     let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system
@@ -26,29 +53,17 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
 
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+    let term: Arc<Mutex<vt100::Parser>> =
+        Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.scrollback_lines)));
     let term_reader = term.clone();
     let output_dirty = Arc::new(AtomicBool::new(true));
     let dirty_reader = output_dirty.clone();
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    thread::spawn(move || {
-        let mut local = [0u8; 8192];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    dirty_reader.store(true, Ordering::Relaxed);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_pty_reader_thread(reader, term_reader, dirty_reader);
 
     let pane = Pane {
         master: pair.master,
@@ -85,29 +100,17 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
 
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+    let term: Arc<Mutex<vt100::Parser>> =
+        Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.scrollback_lines)));
     let term_reader = term.clone();
     let output_dirty = Arc::new(AtomicBool::new(true));
     let dirty_reader = output_dirty.clone();
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    thread::spawn(move || {
-        let mut local = [0u8; 8192];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    dirty_reader.store(true, Ordering::Relaxed);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_pty_reader_thread(reader, term_reader, dirty_reader);
 
     let pane = Pane {
         master: pair.master,
@@ -133,25 +136,13 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = build_command(command);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+    let term: Arc<Mutex<vt100::Parser>> =
+        Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.scrollback_lines)));
     let term_reader = term.clone();
     let output_dirty = Arc::new(AtomicBool::new(true));
     let dirty_reader = output_dirty.clone();
-    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
-    thread::spawn(move || {
-        let mut local = [0u8; 8192];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    dirty_reader.store(true, Ordering::Relaxed);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    spawn_pty_reader_thread(reader, term_reader, dirty_reader);
     let new_leaf = Node::Leaf(Pane {
         master: pair.master,
         child,

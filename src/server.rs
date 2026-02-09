@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -23,6 +24,36 @@ use crate::config::*;
 use crate::commands::*;
 use crate::util::*;
 
+fn build_dump_state_payload(
+    layout_json: &str,
+    windows_json: &str,
+    prefix_str: &str,
+    tree_json: &str,
+    base_index: usize,
+    prediction_dimming: bool,
+    refresh_ms: u64,
+) -> Arc<str> {
+    let mut out = String::with_capacity(
+        layout_json.len() + windows_json.len() + tree_json.len() + prefix_str.len() + 128,
+    );
+    out.push_str("{\"layout\":");
+    out.push_str(layout_json);
+    out.push_str(",\"windows\":");
+    out.push_str(windows_json);
+    out.push_str(",\"prefix\":\"");
+    out.push_str(prefix_str);
+    out.push_str("\",\"tree\":");
+    out.push_str(tree_json);
+    out.push_str(",\"base_index\":");
+    let _ = write!(&mut out, "{}", base_index);
+    out.push_str(",\"prediction_dimming\":");
+    out.push_str(if prediction_dimming { "true" } else { "false" });
+    out.push_str(",\"refresh_ms\":");
+    let _ = write!(&mut out, "{}", refresh_ms);
+    out.push('}');
+    out.into()
+}
+
 pub fn run_server(session_name: String, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -37,6 +68,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         mode: Mode::Passthrough,
         escape_time_ms: 500,
         refresh_interval_ms: 40,
+        scrollback_lines: 1000,
         prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
         prediction_dimming: crate::rendering::dim_predictions_enabled(),
         drag: None,
@@ -684,7 +716,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         let mut sent_pty_input = false;
+        let mut handled_req = false;
         while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            handled_req = true;
             let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
             let metadata_mutation = mutates_state
                 && !matches!(
@@ -799,17 +833,15 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     metadata_dirty = false;
                     let prefix_str = format_key_binding(&app.prefix_key);
-                    let combined: Arc<str> = format!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"refresh_ms\":{}}}",
-                        layout_json,
-                        cached_windows_json,
-                        prefix_str,
-                        cached_tree_json,
+                    let combined = build_dump_state_payload(
+                        &layout_json,
+                        &cached_windows_json,
+                        &prefix_str,
+                        &cached_tree_json,
                         app.window_base_index,
                         app.prediction_dimming,
-                        app.refresh_interval_ms
-                    )
-                    .into();
+                        app.refresh_interval_ms,
+                    );
                     cached_dump_state = combined.clone();
                     last_dump_build = std::time::Instant::now();
                     state_dirty = false;
@@ -1123,6 +1155,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.refresh_interval_ms = ms.clamp(16, 250);
                             }
                         }
+                        "history-limit" => {
+                            if let Ok(lines) = value.parse::<usize>() {
+                                app.scrollback_lines = lines.clamp(100, 100_000);
+                            }
+                        }
                         "prediction-dimming" | "dim-predictions" => {
                             app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
                         }
@@ -1138,6 +1175,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
                     output.push_str(&format!("refresh-interval {}\n", app.refresh_interval_ms));
+                    output.push_str(&format!("history-limit {}\n", app.scrollback_lines));
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
@@ -1170,6 +1208,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                                 "refresh-interval" => {
                                                     if let Ok(ms) = val.parse::<u64>() {
                                                         app.refresh_interval_ms = ms.clamp(16, 250);
+                                                    }
+                                                }
+                                                "history-limit" => {
+                                                    if let Ok(lines) = val.parse::<usize>() {
+                                                        app.scrollback_lines = lines.clamp(100, 100_000);
                                                     }
                                                 }
                                                 "prediction-dimming" | "dim-predictions" => {
@@ -1307,7 +1350,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
                         if let Ok(mut parser) = p.term.lock() {
-                            *parser = vt100::Parser::new(p.last_rows, p.last_cols, 1000);
+                            *parser = vt100::Parser::new(p.last_rows, p.last_cols, app.scrollback_lines);
                         }
                     }
                 }
@@ -1451,7 +1494,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         }
         // PTY reader threads update pane parsers asynchronously. When new output arrives,
         // mark state dirty so dump-state reflects streaming apps promptly.
-        if app.windows.iter().any(|w| consume_output_dirty(&w.root)) {
+        if !state_dirty
+            && app.attached_clients > 0
+            && app.windows.iter().any(|w| consume_output_dirty(&w.root))
+        {
             state_dirty = true;
         }
         // Check if all windows/panes have exited
@@ -1468,7 +1514,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             let _ = std::fs::remove_file(&regpath);
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        let sleep_ms = if handled_req {
+            1
+        } else if app.attached_clients == 0 {
+            20
+        } else {
+            5
+        };
+        thread::sleep(Duration::from_millis(sleep_ms));
     }
     Ok(())
 }

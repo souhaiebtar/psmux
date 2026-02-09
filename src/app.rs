@@ -38,6 +38,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         mode: Mode::Passthrough,
         escape_time_ms: 500,
         refresh_interval_ms: 40,
+        scrollback_lines: 1000,
         prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
         prediction_dimming: crate::rendering::dim_predictions_enabled(),
         drag: None,
