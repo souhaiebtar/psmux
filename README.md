@@ -37,7 +37,7 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 - Session management (attach/detach)
 - Mouse support for resizing panes
 - Copy mode with vim-like keybindings
-- **Scrollback history** (1000 lines per pane)
+- **Scrollback history** (default 1000 lines per pane, configurable)
 - Synchronized input to multiple panes
 
 ![psmux windows and panes](psmux_windows.gif)
@@ -88,6 +88,9 @@ Download the latest `.zip` from [GitHub Releases](https://github.com/marlocarlo/
 git clone https://github.com/marlocarlo/psmux.git
 cd psmux
 cargo build --release
+
+# Optional: faster JSON parsing path for client/server dump-state
+cargo build --release --features simd-json
 ```
 
 Built binaries:
@@ -383,6 +386,9 @@ set -g cursor-blink on
 # Client refresh interval in ms (default: 40, lower = smoother but more CPU)
 set -g refresh-interval 16
 
+# Scrollback lines per pane (default: 1000, range: 100..100000)
+set -g history-limit 2000
+
 # Prediction dimming is enabled by default. Disable it for apps like Neovim.
 set -g prediction-dimming off
 ```
@@ -422,11 +428,31 @@ set -g refresh-interval 16
 
 This improves perceived responsiveness at the cost of higher CPU usage.
 
+You can also reduce scrollback pressure for heavy interactive workloads:
+
+```tmux
+set -g history-limit 1000
+```
+
 To make it persistent for new shells:
 
 ```powershell
 setx PSMUX_DIM_PREDICTIONS 0
 ```
+
+### Performance Tracing (WPR/WPA)
+
+Use the bundled helper script to capture ETW traces while reproducing slow scenarios:
+
+```powershell
+# Start trace
+.\scripts\perf-trace.ps1 -Action start
+
+# Reproduce lag in psmux, then stop and save ETL
+.\scripts\perf-trace.ps1 -Action stop -Output .\psmux-perf.etl
+```
+
+Open the resulting `.etl` in Windows Performance Analyzer (WPA) and inspect CPU usage and scheduling during `psmux` + shell redraw activity.
 
 ## License
 
