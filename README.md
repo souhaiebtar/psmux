@@ -141,12 +141,16 @@ Default prefix: `Ctrl+b` (same as tmux)
 | `Prefix + %` | Split pane left/right |
 | `Prefix + "` | Split pane top/bottom |
 | `Prefix + x` | Kill current pane |
+| `Prefix + &` | Kill current window |
 | `Prefix + z` | Toggle pane zoom |
 | `Prefix + n` | Next window |
 | `Prefix + p` | Previous window |
 | `Prefix + 0-9` | Select window by number |
 | `Prefix + d` | Detach from session |
 | `Prefix + ,` | Rename current window |
+| `Prefix + t` | Rename active pane title |
+| `Prefix + s` | Session chooser/switcher |
+| `Prefix + o` | Select next pane |
 | `Prefix + w` | Window/pane chooser |
 | `Prefix + [` | Enter copy/scroll mode |
 | `Prefix + {` | Enter copy/scroll mode (alternate) |
@@ -309,6 +313,51 @@ The `display-message` command supports these variables:
 | `#T` | Pane title |
 | `#H` | Hostname |
 
+### Advanced Commands
+
+```powershell
+# Discover supported commands
+psmux list-commands
+
+# Server/session management
+psmux kill-server
+psmux list-clients
+psmux switch-client -t other-session
+
+# Config at runtime
+psmux source-file ~/.psmux.conf
+psmux show-options
+psmux set-option -g status-left "[#S]"
+
+# Layout/history/stream control
+psmux next-layout
+psmux previous-layout
+psmux clear-history
+psmux pipe-pane -o "cat > pane.log"
+
+# Hooks
+psmux set-hook -g after-new-window "display-message created"
+psmux show-hooks
+```
+
+### Target Syntax (`-t`)
+
+psmux supports tmux-style targets:
+
+```powershell
+# window by index in session
+psmux select-window -t work:2
+
+# specific pane by index
+psmux send-keys -t work:2.1 "echo hi" Enter
+
+# pane by pane id
+psmux send-keys -t %3 "pwd" Enter
+
+# window by window id
+psmux select-window -t @4
+```
+
 ## Configuration
 
 Create `~/.psmux.conf`:
@@ -330,6 +379,31 @@ set -g status-right "%H:%M"
 # Cursor style: block, underline, or bar
 set -g cursor-style bar
 set -g cursor-blink on
+```
+
+### Environment Variables
+
+```powershell
+# Default session name used when not explicitly provided
+$env:PSMUX_DEFAULT_SESSION = "work"
+
+# Disable prediction dimming (useful for apps like Neovim)
+$env:PSMUX_DIM_PREDICTIONS = "0"
+```
+
+### Neovim Rendering Workaround
+
+If Neovim looks slow inside psmux or shows a "shadow" effect until you move the cursor, disable psmux prediction dimming:
+
+```powershell
+$env:PSMUX_DIM_PREDICTIONS = "0"
+psmux
+```
+
+To make it persistent for new shells:
+
+```powershell
+setx PSMUX_DIM_PREDICTIONS 0
 ```
 
 ## License
