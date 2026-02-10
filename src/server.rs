@@ -798,6 +798,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let mut cached_tree_json = String::new();
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     let mut dirty_pane_ids: HashSet<usize> = HashSet::new();
+    let mut pending_req: Option<CtrlReq> = None;
     loop {
         let mut sent_pty_input = false;
         let mut handled_req = false;
@@ -810,7 +811,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 state_dirty = true;
             }
         }
-        while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        // Process any request stashed from recv_timeout, then drain the channel.
+        let first = pending_req.take().or_else(|| {
+            app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        });
+        let mut req_iter = first.into_iter();
+        while let Some(req) = req_iter.next().or_else(|| {
+            app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        }) {
             handled_req = true;
             let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
             let metadata_mutation = mutates_state
@@ -1631,14 +1639,24 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             let _ = std::fs::remove_file(&regpath);
             break;
         }
-        let sleep_ms = if handled_req {
+        // Use recv_timeout instead of sleep to avoid busy-waiting.
+        // This wakes immediately when a request arrives rather than
+        // sleeping the full interval.
+        let wait_ms = if handled_req {
             1
         } else if app.attached_clients == 0 {
             20
         } else {
             5
         };
-        thread::sleep(Duration::from_millis(sleep_ms));
+        if let Some(rx) = app.control_rx.as_ref() {
+            match rx.recv_timeout(Duration::from_millis(wait_ms)) {
+                Ok(req) => { pending_req = Some(req); }
+                Err(_) => {} // timeout — re-enter loop to check dirty panes
+            }
+        } else {
+            thread::sleep(Duration::from_millis(wait_ms));
+        }
     }
     Ok(())
 }
