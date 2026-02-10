@@ -458,18 +458,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             Ok(_) => {}
         }
         trim_dump_line(&mut state_buf);
+        let is_delta_frame = state_buf.starts_with(b"{\"delta\":");
         let can_skip_same_frame = !force_dump
             && !had_input_event
             && !size_changed
             && cmd_batch.is_empty()
             && !overlays_active;
-        if can_skip_same_frame && state_buf == last_state_buf {
+        if can_skip_same_frame && !is_delta_frame && state_buf == last_state_buf {
             last_dump_time = Instant::now();
             continue;
         }
-        last_state_buf.clear();
-        last_state_buf.extend_from_slice(&state_buf);
-        let is_delta_frame = state_buf.starts_with(b"{\"delta\":");
+        if !is_delta_frame {
+            last_state_buf.clear();
+            last_state_buf.extend_from_slice(&state_buf);
+        }
         if is_delta_frame {
             let delta_state: DumpDelta = match parse_dump_delta(&mut state_buf) {
                 Some(s) => s,
