@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -52,6 +53,54 @@ fn build_dump_state_payload(
     let _ = write!(&mut out, "{}", refresh_ms);
     out.push('}');
     out.into()
+}
+
+fn collect_live_pane_ids(node: &Node, out: &mut HashSet<usize>) {
+    match node {
+        Node::Leaf(p) => {
+            out.insert(p.id);
+        }
+        Node::Split { children, .. } => {
+            for child in children {
+                collect_live_pane_ids(child, out);
+            }
+        }
+    }
+}
+
+fn remove_pipe_pane_by_id(app: &mut AppState, pane_id: usize) {
+    let mut i = 0;
+    while i < app.pipe_panes.len() {
+        if app.pipe_panes[i].pane_id == pane_id {
+            if let Some(mut proc) = app.pipe_panes[i].process.take() {
+                let _ = proc.kill();
+                let _ = proc.wait();
+            }
+            app.pipe_panes.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn prune_stale_pipe_panes(app: &mut AppState) {
+    let mut live_pane_ids: HashSet<usize> = HashSet::new();
+    for win in &app.windows {
+        collect_live_pane_ids(&win.root, &mut live_pane_ids);
+    }
+
+    let mut i = 0;
+    while i < app.pipe_panes.len() {
+        if live_pane_ids.contains(&app.pipe_panes[i].pane_id) {
+            i += 1;
+            continue;
+        }
+        if let Some(mut proc) = app.pipe_panes[i].process.take() {
+            let _ = proc.kill();
+            let _ = proc.wait();
+        }
+        app.pipe_panes.remove(i);
+    }
 }
 
 pub fn run_server(session_name: String, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
@@ -1296,13 +1345,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
                     
                     if cmd.is_empty() {
-                        app.pipe_panes.retain(|p| p.pane_id != pane_id);
+                        remove_pipe_pane_by_id(&mut app, pane_id);
                     } else {
-                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
-                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
-                                let _ = proc.kill();
-                            }
-                            app.pipe_panes.remove(idx);
+                        if app.pipe_panes.iter().any(|p| p.pane_id == pane_id) {
+                            remove_pipe_pane_by_id(&mut app, pane_id);
                         } else {
                             #[cfg(windows)]
                             let process = std::process::Command::new("cmd")
@@ -1503,6 +1549,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         // Check if all windows/panes have exited
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
         if any_pruned {
+            prune_stale_pipe_panes(&mut app);
             // A pane exited naturally - resize remaining panes to fill the space
             resize_all_panes(&mut app);
             state_dirty = true;
