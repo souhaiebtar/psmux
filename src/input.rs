@@ -59,6 +59,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         .get()
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, app, None)?;
+                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('n') => {
@@ -75,14 +76,17 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('%') => {
                     split_active(app, LayoutKind::Horizontal)?;
+                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('"') => {
                     split_active(app, LayoutKind::Vertical)?;
+                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('x') => {
                     kill_active_pane(app)?;
+                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('d') => {
@@ -90,7 +94,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('w') => { app.mode = Mode::WindowChooser { selected: app.active_idx }; true }
                 KeyCode::Char(',') => { app.mode = Mode::RenamePrompt { input: String::new() }; true }
-                KeyCode::Char(' ') => { cycle_top_layout(app); true }
+                KeyCode::Char(' ') => { cycle_top_layout(app); invalidate_layout_cache(app); true }
                 KeyCode::Char('[') => { enter_copy_mode(app); true }
                 KeyCode::Char(']') => { paste_latest(app)?; app.mode = Mode::Passthrough; true }
                 KeyCode::Char(':') => {
@@ -98,11 +102,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('q') => {
-                    let win = &app.windows[app.active_idx];
-                    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-                    compute_rects(&win.root, app.last_window_area, &mut rects);
+                    ensure_rects_cache(app);
                     app.display_map.clear();
-                    for (i, (path, _)) in rects.into_iter().enumerate() {
+                    for (i, (path, _)) in app.scratch_rects.iter().cloned().enumerate() {
                         let n = i + 1;
                         if n <= 10 { app.display_map.push((n, path)); } else { break; }
                     }
@@ -312,9 +314,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
 }
 
 pub fn move_focus(app: &mut AppState, dir: FocusDir) {
+    ensure_rects_cache(app);
+    let rects = &app.scratch_rects;
     let win = &mut app.windows[app.active_idx];
-    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-    compute_rects(&win.root, app.last_window_area, &mut rects);
     let mut active_idx = None;
     for (i, (path, _)) in rects.iter().enumerate() { if *path == win.active_path { active_idx = Some(i); break; } }
     let Some(ai) = active_idx else { return; };
@@ -386,11 +388,12 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 }
 
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
+    app.last_window_area = window_area;
+    ensure_rects_cache(app);
+    ensure_borders_cache(app);
+    let rects = &app.scratch_rects;
+    let borders = &app.scratch_borders;
     let win = &mut app.windows[app.active_idx];
-    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-    compute_rects(&win.root, window_area, &mut rects);
-    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
-    compute_split_borders(&win.root, window_area, &mut borders);
     let mut active_area = rects
         .iter()
         .find(|(path, _)| *path == win.active_path)

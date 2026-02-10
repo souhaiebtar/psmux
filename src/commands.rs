@@ -187,11 +187,9 @@ pub fn fire_hooks(app: &mut AppState, event: &str) {
 pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
     match action {
         Action::DisplayPanes => {
-            let win = &app.windows[app.active_idx];
-            let mut rects: Vec<(Vec<usize>, ratatui::prelude::Rect)> = Vec::new();
-            compute_rects(&win.root, app.last_window_area, &mut rects);
+            ensure_rects_cache(app);
             app.display_map.clear();
-            for (i, (path, _)) in rects.into_iter().enumerate() {
+            for (i, (path, _)) in app.scratch_rects.iter().cloned().enumerate() {
                 let n = i + 1;
                 if n <= 10 { app.display_map.push((n, path)); } else { break; }
             }
@@ -205,15 +203,19 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
                 .get()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
             create_window(&*pty_system, app, None)?;
+            invalidate_layout_cache(app);
         }
         Action::SplitHorizontal => {
             split_active(app, LayoutKind::Horizontal)?;
+            invalidate_layout_cache(app);
         }
         Action::SplitVertical => {
             split_active(app, LayoutKind::Vertical)?;
+            invalidate_layout_cache(app);
         }
         Action::KillPane => {
             kill_active_pane(app)?;
+            invalidate_layout_cache(app);
         }
         Action::NextWindow => {
             if !app.windows.is_empty() {

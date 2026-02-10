@@ -171,6 +171,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         last_pane_path: Vec::new(),
         scratch_rects: Vec::new(),
         scratch_borders: Vec::new(),
+        rects_cache_area: Rect { x: 0, y: 0, width: 0, height: 0 },
+        rects_cache_window_id: None,
+        rects_cache_dirty: true,
+        borders_cache_area: Rect { x: 0, y: 0, width: 0, height: 0 },
+        borders_cache_window_id: None,
+        borders_cache_dirty: true,
     };
     load_config(&mut app);
     // Create initial window with optional command
@@ -237,9 +243,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 let tx = tx.clone();
                 let session_key_clone = session_key.clone();
                 active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _conn_guard = ConnGuard(active_connections.clone());
+                let active_connections = active_connections.clone();
                 thread::spawn(move || {
-                let _guard = _conn_guard;
+                let _guard = ConnGuard(active_connections);
                 // Clone stream for writing, original goes into BufReader for reading
                 let mut write_stream = match stream.try_clone() {
                     Ok(s) => s,
@@ -1010,8 +1016,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => { 
-                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
+                CtrlReq::ClientSize(w, h) => {
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
                     resize_all_panes(&mut app);
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }

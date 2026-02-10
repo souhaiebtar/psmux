@@ -145,10 +145,22 @@ pub struct AppState {
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
-    /// Reusable scratch buffer for compute_rects results
+    /// Cached compute_rects results for the active window
     pub scratch_rects: Vec<(Vec<usize>, ratatui::prelude::Rect)>,
-    /// Reusable scratch buffer for compute_split_borders results
+    /// Cached compute_split_borders results for the active window
     pub scratch_borders: Vec<(Vec<usize>, LayoutKind, usize, u16)>,
+    /// Cached rects area used for scratch_rects
+    pub rects_cache_area: Rect,
+    /// Cached rects window id used for scratch_rects
+    pub rects_cache_window_id: Option<usize>,
+    /// Whether scratch_rects must be rebuilt
+    pub rects_cache_dirty: bool,
+    /// Cached borders area used for scratch_borders
+    pub borders_cache_area: Rect,
+    /// Cached borders window id used for scratch_borders
+    pub borders_cache_window_id: Option<usize>,
+    /// Whether scratch_borders must be rebuilt
+    pub borders_cache_dirty: bool,
 }
 
 pub struct DragState {

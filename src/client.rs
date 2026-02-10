@@ -186,7 +186,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut cached_windows: Vec<WinStatus> = Vec::new();
     let mut cached_base_index: usize = default_base_index();
     let mut cached_dim_preds: bool = default_prediction_dimming();
-    let mut cmd_batch: Vec<String> = Vec::new();
+    let mut cmd_batch: Vec<String> = Vec::with_capacity(64);
 
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
@@ -580,8 +580,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 let mut c: u16 = 0;
                                 while c < max_c {
                                     let cell = &row[c as usize];
-                                    let mut fg = map_color(&cell.fg);
-                                    let mut bg = map_color(&cell.bg);
+                                    let mut fg = map_color(cell.fg.as_ref());
+                                    let mut bg = map_color(cell.bg.as_ref());
                                     if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
                                     let in_selection = if *copy_mode && *active {
                                         if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {

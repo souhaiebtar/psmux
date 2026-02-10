@@ -26,6 +26,7 @@ use crate::layout::dump_layout_json;
 use crate::window_ops::*;
 use crate::util::*;
 use crate::input::{send_text_to_active, send_key_to_active};
+use crate::tree::invalidate_layout_cache;
 
 pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let pty_system = PtySystemSelection::default()
@@ -69,6 +70,12 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         last_pane_path: Vec::new(),
         scratch_rects: Vec::new(),
         scratch_borders: Vec::new(),
+        rects_cache_area: Rect { x: 0, y: 0, width: 0, height: 0 },
+        rects_cache_window_id: None,
+        rects_cache_dirty: true,
+        borders_cache_area: Rect { x: 0, y: 0, width: 0, height: 0 },
+        borders_cache_window_id: None,
+        borders_cache_dirty: true,
     };
 
     load_config(&mut app);
@@ -249,10 +256,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
 
             if let Mode::PaneChooser { .. } = &app.mode {
-                let win = &app.windows[app.active_idx];
-                let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-                compute_rects(&win.root, app.last_window_area, &mut rects);
-                for (i, (_, r)) in rects.iter().enumerate() {
+                ensure_rects_cache(&mut app);
+                for (i, (_, r)) in app.scratch_rects.iter().enumerate() {
                     let n = i + 1;
                     if n > 9 { break; }
                     let bw = 7u16;
@@ -398,9 +403,18 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
                     resize_all_panes(&mut app);
+                    invalidate_layout_cache(&mut app);
                 }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
-                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd) => {
+                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
+                    resize_all_panes(&mut app);
+                    invalidate_layout_cache(&mut app);
+                }
+                CtrlReq::KillPane => {
+                    let _ = kill_active_pane(&mut app);
+                    resize_all_panes(&mut app);
+                    invalidate_layout_cache(&mut app);
+                }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
@@ -437,9 +451,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => { 
-                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
+                CtrlReq::ClientSize(w, h) => {
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
                     resize_all_panes(&mut app);
+                    invalidate_layout_cache(&mut app);
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
@@ -466,6 +481,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         let (all_empty, any_pruned) = reap_children(&mut app)?;
         if any_pruned {
             resize_all_panes(&mut app);
+            invalidate_layout_cache(&mut app);
         }
         if all_empty {
             quit = true;

@@ -24,20 +24,21 @@ pub fn toggle_zoom(app: &mut AppState) {
             }
         }
         app.zoom_saved = Some(saved);
+        invalidate_layout_cache(app);
     } else {
         if let Some(saved) = app.zoom_saved.take() {
             for (p, sz) in saved.into_iter() {
                 if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &p) { *sizes = sz; }
             }
         }
+        invalidate_layout_cache(app);
     }
 }
 
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
-    let win = &mut app.windows[app.active_idx];
-    app.scratch_rects.clear();
-    compute_rects(&win.root, app.last_window_area, &mut app.scratch_rects);
+    ensure_rects_cache(app);
     let rects = &app.scratch_rects;
+    let win = &mut app.windows[app.active_idx];
     let mut active_area: Option<Rect> = None;
     for (path, area) in rects.iter() {
         if area.contains(ratatui::layout::Position { x, y }) {
@@ -55,8 +56,8 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
-    app.scratch_borders.clear();
-    compute_split_borders(&win.root, app.last_window_area, &mut app.scratch_borders);
+    ensure_borders_cache(app);
+    let win = &mut app.windows[app.active_idx];
     let tol = 1u16;
     for (path, kind, idx, pos) in app.scratch_borders.iter() {
         match kind {
@@ -71,9 +72,8 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 }
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
+    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
-    app.scratch_rects.clear();
-    compute_rects(&win.root, app.last_window_area, &mut app.scratch_rects);
 
     if matches!(app.mode, Mode::CopyMode) {
         if let Some((path, area)) = app.scratch_rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
@@ -87,13 +87,15 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
-    if let Some(d) = &app.drag { adjust_split_sizes(&mut win.root, d, x, y); }
+    if let Some(d) = &app.drag {
+        adjust_split_sizes(&mut win.root, d, x, y);
+        invalidate_layout_cache(app);
+    }
 }
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
+    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
-    app.scratch_rects.clear();
-    compute_rects(&win.root, app.last_window_area, &mut app.scratch_rects);
 
     if matches!(app.mode, Mode::CopyMode) {
         if let Some((path, area)) = app.scratch_rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
@@ -151,9 +153,8 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         return;
     }
 
+    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
-    app.scratch_rects.clear();
-    compute_rects(&win.root, app.last_window_area, &mut app.scratch_rects);
 
     let mut target_area: Option<Rect> = None;
     for (path, area) in &app.scratch_rects {
@@ -181,9 +182,8 @@ pub fn remote_scroll_up(app: &mut AppState, x: u16, y: u16) { remote_scroll_whee
 pub fn remote_scroll_down(app: &mut AppState, x: u16, y: u16) { remote_scroll_wheel(app, x, y, false); }
 
 pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
+    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
-    app.scratch_rects.clear();
-    compute_rects(&win.root, app.last_window_area, &mut app.scratch_rects);
 
     let mut active_idx = None;
     for (i, (path, _)) in app.scratch_rects.iter().enumerate() {
@@ -229,6 +229,7 @@ pub fn resize_pane_vertical(app: &mut AppState, amount: i16) {
                     } else if idx > 0 {
                         sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
                     }
+                    invalidate_layout_cache(app);
                 }
                 return;
             }
@@ -254,6 +255,7 @@ pub fn resize_pane_horizontal(app: &mut AppState, amount: i16) {
                     } else if idx > 0 {
                         sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
                     }
+                    invalidate_layout_cache(app);
                 }
                 return;
             }
@@ -267,6 +269,7 @@ pub fn rotate_panes(app: &mut AppState, _reverse: bool) {
         Node::Split { children, .. } if children.len() >= 2 => {
             let last_idx = children.len() - 1;
             children.swap(0, last_idx);
+            invalidate_layout_cache(app);
         }
         _ => {}
     }
@@ -277,7 +280,9 @@ pub fn break_pane_to_window(app: &mut AppState) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let _ = create_window(&*pty_system, app, None);
+    if create_window(&*pty_system, app, None).is_ok() {
+        invalidate_layout_cache(app);
+    }
 }
 
 pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
