@@ -580,9 +580,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 let mut c: u16 = 0;
                                 while c < max_c {
                                     let cell = &row[c as usize];
-                                    let mut fg = map_color(cell.fg.as_ref());
-                                    let mut bg = map_color(cell.bg.as_ref());
-                                    if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
+                                    let mut fg = map_color_code(cell.fg);
+                                    let mut bg = map_color_code(cell.bg);
+                                    if cell.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
                                     let in_selection = if *copy_mode && *active {
                                         if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
                                             r >= *sr && r <= *er && c >= *sc && c <= *ec
@@ -597,10 +597,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if in_selection {
                                         style = style.fg(Color::Black).bg(Color::LightYellow);
                                     }
-                                    if cell.dim { style = style.add_modifier(Modifier::DIM); }
-                                    if cell.bold { style = style.add_modifier(Modifier::BOLD); }
-                                    if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
-                                    if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    if cell.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
+                                    if cell.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
+                                    if cell.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
+                                    if cell.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
                                     let text: Cow<'_, str> = if cell.text.is_empty() {
                                         Cow::Borrowed(" ")
                                     } else {

@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Serialize, Deserialize};
@@ -25,7 +24,7 @@ pub fn cycle_top_layout(app: &mut AppState) {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct CellJson { pub text: String, pub fg: Arc<str>, pub bg: Arc<str>, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub dim: bool }
+pub struct CellJson { pub text: String, pub fg: u32, pub bg: u32, pub flags: u8 }
 
 #[derive(Serialize, Deserialize)]
 pub struct CellRunJson {
@@ -105,23 +104,12 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
     let scroll_offset = app.copy_scroll_offset;
     const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(500);
 
-    fn color_name_cached(cache: &mut HashMap<u32, Arc<str>>, code: u32, color: vt100::Color) -> Arc<str> {
-        if let Some(name) = cache.get(&code) {
-            return Arc::clone(name);
-        }
-        let name = crate::util::color_to_name(color);
-        let arc: Arc<str> = Arc::from(name);
-        cache.insert(code, Arc::clone(&arc));
-        arc
-    }
-    
     fn build(
         node: &mut Node,
         cur_path: &mut Vec<usize>,
         active_path: &[usize],
         include_full_content: bool,
         title_changed: &mut bool,
-        color_cache: &mut HashMap<u32, Arc<str>>,
     ) -> LayoutJson {
         match node {
             Node::Split { kind, sizes, children } => {
@@ -129,7 +117,7 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                 let mut ch: Vec<LayoutJson> = Vec::new();
                 for (i, c) in children.iter_mut().enumerate() {
                     cur_path.push(i);
-                    ch.push(build(c, cur_path, active_path, include_full_content, title_changed, color_cache));
+                    ch.push(build(c, cur_path, active_path, include_full_content, title_changed));
                     cur_path.pop();
                 }
                 LayoutJson::Split { kind: k, sizes: sizes.clone(), children: ch }
@@ -197,8 +185,6 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                         let mut text = String::new();
                         let mut fg_code = encode_color(vt100::Color::Default);
                         let mut bg_code = encode_color(vt100::Color::Default);
-                        let mut fg_name: Arc<str> = Arc::from("default");
-                        let mut bg_name: Arc<str> = Arc::from("default");
                         let mut bold = false;
                         let mut italic = false;
                         let mut underline = false;
@@ -209,10 +195,6 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                             let bg = cell.bgcolor();
                             fg_code = encode_color(fg);
                             bg_code = encode_color(bg);
-                            if need_full_content {
-                                fg_name = color_name_cached(color_cache, fg_code, fg);
-                                bg_name = color_name_cached(color_cache, bg_code, bg);
-                            }
                             text = cell.contents().to_string();
                             if text.is_empty() {
                                 text.push(' ');
@@ -251,24 +233,16 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                             }
                             row.push(CellJson {
                                 text,
-                                fg: Arc::clone(&fg_name),
-                                bg: Arc::clone(&bg_name),
-                                bold,
-                                italic,
-                                underline,
-                                inverse,
-                                dim,
+                                fg: fg_code,
+                                bg: bg_code,
+                                flags,
                             });
                             for _ in 1..width {
                                 row.push(CellJson {
                                     text: String::new(),
-                                    fg: Arc::clone(&fg_name),
-                                    bg: Arc::clone(&bg_name),
-                                    bold,
-                                    italic,
-                                    underline,
-                                    inverse,
-                                    dim,
+                                    fg: fg_code,
+                                    bg: bg_code,
+                                    flags,
                                 });
                             }
                         } else if let Some(last) = runs.last_mut() {
@@ -288,13 +262,9 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                         while row.len() < p.last_cols as usize {
                             row.push(CellJson {
                                 text: " ".to_string(),
-                                fg: Arc::from("default"),
-                                bg: Arc::from("default"),
-                                bold: false,
-                                italic: false,
-                                underline: false,
-                                inverse: false,
-                                dim: false,
+                                fg: encode_color(vt100::Color::Default),
+                                bg: encode_color(vt100::Color::Default),
+                                flags: 0,
                             });
                         }
                         lines.push(row);
@@ -324,14 +294,12 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
     let win = &mut app.windows[app.active_idx];
     let mut path = Vec::new();
     let mut title_changed = false;
-    let mut color_cache: HashMap<u32, Arc<str>> = HashMap::new();
     let mut root = build(
         &mut win.root,
         &mut path,
         &win.active_path,
         in_copy_mode,
         &mut title_changed,
-        &mut color_cache,
     );
     // Mark the active pane and set copy mode info
     fn mark_active(
