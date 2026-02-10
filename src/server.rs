@@ -215,11 +215,29 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     }
 
     thread::spawn(move || {
+        use std::sync::atomic::AtomicUsize;
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        const MAX_CONNECTIONS: usize = 64;
+
+        struct ConnGuard(Arc<AtomicUsize>);
+        impl Drop for ConnGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
+                if active_connections.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    drop(stream);
+                    continue;
+                }
                 let tx = tx.clone();
                 let session_key_clone = session_key.clone();
+                active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _conn_guard = ConnGuard(active_connections.clone());
                 thread::spawn(move || {
+                let _guard = _conn_guard;
                 // Clone stream for writing, original goes into BufReader for reading
                 let mut write_stream = match stream.try_clone() {
                     Ok(s) => s,
