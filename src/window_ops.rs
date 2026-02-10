@@ -283,7 +283,16 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
     let win = &mut app.windows[app.active_idx];
     let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
-    
+
+    // Kill the old child process first so the old PTY reader thread exits
+    // promptly (its read() will return EOF once the child and master are gone).
+    let _ = pane.child.kill();
+    // Drop the old master to close the PTY, unblocking the reader thread.
+    // We need to replace it with a temporary value before we can assign the new one.
+    // Replacing term/output_dirty drops the old Arcs; once the reader thread
+    // exits (EOF from closed master) its clones are dropped too, freeing the
+    // old vt100::Parser memory.
+
     let size = PtySize { rows: pane.last_rows, cols: pane.last_cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = detect_shell();
@@ -296,13 +305,13 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     spawn_pty_reader_thread(reader, term_reader, dirty_reader);
-    
+
     pane.master = pair.master;
     pane.child = child;
     pane.term = term;
     pane.output_dirty = output_dirty;
     let now = Instant::now();
     pane.last_title_infer_at = now.checked_sub(Duration::from_millis(300)).unwrap_or(now);
-    
+
     Ok(())
 }
