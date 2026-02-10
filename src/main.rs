@@ -513,7 +513,13 @@ fn main() -> io::Result<()> {
                 let session_name = target.clone().unwrap_or_else(|| {
                     env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string())
                 });
+                if !is_valid_session_name(&session_name) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid session name: {}", session_name)));
+                }
                 if let Some(t) = target {
+                    if !is_valid_session_name(&t) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid session name: {}", t)));
+                    }
                     env::set_var("PSMUX_TARGET_SESSION", &t);
                 }
                 // Try to send kill command to server
@@ -544,6 +550,9 @@ fn main() -> io::Result<()> {
                     }
                     t
                 });
+                if !is_valid_session_name(&target) {
+                    std::process::exit(1);
+                }
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let path = format!("{}\\.psmux\\{}.port", home, target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
