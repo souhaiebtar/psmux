@@ -187,22 +187,22 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let _ = std::fs::create_dir_all(&dir);
     
     // Generate a random session key for security
-    let session_key: String = {
+    let session_key: Arc<str> = {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
         let s = RandomState::new();
         let mut h = s.build_hasher();
         h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
         h.write_u64(std::process::id() as u64);
-        format!("{:016x}", h.finish())
+        Arc::from(format!("{:016x}", h.finish()).as_str())
     };
-    
+
     // Write port and key to files
     let regpath = format!("{}\\{}.port", dir, app.session_name);
     let _ = std::fs::write(&regpath, port.to_string());
     let keypath = format!("{}\\{}.key", dir, app.session_name);
-    let _ = std::fs::write(&keypath, &session_key);
-    
+    let _ = std::fs::write(&keypath, &*session_key);
+
     // Write session key to file (permissions handled by user's umask/ACLs)
     #[cfg(windows)]
     {
@@ -213,7 +213,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             .open(&keypath)
             .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
     }
-    
+
     thread::spawn(move || {
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
@@ -245,7 +245,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     return;
                 }
                 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
-                if provided_key != session_key_clone {
+                if provided_key != &*session_key_clone {
                     let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
                     let _ = write_stream.flush();
                     return;
