@@ -1,4 +1,4 @@
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, Write, BufRead, BufReader, Read};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -48,6 +48,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
     // Set read timeout for dump-state responses (generous but bounded)
     let _ = reader.get_ref().set_read_timeout(Some(Duration::from_millis(2000)));
+    let mut use_framed_dump = false;
+    let mut proto_line = String::new();
+    if writer.write_all(b"protocol framed\n").is_ok()
+        && writer.flush().is_ok()
+        && reader.read_line(&mut proto_line).is_ok()
+        && proto_line.trim().eq_ignore_ascii_case("ok")
+    {
+        use_framed_dump = true;
+    }
 
     let mut quit = false;
     let mut prefix_armed = false;
@@ -138,6 +147,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     #[cfg(not(feature = "simd-json"))]
     fn parse_dump_delta(buf: &mut Vec<u8>) -> Option<DumpDelta> {
         serde_json::from_slice::<DumpDelta>(buf.as_slice()).ok()
+    }
+
+    fn parse_frame_header_len(line: &[u8]) -> Option<usize> {
+        let s = std::str::from_utf8(line).ok()?;
+        let raw = s.trim();
+        let len = raw.strip_prefix("FRAME ")?;
+        len.parse::<usize>().ok()
     }
 
     fn apply_pane_deltas(root: &mut LayoutJson, deltas: Vec<PaneDeltaJson>) -> usize {
@@ -445,11 +461,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             continue;
         }
 
-        // Send dump-state and flush (server responds with one line of JSON)
+        // Send dump-state and flush (server responds with JSON line or framed JSON payload)
         if writer.write_all(b"dump-state\n").is_err() { break; }
         if writer.flush().is_err() { break; }
 
-        // Read one line of JSON response into a reusable byte buffer.
+        // Read one response frame into a reusable byte buffer.
+        // JSON mode returns one line; framed mode returns:
+        //   FRAME <len>\n<raw JSON bytes>
         trim_reusable_buf(&mut state_buf, MAX_STATE_BUF_CAP);
         trim_reusable_buf(&mut last_state_buf, MAX_STATE_BUF_CAP);
         state_buf.clear();
@@ -458,7 +476,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             Err(_) => break, // Error
             Ok(_) => {}
         }
-        trim_dump_line(&mut state_buf);
+        if use_framed_dump {
+            if let Some(payload_len) = parse_frame_header_len(&state_buf) {
+                if payload_len > MAX_STATE_BUF_CAP {
+                    force_dump = true;
+                    continue;
+                }
+                state_buf.clear();
+                state_buf.resize(payload_len, 0);
+                if reader.read_exact(&mut state_buf).is_err() {
+                    break;
+                }
+            } else {
+                // Graceful fallback if server switched back to JSON for this frame.
+                trim_dump_line(&mut state_buf);
+            }
+        } else {
+            trim_dump_line(&mut state_buf);
+        }
+
         let is_delta_frame = state_buf.starts_with(b"{\"delta\":");
         let can_skip_same_frame = !force_dump
             && !had_input_event

@@ -72,6 +72,12 @@ fn build_dump_delta_payload(delta_json: &str) -> Arc<str> {
     out.into()
 }
 
+fn write_framed_json<W: Write>(writer: &mut W, json: &str) -> io::Result<()> {
+    write!(writer, "FRAME {}\n", json.len())?;
+    writer.write_all(json.as_bytes())?;
+    writer.flush()
+}
+
 fn collect_live_pane_ids(node: &Node, out: &mut HashSet<usize>) {
     match node {
         Node::Leaf(p) => {
@@ -288,6 +294,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 let mut global_target_win: Option<usize> = None;
                 let mut global_target_pane: Option<usize> = None;
                 let mut global_pane_is_id = false;
+                let mut framed_dump_state = false;
                 let mut line = String::new();
                 if r.read_line(&mut line).is_err() {
                     return;
@@ -426,9 +433,35 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "dump-state" => {
                         let (rtx, rrx) = mpsc::channel::<Arc<str>>();
                         let _ = tx.send(CtrlReq::DumpState(rtx));
-                        if let Ok(text) = rrx.recv() { 
-                            let _ = write!(write_stream, "{}\n", text); 
-                            let _ = write_stream.flush();
+                        if let Ok(text) = rrx.recv() {
+                            if framed_dump_state {
+                                if write_framed_json(&mut write_stream, text.as_ref()).is_err() {
+                                    break;
+                                }
+                            } else {
+                                let _ = write!(write_stream, "{}\n", text);
+                                let _ = write_stream.flush();
+                            }
+                        }
+                        if !persistent { break; }
+                    }
+                    "protocol" => {
+                        let mode = args.get(0).copied().unwrap_or("json");
+                        match mode {
+                            "framed" => {
+                                framed_dump_state = true;
+                                let _ = write_stream.write_all(b"ok\n");
+                                let _ = write_stream.flush();
+                            }
+                            "json" => {
+                                framed_dump_state = false;
+                                let _ = write_stream.write_all(b"ok\n");
+                                let _ = write_stream.flush();
+                            }
+                            _ => {
+                                let _ = write_stream.write_all(b"error: unsupported protocol\n");
+                                let _ = write_stream.flush();
+                            }
                         }
                         if !persistent { break; }
                     }
