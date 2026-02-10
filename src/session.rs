@@ -23,18 +23,32 @@ pub fn is_valid_session_name(name: &str) -> bool {
 /// Sanitize a session name by replacing invalid characters.
 /// Returns a safe version of the name or "default" if completely invalid.
 pub fn sanitize_session_name(name: &str) -> String {
-    if name.is_empty() {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
         return "default".to_string();
     }
-    let sanitized: String = name
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
-        .collect();
-    if sanitized.is_empty() {
-        "default".to_string()
-    } else {
+
+    // Keep valid characters (including dots), but prevent leading dot and "..".
+    let mut sanitized = String::with_capacity(trimmed.len().min(64));
+    let mut prev_dot = false;
+    for c in trimmed.chars().take(64) {
+        if !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            continue;
+        }
+        if sanitized.is_empty() && c == '.' {
+            continue;
+        }
+        if c == '.' && prev_dot {
+            continue;
+        }
+        prev_dot = c == '.';
+        sanitized.push(c);
+    }
+
+    if is_valid_session_name(&sanitized) {
         sanitized
+    } else {
+        "default".to_string()
     }
 }
 
