@@ -170,41 +170,39 @@ pub fn kill_active_pane(app: &mut AppState) -> io::Result<()> {
     Ok(())
 }
 
+/// Cached shell path resolved once via which::which to avoid repeated
+/// PATH lookups on every split/new-window.
+fn cached_shell_path() -> &'static str {
+    use std::sync::OnceLock;
+    static SHELL: OnceLock<String> = OnceLock::new();
+    SHELL.get_or_init(|| {
+        which::which("pwsh")
+            .ok()
+            .or_else(|| which::which("cmd").ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pwsh.exe".to_string())
+    })
+}
+
 pub fn detect_shell() -> CommandBuilder {
     build_command(None)
 }
 
 pub fn build_command(command: Option<&str>) -> CommandBuilder {
+    let path = cached_shell_path();
     if let Some(cmd) = command {
-        let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
-        let cmd_exe = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
-        
-        match pwsh.or(cmd_exe) {
-            Some(path) => {
-                let mut builder = CommandBuilder::new(&path);
-                builder.env("TERM", "xterm-256color");
-                builder.env("COLORTERM", "truecolor");
-                builder.env("PSMUX_SESSION", "1");
-                
-                if path.to_lowercase().contains("pwsh") {
-                    builder.args(["-NoLogo", "-Command", cmd]);
-                } else {
-                    builder.args(["/C", cmd]);
-                }
-                builder
-            }
-            None => {
-                let mut builder = CommandBuilder::new("pwsh.exe");
-                builder.env("TERM", "xterm-256color");
-                builder.env("COLORTERM", "truecolor");
-                builder.env("PSMUX_SESSION", "1");
-                builder.args(["-NoLogo", "-Command", cmd]);
-                builder
-            }
+        let mut builder = CommandBuilder::new(path);
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
+        builder.env("PSMUX_SESSION", "1");
+
+        if path.to_lowercase().contains("pwsh") {
+            builder.args(["-NoLogo", "-Command", cmd]);
+        } else {
+            builder.args(["/C", cmd]);
         }
+        builder
     } else {
-        let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
-        let cmd_exe = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
         // PSReadLine v2.2.6+ enables PredictionSource HistoryAndPlugin by default.
         // Predictions cause display corruption in terminal multiplexers because
         // PSReadLine's VT rendering races with ConPTY output capture.
@@ -215,25 +213,14 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             "try { Set-PSReadLineOption -PredictionViewStyle InlineView -ErrorAction Stop } catch {}; ",
             "try { Remove-PSReadLineKeyHandler -Chord 'F2' -ErrorAction Stop } catch {}",
         );
-        match pwsh.or(cmd_exe) {
-            Some(path) => {
-                let mut builder = CommandBuilder::new(&path);
-                builder.env("TERM", "xterm-256color");
-                builder.env("COLORTERM", "truecolor");
-                builder.env("PSMUX_SESSION", "1");
-                if path.to_lowercase().contains("pwsh") {
-                    builder.args(["-NoLogo", "-NoExit", "-Command", psrl_init]);
-                }
-                builder
-            }
-            None => {
-                let mut builder = CommandBuilder::new("pwsh.exe");
-                builder.env("TERM", "xterm-256color");
-                builder.env("COLORTERM", "truecolor");
-                builder.env("PSMUX_SESSION", "1");
-                builder
-            }
+        let mut builder = CommandBuilder::new(path);
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
+        builder.env("PSMUX_SESSION", "1");
+        if path.to_lowercase().contains("pwsh") {
+            builder.args(["-NoLogo", "-NoExit", "-Command", psrl_init]);
         }
+        builder
     }
 }
 
