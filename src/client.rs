@@ -186,6 +186,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut cached_windows: Vec<WinStatus> = Vec::new();
     let mut cached_base_index: usize = default_base_index();
     let mut cached_dim_preds: bool = default_prediction_dimming();
+    let mut cmd_batch: Vec<String> = Vec::new();
 
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
@@ -203,7 +204,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             until_dump_deadline.max(1)
         };
 
-        let mut cmd_batch: Vec<String> = Vec::new();
+        cmd_batch.clear();
         let mut had_input_event = false;
         if event::poll(Duration::from_millis(poll_ms))? {
             last_event_time = Instant::now();
