@@ -16,8 +16,15 @@ pub fn cleanup_stale_port_files() {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
+                        let sock_addr = match addr.parse::<std::net::SocketAddr>() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                let _ = std::fs::remove_file(&path);
+                                continue;
+                            }
+                        };
                         if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
+                            &sock_addr,
                             Duration::from_millis(50)
                         ).is_err() {
                             let _ = std::fs::remove_file(&path);
@@ -41,25 +48,26 @@ pub fn read_session_key(session: &str) -> io::Result<String> {
 /// Send an authenticated command to a server
 pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
     let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    if let Ok(mut s) = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)) {
-        let _ = write!(s, "AUTH {}\n", key);
-        let _ = std::io::Write::write_all(&mut s, cmd);
-        let _ = s.flush();
-    }
+    let mut s = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50))?;
+    write!(s, "AUTH {}\n", key)?;
+    std::io::Write::write_all(&mut s, cmd)?;
+    s.flush()?;
     Ok(())
 }
 
 /// Send an authenticated command and get response
 pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
     let mut s = std::net::TcpStream::connect(addr)?;
-    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = write!(s, "AUTH {}\n", key);
-    let _ = std::io::Write::write_all(&mut s, cmd);
-    let _ = s.flush();
+    s.set_read_timeout(Some(Duration::from_millis(500)))?;
+    write!(s, "AUTH {}\n", key)?;
+    std::io::Write::write_all(&mut s, cmd)?;
+    s.flush()?;
     let mut br = std::io::BufReader::new(&mut s);
     let mut auth_line = String::new();
+    // Read auth response line - ignore read errors as connection may have closed
     let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
     let mut buf = String::new();
+    // Read remaining response - ignore read errors for same reason
     let _ = std::io::Read::read_to_string(&mut br, &mut buf);
     Ok(buf)
 }
@@ -73,12 +81,12 @@ pub fn send_control(line: String) -> io::Result<()> {
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(addr)?;
-    let _ = write!(stream, "AUTH {}\n", session_key);
+    write!(stream, "AUTH {}\n", session_key)?;
     if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
+        write!(stream, "TARGET {}\n", ft)?;
     }
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
+    write!(stream, "{}", line)?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -91,13 +99,13 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    let _ = write!(stream, "AUTH {}\n", session_key);
+    stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
+    write!(stream, "AUTH {}\n", session_key)?;
     if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
+        write!(stream, "TARGET {}\n", ft)?;
     }
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
+    write!(stream, "{}", line)?;
+    stream.flush()?;
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     loop {
@@ -114,9 +122,9 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
 /// Send a control message to a specific port
 pub fn send_control_to_port(port: u16, msg: &str) -> io::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-        let _ = stream.write_all(msg.as_bytes());
-    }
+    let mut stream = std::net::TcpStream::connect(&addr)?;
+    stream.write_all(msg.as_bytes())?;
+    stream.flush()?;
     Ok(())
 }
 
