@@ -27,14 +27,12 @@ use crossterm::{execute};
 use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
-use crate::types::*;
 use crate::platform::enable_virtual_terminal_processing;
 use crate::cli::*;
 use crate::session::*;
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
-use crate::util::*;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();

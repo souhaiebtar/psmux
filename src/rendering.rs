@@ -9,7 +9,6 @@ use crossterm::execute;
 use portable_pty::PtySize;
 
 use crate::types::*;
-use crate::tree::active_pane_mut;
 
 pub fn vt_to_color(c: vt100::Color) -> Color {
     match c {

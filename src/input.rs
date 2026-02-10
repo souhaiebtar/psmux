@@ -288,7 +288,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             
             Ok(false)
         }
-        Mode::ConfirmMode { ref prompt, ref command, ref mut input } => {
+        Mode::ConfirmMode { prompt: _, ref command, ref mut input } => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     app.mode = Mode::Passthrough;

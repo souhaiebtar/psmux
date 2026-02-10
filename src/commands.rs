@@ -6,9 +6,7 @@ use crate::tree::*;
 use crate::pane::*;
 use crate::copy_mode::*;
 use crate::session::send_control_to_port;
-use crate::layout::cycle_top_layout;
 use crate::window_ops::toggle_zoom;
-use crate::window_ops;
 
 /// Parse a command string to an Action
 pub fn parse_command_to_action(cmd: &str) -> Option<Action> {

@@ -203,11 +203,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let keypath = format!("{}\\{}.key", dir, app.session_name);
     let _ = std::fs::write(&keypath, &session_key);
     
-    // Try to set file permissions to user-only (Windows)
+    // Write session key to file (permissions handled by user's umask/ACLs)
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Recreate key file with restricted permissions
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
