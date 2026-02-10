@@ -2,6 +2,42 @@ use std::io::{self, Write};
 use std::time::Duration;
 use std::env;
 
+/// Validate a session name to prevent path traversal attacks.
+/// Session names must be alphanumeric with optional hyphens, underscores, and dots.
+/// Returns true if the name is valid, false otherwise.
+pub fn is_valid_session_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    // Reject path traversal attempts
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    // Allow alphanumeric, hyphen, underscore, dot (but not starting with dot)
+    if name.starts_with('.') {
+        return false;
+    }
+    name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Sanitize a session name by replacing invalid characters.
+/// Returns a safe version of the name or "default" if completely invalid.
+pub fn sanitize_session_name(name: &str) -> String {
+    if name.is_empty() {
+        return "default".to_string();
+    }
+    let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {

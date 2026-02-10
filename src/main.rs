@@ -131,8 +131,9 @@ fn main() -> io::Result<()> {
                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                         if let Ok(_p) = port_str.trim().parse::<u16>() {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
+                                            let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>() else { continue };
                                             if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
+                                                &sock_addr,
                                                 Duration::from_millis(50)
                                             ) {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
@@ -182,7 +183,8 @@ fn main() -> io::Result<()> {
             }
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
-                let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
+                let raw_name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
+                let name = sanitize_session_name(&raw_name);
                 // Check for initial command via -c flag (shell-wrapped)
                 let initial_cmd = args.iter().position(|a| a == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for raw command after -- (direct execution)
@@ -192,7 +194,8 @@ fn main() -> io::Result<()> {
                 return run_server(name, initial_cmd, raw_cmd);
             }
             "new-session" | "new" => {
-                let name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
+                let raw_name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
+                let name = sanitize_session_name(&raw_name);
                 let detached = cmd_args.iter().any(|a| *a == "-d");
                 // Check for -- separator: everything after it is a raw command (direct execution)
                 let dash_dash_pos = cmd_args.iter().position(|a| *a == "--");
@@ -223,10 +226,9 @@ fn main() -> io::Result<()> {
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                         if let Ok(port) = port_str.trim().parse::<u16>() {
                             let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
+                            addr.parse::<std::net::SocketAddr>().ok().map_or(false, |sock_addr| {
+                                std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(100)).is_ok()
+                            })
                         } else { false }
                     } else { false };
                     
@@ -1513,10 +1515,9 @@ fn main() -> io::Result<()> {
             if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                 if let Ok(port) = port_str.trim().parse::<u16>() {
                     let addr = format!("127.0.0.1:{}", port);
-                    std::net::TcpStream::connect_timeout(
-                        &addr.parse().unwrap(),
-                        Duration::from_millis(50)
-                    ).is_ok()
+                    addr.parse::<std::net::SocketAddr>().ok().map_or(false, |sock_addr| {
+                        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)).is_ok()
+                    })
                 } else {
                     false
                 }
