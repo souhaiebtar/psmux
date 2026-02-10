@@ -334,6 +334,22 @@ pub fn consume_output_dirty(node: &Node) -> bool {
     }
 }
 
+/// Consume and collect pane ids that had fresh output since the last check.
+pub fn consume_output_dirty_ids(node: &Node, out: &mut Vec<usize>) {
+    match node {
+        Node::Leaf(p) => {
+            if p.output_dirty.swap(false, Ordering::Relaxed) {
+                out.push(p.id);
+            }
+        }
+        Node::Split { children, .. } => {
+            for child in children {
+                consume_output_dirty_ids(child, out);
+            }
+        }
+    }
+}
+
 /// Count the number of leaf nodes in a tree
 fn count_leaves(node: &Node) -> usize {
     match node {

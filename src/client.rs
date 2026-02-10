@@ -1,5 +1,6 @@
 use std::io::{self, Write, BufRead, BufReader};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::env;
 
@@ -7,7 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::layout::LayoutJson;
+use crate::layout::{LayoutJson, PaneDeltaJson};
 use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
@@ -97,6 +98,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         refresh_ms: u64,
     }
 
+    #[derive(serde::Deserialize)]
+    struct DumpDeltaPayload {
+        panes: Vec<PaneDeltaJson>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DumpDelta {
+        delta: DumpDeltaPayload,
+    }
+
     fn trim_dump_line(buf: &mut Vec<u8>) {
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
@@ -113,8 +124,61 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         serde_json::from_slice::<DumpState>(buf.as_slice()).ok()
     }
 
+    #[cfg(feature = "simd-json")]
+    fn parse_dump_delta(buf: &mut Vec<u8>) -> Option<DumpDelta> {
+        simd_json::serde::from_slice::<DumpDelta>(buf.as_mut_slice()).ok()
+    }
+
+    #[cfg(not(feature = "simd-json"))]
+    fn parse_dump_delta(buf: &mut Vec<u8>) -> Option<DumpDelta> {
+        serde_json::from_slice::<DumpDelta>(buf.as_slice()).ok()
+    }
+
+    fn apply_pane_deltas(root: &mut LayoutJson, deltas: Vec<PaneDeltaJson>) -> usize {
+        fn rec(node: &mut LayoutJson, by_id: &mut HashMap<usize, PaneDeltaJson>, applied: &mut usize) {
+            match node {
+                LayoutJson::Leaf {
+                    id,
+                    cursor_row,
+                    cursor_col,
+                    alternate_screen,
+                    rows_v2,
+                    ..
+                } => {
+                    if let Some(mut delta) = by_id.remove(id) {
+                        *cursor_row = delta.cursor_row;
+                        *cursor_col = delta.cursor_col;
+                        *alternate_screen = delta.alternate_screen;
+                        *rows_v2 = std::mem::take(&mut delta.rows_v2);
+                        *applied += 1;
+                    }
+                }
+                LayoutJson::Split { children, .. } => {
+                    for child in children.iter_mut() {
+                        rec(child, by_id, applied);
+                        if by_id.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut by_id: HashMap<usize, PaneDeltaJson> = HashMap::with_capacity(deltas.len());
+        for delta in deltas {
+            by_id.insert(delta.id, delta);
+        }
+        let mut applied = 0usize;
+        rec(root, &mut by_id, &mut applied);
+        applied
+    }
+
     let mut state_buf: Vec<u8> = Vec::with_capacity(262_144);
     let mut last_state_buf: Vec<u8> = Vec::with_capacity(262_144);
+    let mut cached_root: Option<LayoutJson> = None;
+    let mut cached_windows: Vec<WinStatus> = Vec::new();
+    let mut cached_base_index: usize = default_base_index();
+    let mut cached_dim_preds: bool = default_prediction_dimming();
 
     loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
@@ -396,35 +460,70 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
         last_state_buf.clear();
         last_state_buf.extend_from_slice(&state_buf);
-        let state: DumpState = match parse_dump_state(&mut state_buf) {
-            Some(s) => s,
-            None => {
-                force_dump = true;
-                continue; // Skip frame on parse error
+        let is_delta_frame = state_buf.starts_with(b"{\"delta\":");
+        if is_delta_frame {
+            let delta_state: DumpDelta = match parse_dump_delta(&mut state_buf) {
+                Some(s) => s,
+                None => {
+                    force_dump = true;
+                    continue;
+                }
+            };
+            match cached_root.as_mut() {
+                Some(root) => {
+                    let applied = apply_pane_deltas(root, delta_state.delta.panes);
+                    if applied == 0 && can_skip_same_frame {
+                        last_dump_time = Instant::now();
+                        continue;
+                    }
+                }
+                None => {
+                    force_dump = true;
+                    continue;
+                }
             }
-        };
+        } else {
+            let state: DumpState = match parse_dump_state(&mut state_buf) {
+                Some(s) => s,
+                None => {
+                    force_dump = true;
+                    continue; // Skip frame on parse error
+                }
+            };
 
-        let root = state.layout;
-        let windows = state.windows;
-        last_tree = state.tree;
-        let base_index = state.base_index;
-        let dim_preds = state.prediction_dimming;
-        target_idle_refresh_ms = state.refresh_ms.clamp(16, 250);
+            cached_root = Some(state.layout);
+            cached_windows = state.windows;
+            last_tree = state.tree;
+            cached_base_index = state.base_index;
+            cached_dim_preds = state.prediction_dimming;
+            target_idle_refresh_ms = state.refresh_ms.clamp(16, 250);
 
-        // Update prefix key from server config (if provided)
-        if let Some(ref prefix_str) = state.prefix {
-            if let Some((kc, km)) = parse_key_string(prefix_str) {
-                if (kc, km) != prefix_key {
-                    prefix_key = (kc, km);
-                    // Compute raw control character for Ctrl+<letter> prefix
-                    prefix_raw_char = if km.contains(KeyModifiers::CONTROL) {
-                        if let KeyCode::Char(c) = kc {
-                            Some((c as u8 & 0x1f) as char)
-                        } else { None }
-                    } else { None };
+            // Update prefix key from server config (if provided)
+            if let Some(ref prefix_str) = state.prefix {
+                if let Some((kc, km)) = parse_key_string(prefix_str) {
+                    if (kc, km) != prefix_key {
+                        prefix_key = (kc, km);
+                        // Compute raw control character for Ctrl+<letter> prefix
+                        prefix_raw_char = if km.contains(KeyModifiers::CONTROL) {
+                            if let KeyCode::Char(c) = kc {
+                                Some((c as u8 & 0x1f) as char)
+                            } else { None }
+                        } else { None };
+                    }
                 }
             }
         }
+
+        let root = match cached_root.as_ref() {
+            Some(r) => r,
+            None => {
+                force_dump = true;
+                continue;
+            }
+        };
+        let windows = &cached_windows;
+        let base_index = cached_base_index;
+        let dim_preds = cached_dim_preds;
 
         // ── STEP 3: Render ───────────────────────────────────────────────
         terminal.draw(|f| {
@@ -587,7 +686,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 }
             }
 
-            render_json(f, &root, chunks[0], dim_preds);
+            render_json(f, root, chunks[0], dim_preds);
 
             if session_chooser {
                 let overlay = Block::default().borders(Borders::ALL).title("choose-session");
@@ -646,7 +745,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         }
                     }
                 }
-                rec(&root, chunks[0], &mut rects);
+                rec(root, chunks[0], &mut rects);
                 choices.clear();
                 for (i, (pid, r)) in rects.iter().enumerate() {
                     if i < 10 {

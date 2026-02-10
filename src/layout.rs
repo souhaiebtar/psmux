@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -37,6 +40,22 @@ pub struct CellRunJson {
 #[derive(Serialize, Deserialize)]
 pub struct RowRunsJson {
     pub runs: Vec<CellRunJson>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PaneDeltaJson {
+    pub id: usize,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    #[serde(default)]
+    pub alternate_screen: bool,
+    #[serde(default)]
+    pub rows_v2: Vec<RowRunsJson>,
+}
+
+#[derive(Serialize)]
+struct LayoutDeltaJson {
+    panes: Vec<PaneDeltaJson>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,7 +104,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
 pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(String, bool)> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode);
     let scroll_offset = app.copy_scroll_offset;
-    const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(250);
+    const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(500);
     
     fn build(
         node: &mut Node,
@@ -117,7 +136,11 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                 let (cr, cc) = screen.cursor_position();
                 let alternate_screen = screen.alternate_screen();
                 let now = Instant::now();
-                if !alternate_screen && now.duration_since(p.last_title_infer_at) >= TITLE_INFER_INTERVAL {
+                let is_active_pane = *cur_path == active_path;
+                if is_active_pane
+                    && !alternate_screen
+                    && now.duration_since(p.last_title_infer_at) >= TITLE_INFER_INTERVAL
+                {
                     if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
                         if t != p.title {
                             p.title = t;
@@ -347,6 +370,185 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
     );
     let s = serde_json::to_string(&root).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok((s, title_changed))
+}
+
+fn pane_delta_fingerprint(delta: &PaneDeltaJson) -> u64 {
+    let mut h = DefaultHasher::new();
+    delta.id.hash(&mut h);
+    delta.cursor_row.hash(&mut h);
+    delta.cursor_col.hash(&mut h);
+    delta.alternate_screen.hash(&mut h);
+    for row in &delta.rows_v2 {
+        row.runs.len().hash(&mut h);
+        for run in &row.runs {
+            run.text.hash(&mut h);
+            run.fg.hash(&mut h);
+            run.bg.hash(&mut h);
+            run.flags.hash(&mut h);
+            run.width.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Build pane-only deltas for dirty panes in the active window.
+/// Returns (delta_json, title_changed, changed_pane_count).
+pub fn dump_panes_delta_json(
+    app: &mut AppState,
+    dirty_panes: &HashSet<usize>,
+    pane_fingerprints: &mut HashMap<usize, u64>,
+) -> io::Result<(String, bool, usize)> {
+    const FLAG_DIM: u8 = 1;
+    const FLAG_BOLD: u8 = 2;
+    const FLAG_ITALIC: u8 = 4;
+    const FLAG_UNDERLINE: u8 = 8;
+    const FLAG_INVERSE: u8 = 16;
+    const TITLE_INFER_INTERVAL: Duration = Duration::from_millis(500);
+
+    fn build_rows_v2(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<RowRunsJson> {
+        let mut rows_v2: Vec<RowRunsJson> = Vec::with_capacity(rows as usize);
+        for r in 0..rows {
+            let mut runs: Vec<CellRunJson> = Vec::new();
+            let mut c = 0;
+            while c < cols {
+                let mut text = String::new();
+                let mut fg_code = encode_color(vt100::Color::Default);
+                let mut bg_code = encode_color(vt100::Color::Default);
+                let mut bold = false;
+                let mut italic = false;
+                let mut underline = false;
+                let mut inverse = false;
+                let mut dim = false;
+
+                if let Some(cell) = screen.cell(r, c) {
+                    let fg = cell.fgcolor();
+                    let bg = cell.bgcolor();
+                    fg_code = encode_color(fg);
+                    bg_code = encode_color(bg);
+                    text = cell.contents().to_string();
+                    if text.is_empty() {
+                        text.push(' ');
+                    }
+                    bold = cell.bold();
+                    italic = cell.italic();
+                    underline = cell.underline();
+                    inverse = cell.inverse();
+                    dim = cell.dim();
+                } else {
+                    text.push(' ');
+                }
+
+                let mut width = UnicodeWidthStr::width(text.as_str()) as u16;
+                if width == 0 {
+                    width = 1;
+                }
+
+                let mut flags = 0u8;
+                if dim { flags |= FLAG_DIM; }
+                if bold { flags |= FLAG_BOLD; }
+                if italic { flags |= FLAG_ITALIC; }
+                if underline { flags |= FLAG_UNDERLINE; }
+                if inverse { flags |= FLAG_INVERSE; }
+
+                if let Some(last) = runs.last_mut() {
+                    if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
+                        last.text.push_str(text.as_str());
+                        last.width = last.width.saturating_add(width);
+                    } else {
+                        runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
+                    }
+                } else {
+                    runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
+                }
+
+                c = c.saturating_add(width.max(1));
+            }
+            rows_v2.push(RowRunsJson { runs });
+        }
+        rows_v2
+    }
+
+    fn collect_deltas(
+        node: &mut Node,
+        cur_path: &mut Vec<usize>,
+        active_path: &[usize],
+        dirty_panes: &HashSet<usize>,
+        pane_fingerprints: &mut HashMap<usize, u64>,
+        title_changed: &mut bool,
+        out: &mut Vec<PaneDeltaJson>,
+    ) {
+        match node {
+            Node::Split { children, .. } => {
+                for (i, child) in children.iter_mut().enumerate() {
+                    cur_path.push(i);
+                    collect_deltas(
+                        child,
+                        cur_path,
+                        active_path,
+                        dirty_panes,
+                        pane_fingerprints,
+                        title_changed,
+                        out,
+                    );
+                    cur_path.pop();
+                }
+            }
+            Node::Leaf(p) => {
+                if !dirty_panes.contains(&p.id) {
+                    return;
+                }
+                let parser = p.term.lock().unwrap();
+                let screen = parser.screen();
+                let (cursor_row, cursor_col) = screen.cursor_position();
+                let alternate_screen = screen.alternate_screen();
+                let now = Instant::now();
+                let is_active_pane = *cur_path == active_path;
+                if is_active_pane
+                    && !alternate_screen
+                    && now.duration_since(p.last_title_infer_at) >= TITLE_INFER_INTERVAL
+                {
+                    if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
+                        if t != p.title {
+                            p.title = t;
+                            *title_changed = true;
+                        }
+                    }
+                    p.last_title_infer_at = now;
+                }
+
+                let delta = PaneDeltaJson {
+                    id: p.id,
+                    cursor_row,
+                    cursor_col,
+                    alternate_screen,
+                    rows_v2: build_rows_v2(&screen, p.last_rows, p.last_cols),
+                };
+                let fp = pane_delta_fingerprint(&delta);
+                if pane_fingerprints.get(&p.id).copied() != Some(fp) {
+                    pane_fingerprints.insert(p.id, fp);
+                    out.push(delta);
+                }
+            }
+        }
+    }
+
+    let win = &mut app.windows[app.active_idx];
+    let mut path = Vec::new();
+    let mut title_changed = false;
+    let mut panes = Vec::new();
+    collect_deltas(
+        &mut win.root,
+        &mut path,
+        &win.active_path,
+        dirty_panes,
+        pane_fingerprints,
+        &mut title_changed,
+        &mut panes,
+    );
+    let changed = panes.len();
+    let s = serde_json::to_string(&LayoutDeltaJson { panes })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
+    Ok((s, title_changed, changed))
 }
 
 /// Apply a named layout to the current window
