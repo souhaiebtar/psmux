@@ -25,6 +25,15 @@ use crate::config::*;
 use crate::commands::*;
 use crate::util::*;
 
+const MAX_CONTROL_LINE_LEN: usize = 64 * 1024;
+const MAX_RETAINED_LINE_CAP: usize = 64 * 1024;
+
+fn trim_reusable_line_buffer(line: &mut String) {
+    if line.capacity() > MAX_RETAINED_LINE_CAP {
+        line.shrink_to(MAX_RETAINED_LINE_CAP);
+    }
+}
+
 fn build_dump_state_payload(
     layout_json: &str,
     windows_json: &str,
@@ -301,18 +310,30 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     if line.trim().is_empty() {
                         // Try to read another command with timeout
                         line.clear();
+                        trim_reusable_line_buffer(&mut line);
                         match r.read_line(&mut line) {
                             Ok(0) => break, // EOF - client disconnected
                             Err(e) => {
                                 // In persistent mode, timeouts are expected - keep waiting
                                 if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                                     line.clear(); // Clear any partial data from interrupted read
+                                    trim_reusable_line_buffer(&mut line);
                                     continue;
                                 }
                                 break; // Real error or non-persistent timeout
                             }
                             Ok(_) => continue, // Process the new line
                         }
+                    }
+                    if line.len() > MAX_CONTROL_LINE_LEN {
+                        let _ = write_stream.write_all(b"ERROR: command too long\n");
+                        let _ = write_stream.flush();
+                        line.clear();
+                        trim_reusable_line_buffer(&mut line);
+                        if !persistent {
+                            break;
+                        }
+                        continue;
                     }
                     
                     // Use quote-aware parser to preserve arguments with spaces
@@ -762,11 +783,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                     // Try to read next command for batching (with timeout)
                     line.clear();
+                    trim_reusable_line_buffer(&mut line);
                     match r.read_line(&mut line) {
                         Ok(0) => break, // EOF - client disconnected
                         Err(e) => {
                             if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                                 line.clear(); // Clear any partial data from interrupted read
+                                trim_reusable_line_buffer(&mut line);
                                 continue; // Persistent mode - keep waiting
                             }
                             break; // Non-persistent timeout or real error

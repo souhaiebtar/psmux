@@ -114,6 +114,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
     }
 
+    fn trim_reusable_buf(buf: &mut Vec<u8>, max_cap: usize) {
+        if buf.capacity() > max_cap {
+            buf.shrink_to(max_cap);
+        }
+    }
+
     #[cfg(feature = "simd-json")]
     fn parse_dump_state(buf: &mut Vec<u8>) -> Option<DumpState> {
         simd_json::serde::from_slice::<DumpState>(buf.as_mut_slice()).ok()
@@ -173,6 +179,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         applied
     }
 
+    const MAX_STATE_BUF_CAP: usize = 2 * 1024 * 1024;
     let mut state_buf: Vec<u8> = Vec::with_capacity(262_144);
     let mut last_state_buf: Vec<u8> = Vec::with_capacity(262_144);
     let mut cached_root: Option<LayoutJson> = None;
@@ -442,6 +449,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         if writer.flush().is_err() { break; }
 
         // Read one line of JSON response into a reusable byte buffer.
+        trim_reusable_buf(&mut state_buf, MAX_STATE_BUF_CAP);
+        trim_reusable_buf(&mut last_state_buf, MAX_STATE_BUF_CAP);
         state_buf.clear();
         match reader.read_until(b'\n', &mut state_buf) {
             Ok(0) => break, // EOF - server disconnected
