@@ -797,10 +797,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let mut cached_windows_json = String::new();
     let mut cached_tree_json = String::new();
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
+    let mut dirty_pane_ids: HashSet<usize> = HashSet::new();
     loop {
         let mut sent_pty_input = false;
         let mut handled_req = false;
-        let mut dirty_pane_ids: HashSet<usize> = HashSet::new();
+        dirty_pane_ids.clear();
         if app.attached_clients > 0 {
             for win in &app.windows {
                 consume_output_dirty_set(&win.root, &mut dirty_pane_ids);
