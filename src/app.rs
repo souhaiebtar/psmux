@@ -377,8 +377,9 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let win = &mut app.windows[app.active_idx];
                         if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
                             let _ = pane.master.resize(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 });
-                            let mut parser = pane.term.lock().unwrap();
-                            parser.screen_mut().set_size(rows, cols);
+                            if let Ok(mut parser) = pane.term.lock() {
+                                parser.screen_mut().set_size(rows, cols);
+                            }
                         }
                         last_resize = Instant::now();
                     }

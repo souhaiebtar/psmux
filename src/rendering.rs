@@ -93,12 +93,13 @@ pub fn render_node(
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
                 let _ = pane.master.resize(PtySize { rows: target_rows, cols: target_cols, pixel_width: 0, pixel_height: 0 });
-                let mut parser = pane.term.lock().unwrap();
-                parser.screen_mut().set_size(target_rows, target_cols);
+                if let Ok(mut parser) = pane.term.lock() {
+                    parser.screen_mut().set_size(target_rows, target_cols);
+                }
                 pane.last_rows = target_rows;
                 pane.last_cols = target_cols;
             }
-            let parser = pane.term.lock().unwrap();
+            let Ok(parser) = pane.term.lock() else { return };
             let screen = parser.screen();
             let (cur_r, cur_c) = screen.cursor_position();
             let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);

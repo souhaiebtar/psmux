@@ -27,9 +27,10 @@ pub fn spawn_pty_reader_thread<R: std::io::Read + Send + 'static>(
                 match reader.read(&mut local) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let mut parser = term_reader.lock().unwrap();
-                        parser.process(&local[..n]);
-                        dirty_reader.store(true, Ordering::Relaxed);
+                        if let Ok(mut parser) = term_reader.lock() {
+                            parser.process(&local[..n]);
+                            dirty_reader.store(true, Ordering::Relaxed);
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

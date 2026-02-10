@@ -129,7 +129,26 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                 const FLAG_UNDERLINE: u8 = 8;
                 const FLAG_INVERSE: u8 = 16;
 
-                let parser = p.term.lock().unwrap();
+                let Ok(parser) = p.term.lock() else {
+                    // Mutex poisoned - return minimal leaf
+                    return LayoutJson::Leaf {
+                        id: p.id,
+                        rows: p.last_rows,
+                        cols: p.last_cols,
+                        cursor_row: 0,
+                        cursor_col: 0,
+                        alternate_screen: false,
+                        active: false,
+                        copy_mode: false,
+                        scroll_offset: 0,
+                        sel_start_row: None,
+                        sel_start_col: None,
+                        sel_end_row: None,
+                        sel_end_col: None,
+                        content: Vec::new(),
+                        rows_v2: Vec::new(),
+                    };
+                };
                 let screen = parser.screen();
                 let (cr, cc) = screen.cursor_position();
                 let alternate_screen = screen.alternate_screen();
@@ -473,7 +492,7 @@ pub fn dump_panes_delta_json(
                 if !dirty_panes.contains(&p.id) {
                     return;
                 }
-                let parser = p.term.lock().unwrap();
+                let Ok(parser) = p.term.lock() else { return };
                 let screen = parser.screen();
                 let (cursor_row, cursor_col) = screen.cursor_position();
                 let alternate_screen = screen.alternate_screen();
