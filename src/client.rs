@@ -11,6 +11,159 @@ use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
 use crate::config::parse_key_string;
+use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::layout::RowRunsJson;
+use crate::tree::split_with_gaps;
+
+/// Extract selected text from the layout tree given absolute terminal coordinates.
+/// Computes pane areas via the same Layout splitting render_json uses, then reads
+/// characters from the run-length-encoded rows_v2 data.
+fn extract_selection_text(
+    layout: &LayoutJson,
+    term_width: u16,
+    content_height: u16, // excluding status bar
+    start: (u16, u16),   // (col, row)
+    end: (u16, u16),
+) -> String {
+    // Normalise so (r0,c0) <= (r1,c1) in reading order
+    let (r0, c0, r1, c1) = if (start.1, start.0) <= (end.1, end.0) {
+        (start.1, start.0, end.1, end.0)
+    } else {
+        (end.1, end.0, start.1, start.0)
+    };
+
+    // Collect leaf panes with their inner areas and content
+    struct PaneLeaf<'a> {
+        inner: Rect,
+        rows_v2: &'a [RowRunsJson],
+    }
+
+    fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
+        match node {
+            LayoutJson::Leaf { rows_v2, .. } => {
+                // No borders — content fills entire area (tmux-style)
+                out.push(PaneLeaf { inner: area, rows_v2 });
+            }
+            LayoutJson::Split { kind, sizes, children } => {
+                let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                    sizes.clone()
+                } else {
+                    vec![(100 / children.len().max(1)) as u16; children.len()]
+                };
+                let is_horizontal = kind == "Horizontal";
+                let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() {
+                        collect_leaves(child, rects[i], out);
+                    }
+                }
+            }
+        }
+    }
+
+    let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
+    let mut leaves: Vec<PaneLeaf> = Vec::new();
+    collect_leaves(layout, content_area, &mut leaves);
+
+    // Helper: get character at a local column position within a row's runs
+    fn char_at_col(runs: &[crate::layout::CellRunJson], local_col: usize) -> char {
+        let mut cursor = 0usize;
+        for run in runs {
+            let run_width = run.width.max(1) as usize;
+            if local_col >= cursor && local_col < cursor + run_width {
+                let offset = local_col - cursor;
+                // Run text may be shorter than run_width (e.g. single char repeated)
+                // or multi-char for wide chars. Pick the nth char if available.
+                return run.text.chars().nth(offset).unwrap_or(' ');
+            }
+            cursor += run_width;
+        }
+        ' '
+    }
+
+    let mut result = String::new();
+    for row in r0..=r1 {
+        let col_start = if row == r0 { c0 } else { 0 };
+        let col_end = if row == r1 { c1 } else { term_width.saturating_sub(1) };
+
+        let mut line = String::new();
+        for col in col_start..=col_end {
+            let mut ch = ' ';
+            for leaf in &leaves {
+                let inner = &leaf.inner;
+                if col >= inner.x && col < inner.x + inner.width
+                    && row >= inner.y && row < inner.y + inner.height
+                {
+                    let local_row = (row - inner.y) as usize;
+                    let local_col = (col - inner.x) as usize;
+                    if local_row < leaf.rows_v2.len() {
+                        ch = char_at_col(&leaf.rows_v2[local_row].runs, local_col);
+                    }
+                    break;
+                }
+            }
+            line.push(ch);
+        }
+        // Trim trailing whitespace per line
+        let trimmed = line.trim_end();
+        result.push_str(trimmed);
+        if row < r1 {
+            result.push('\n');
+        }
+    }
+
+    result
+}
+
+/// Check if screen coordinates (x, y) fall on a separator line in the layout.
+/// Used to distinguish border-drag (resize) from text selection on left-click.
+fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
+    match layout {
+        LayoutJson::Leaf { .. } => false,
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+
+            // Check if (x, y) is on any separator between children
+            for i in 0..children.len().saturating_sub(1) {
+                if i >= rects.len() { break; }
+                if is_horizontal {
+                    let sep_x = rects[i].x + rects[i].width;
+                    if x == sep_x && y >= area.y && y < area.y + area.height {
+                        return true;
+                    }
+                } else {
+                    let sep_y = rects[i].y + rects[i].height;
+                    if y == sep_y && x >= area.x && x < area.x + area.width {
+                        return true;
+                    }
+                }
+            }
+
+            // Recurse into children
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() && is_on_separator(child, rects[i], x, y) {
+                    return true;
+                }
+            }
+
+            false
+        }
+    }
+}
+
+/// Check if any leaf in a LayoutJson subtree is the active pane.
+fn has_active_leaf(node: &LayoutJson) -> bool {
+    match node {
+        LayoutJson::Leaf { active, .. } => *active,
+        LayoutJson::Split { children, .. } => children.iter().any(|c| has_active_leaf(c)),
+    }
+}
 
 pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
@@ -44,8 +197,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let _ = writer.write_all(b"client-attach\n");
     let _ = writer.flush();
 
-    // Set read timeout for dump-state responses (generous but bounded)
-    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_millis(2000)));
+    // Spawn a dedicated reader thread so the event loop never blocks on I/O.
+    // The reader thread reads lines from the server and sends them via channel.
+    let _ = reader.get_ref().set_read_timeout(None); // blocking reads in reader thread
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = String::with_capacity(64 * 1024);
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = std::mem::take(&mut buf);
+                    buf = String::with_capacity(64 * 1024);
+                    if frame_tx.send(line).is_err() { break; }
+                }
+            }
+        }
+    });
 
     let mut quit = false;
     let mut prefix_armed = false;
@@ -53,6 +223,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut rename_buf = String::new();
     let mut pane_renaming = false;
     let mut pane_title_buf = String::new();
+    let mut command_input = false;
+    let mut command_buf = String::new();
     let mut chooser = false;
     let mut choices: Vec<(usize, usize)> = Vec::new();
     let mut tree_chooser = false;
@@ -63,7 +235,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut session_selected: usize = 0;
     let current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
-    let mut last_event_time = Instant::now();
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
     let mut force_dump = true;
     let mut last_tree: Vec<WinTree> = Vec::new();
@@ -92,18 +263,52 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         prediction_dimming: bool,
     }
 
+    let mut cmd_batch: Vec<String> = Vec::new();
+    let mut dump_buf = String::new();
+    let mut prev_dump_buf = String::new();
+    let mut last_key_send_time: Option<Instant> = None;
+    let mut dump_in_flight = false;
+    // Text selection state (client-side only, left-click drag like pwsh)
+    let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
+    let mut rsel_end: Option<(u16, u16)> = None;
+    let mut rsel_dragged = false;
+    let mut selection_changed = false; // forces redraw for selection overlay
+    let mut border_drag = false; // true when dragging a pane separator (resize)
     loop {
-        // ── STEP 1: Poll events with adaptive timeout ────────────────────
-        // Fast polling when typing (1ms), relaxed when idle (16ms ≈ 60fps)
-        let since_last = last_event_time.elapsed().as_millis();
-        let poll_ms = if since_last < 50 { 1 } else if since_last < 200 { 5 } else { 25 };
+        // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
+        // Drain channel, keeping only the most recent frame.
+        let mut got_frame = false;
+        loop {
+            match frame_rx.try_recv() {
+                Ok(line) => { dump_buf = line; got_frame = true; dump_in_flight = false; }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { quit = true; break; }
+            }
+        }
+        if quit && !got_frame { break; }
 
-        let mut cmd_batch: Vec<String> = Vec::new();
-        let mut had_input_event = false;
+        // ── STEP 1: Poll events with adaptive timeout ────────────────────
+        let since_dump = last_dump_time.elapsed().as_millis() as u64;
+        // Expire typing timer after 100ms of no new keys
+        if let Some(kt) = last_key_send_time {
+            if kt.elapsed().as_millis() > 100 { last_key_send_time = None; }
+        }
+        let typing_active = last_key_send_time.is_some();
+        // When typing: dump ASAP, round-trip is the natural rate limiter.
+        // When idle: 50ms refresh (20fps) saves CPU.
+        let poll_ms = if got_frame { 0 }
+            else if dump_in_flight { 1 }
+            else if force_dump { 0 }
+            else if typing_active { 0 }             // dump immediately — no artificial wait
+            else {
+                let idle_frame: u64 = 50;
+                let remaining = idle_frame.saturating_sub(since_dump);
+                if remaining == 0 { 0 } else { remaining.min(50) }
+            };
+
+        cmd_batch.clear();
         if event::poll(Duration::from_millis(poll_ms))? {
-            last_event_time = Instant::now();
             loop {
-                had_input_event = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -113,6 +318,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
 
                         if is_ctrl_q { quit = true; }
+                        else if rsel_start.is_some() && matches!(key.code, KeyCode::Esc) {
+                            // Escape clears any active text selection
+                            rsel_start = None;
+                            rsel_end = None;
+                            selection_changed = true;
+                        }
                         else if is_prefix { prefix_armed = true; }
                         else if prefix_armed {
                             match key.code {
@@ -137,6 +348,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Char('d') => { quit = true; }
                                 KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
                                 KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
+                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); }
                                 KeyCode::Char('w') => {
                                     tree_chooser = true;
                                     tree_entries.clear();
@@ -229,12 +441,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Esc if tree_chooser => { tree_chooser = false; }
                                 KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { rename_buf.push(c); }
                                 KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { pane_title_buf.push(c); }
+                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) => { command_buf.push(c); }
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
+                                KeyCode::Backspace if command_input => { let _ = command_buf.pop(); }
                                 KeyCode::Enter if renaming => { cmd_batch.push(format!("rename-window {}\n", rename_buf)); renaming = false; }
                                 KeyCode::Enter if pane_renaming => { cmd_batch.push(format!("set-pane-title {}\n", pane_title_buf)); pane_renaming = false; }
+                                KeyCode::Enter if command_input => {
+                                    let trimmed = command_buf.trim().to_string();
+                                    if !trimmed.is_empty() {
+                                        cmd_batch.push(format!("{}\n", trimmed));
+                                    }
+                                    command_input = false;
+                                }
                                 KeyCode::Esc if renaming => { renaming = false; }
                                 KeyCode::Esc if pane_renaming => { pane_renaming = false; }
+                                KeyCode::Esc if command_input => { command_input = false; }
                                 KeyCode::Char(d) if chooser && d.is_ascii_digit() => {
                                     let raw = d.to_digit(10).unwrap() as usize;
                                     let choice = if raw == 0 { 10 } else { raw };
@@ -279,6 +501,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::PageDown => { cmd_batch.push("send-key pagedown\n".into()); }
                                 KeyCode::Home => { cmd_batch.push("send-key home\n".into()); }
                                 KeyCode::End => { cmd_batch.push("send-key end\n".into()); }
+                                KeyCode::Insert => { cmd_batch.push("send-key insert\n".into()); }
+                                KeyCode::F(n) => { cmd_batch.push(format!("send-key f{}\n", n)); }
                                 _ => {}
                             }
                         }
@@ -290,14 +514,92 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
                         match me.kind {
-                            MouseEventKind::Down(MouseButton::Left) => { cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Down(MouseButton::Right) => { cmd_batch.push(format!("mouse-down-right {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                // Detect if click is on a separator line (for border resize)
+                                let on_sep = if !prev_dump_buf.is_empty() {
+                                    if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                        let content_area = Rect { x: 0, y: 0, width: last_sent_size.0, height: last_sent_size.1 };
+                                        is_on_separator(&state.layout, content_area, me.column, me.row)
+                                    } else { false }
+                                } else { false };
+
+                                // Always forward to server for pane focus, tab clicks, border resize
+                                cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
+
+                                if on_sep {
+                                    // Border resize mode — server handles drag
+                                    border_drag = true;
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                } else {
+                                    // Text selection mode
+                                    border_drag = false;
+                                    rsel_start = Some((me.column, me.row));
+                                    rsel_end = Some((me.column, me.row));
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                // Right-click: paste from clipboard (pwsh behavior)
+                                if let Some(text) = read_from_system_clipboard() {
+                                    if !text.is_empty() {
+                                        let encoded = base64_encode(&text);
+                                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                                    }
+                                }
+                            }
                             MouseEventKind::Down(MouseButton::Middle) => { cmd_batch.push(format!("mouse-down-middle {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Drag(MouseButton::Left) => { cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Up(MouseButton::Left) => { cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Up(MouseButton::Right) => { cmd_batch.push(format!("mouse-up-right {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Up(MouseButton::Middle) => { cmd_batch.push(format!("mouse-up-middle {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Moved => { cmd_batch.push(format!("mouse-move {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if border_drag {
+                                    // Forward drag to server for border resize
+                                    cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
+                                } else {
+                                    // Left-drag: extend text selection (pwsh behavior)
+                                    if rsel_start.is_some() {
+                                        rsel_end = Some((me.column, me.row));
+                                        rsel_dragged = true;
+                                        selection_changed = true;
+                                    }
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Right) => {}
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if border_drag {
+                                    // Forward mouse-up to server to finalize border resize
+                                    cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
+                                    border_drag = false;
+                                } else if rsel_dragged {
+                                    // Left-drag completed — copy selected text to clipboard
+                                    rsel_end = Some((me.column, me.row));
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                            let text = extract_selection_text(
+                                                &state.layout,
+                                                last_sent_size.0,
+                                                last_sent_size.1,
+                                                s, e,
+                                            );
+                                            if !text.is_empty() {
+                                                copy_to_system_clipboard(&text);
+                                            }
+                                        }
+                                    }
+                                    // Keep selection visible (clears on next click or Escape)
+                                } else {
+                                    // Plain left-click (no drag) — clear any old selection, forward mouse-up
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                    cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Right) => {}
+                            MouseEventKind::Up(MouseButton::Middle) => {}
+                            MouseEventKind::Moved => {
+                                // Don't send bare mouse-move to server - wasteful and server ignores it
+                            }
                             MouseEventKind::ScrollUp => { cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row)); }
                             MouseEventKind::ScrollDown => { cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row)); }
                             _ => {}
@@ -310,7 +612,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
         if quit { break; }
 
-        // ── STEP 2: Send commands + dump-state on persistent connection ──
+        // ── STEP 2: Send commands immediately, refresh screen at capped rate ──
         // Send client-size if changed
         let mut size_changed = false;
         {
@@ -325,41 +627,58 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
         }
 
-        // Send all batched commands (fire-and-forget)
-        for cmd in &cmd_batch {
-            if writer.write_all(cmd.as_bytes()).is_err() {
-                break; // Connection lost
+        // Send all batched commands immediately — keys reach the server
+        // without waiting for a dump-state round-trip
+        let sent_keys_this_iter = !cmd_batch.is_empty();
+        if sent_keys_this_iter {
+            for cmd in &cmd_batch {
+                if writer.write_all(cmd.as_bytes()).is_err() {
+                    break; // Connection lost
+                }
             }
+            let _ = writer.flush(); // push keys to server NOW
+            last_key_send_time = Some(Instant::now());
         }
 
-        // Avoid full-state roundtrips every loop when idle.
+        // ── STEP 2b: Request screen update (non-blocking) ────────────────
+        // Send dump-state ASAP when typing. The dump_in_flight flag naturally
+        // rate-limits to 1 outstanding request (round-trip = ~5-10ms).
+        // No artificial echo wait — the server processes keys before dumps
+        // in each batch, so ConPTY gets the input before serialization.
         let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
-        let idle_refresh_ms = if overlays_active { 33 } else { 120 };
-        let should_dump = force_dump
-            || had_input_event
-            || size_changed
-            || !cmd_batch.is_empty()
-            || last_dump_time.elapsed() >= Duration::from_millis(idle_refresh_ms);
-        if !should_dump {
+        let should_dump = if force_dump || size_changed {
+            true
+        } else if typing_active {
+            true  // always request — dump_in_flight prevents flooding
+        } else {
+            let idle_frame: u64 = if overlays_active { 33 } else { 50 };
+            since_dump >= idle_frame
+        };
+        if should_dump && !dump_in_flight {
+            if writer.write_all(b"dump-state\n").is_err() { break; }
+            if writer.flush().is_err() { break; }
+            dump_in_flight = true;
+        }
+
+        // ── STEP 3: Render if we have a frame ────────────────────────────
+        // Also render if selection changed (for highlight overlay) even without new frame
+        if !got_frame && !selection_changed { continue; }
+
+        // Skip parse + render when the raw JSON is identical to the previous
+        // frame AND selection hasn't changed.
+        if dump_buf == prev_dump_buf && !selection_changed {
+            last_dump_time = Instant::now();
             continue;
         }
 
-        // Send dump-state and flush (server responds with one line of JSON)
-        if writer.write_all(b"dump-state\n").is_err() { break; }
-        if writer.flush().is_err() { break; }
-
-        // Read one line of JSON response
-        let mut buf = String::new();
-        match reader.read_line(&mut buf) {
-            Ok(0) => break, // EOF - server disconnected
-            Err(_) => break, // Error
-            Ok(_) => {}
-        }
-        let state: DumpState = match serde_json::from_str(&buf) {
+        // Parse the frame (use prev_dump_buf for selection-only redraws)
+        let frame_to_parse = if got_frame && dump_buf != prev_dump_buf { &dump_buf } else { &prev_dump_buf };
+        let state: DumpState = match serde_json::from_str(frame_to_parse) {
             Ok(s) => s,
             Err(_) => {
                 force_dump = true;
-                continue; // Skip frame on parse error
+                selection_changed = false;
+                continue;
             }
         };
 
@@ -385,6 +704,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
+        let sel_s = rsel_start;
+        let sel_e = rsel_end;
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default().direction(Direction::Vertical)
@@ -409,14 +730,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         content,
                         rows_v2,
                     } => {
-                        let pane_block = if *copy_mode && *active {
-                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("[copy mode]")
-                        } else if *active {
-                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green))
-                        } else {
-                            Block::default().borders(Borders::ALL)
-                        };
-                        let inner = pane_block.inner(area);
+                        // No borders — content fills entire area (tmux-style)
+                        let inner = area;
                         let mut lines: Vec<Line> = Vec::new();
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
                         if use_full_cells || rows_v2.is_empty() {
@@ -448,11 +763,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                     if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                     if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
-                                    let char_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+                                    let text: &str = if cell.text.is_empty() { " " } else { &cell.text };
+                                    let char_width = unicode_width::UnicodeWidthStr::width(text) as u16;
                                     spans.push(Span::styled(text, style));
                                     if char_width >= 2 {
-                                        c += 2; // skip continuation cell after wide character
+                                        c += 2;
                                     } else {
                                         c += 1;
                                     }
@@ -478,24 +793,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                                     if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
                                     if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text = if run.text.is_empty() { " ".to_string() } else { run.text.clone() };
+                                    let text: &str = if run.text.is_empty() { " " } else { &run.text };
                                     spans.push(Span::styled(text, style));
                                     c = c.saturating_add(run.width.max(1));
                                 }
                                 lines.push(Line::from(spans));
                             }
                         }
-                        f.render_widget(pane_block, area);
                         f.render_widget(Clear, inner);
                         let para = Paragraph::new(Text::from(lines));
                         f.render_widget(para, inner);
+
+                        // Copy mode indicator (replaces the old block title "[copy mode]")
+                        if *copy_mode && *active {
+                            let label = "[copy mode]";
+                            let lw = label.len() as u16;
+                            if area.width >= lw {
+                                let lx = area.x + area.width.saturating_sub(lw);
+                                let la = Rect::new(lx, area.y, lw, 1);
+                                let ls = Span::styled(label, Style::default().fg(Color::Black).bg(Color::Yellow));
+                                f.render_widget(Paragraph::new(Line::from(ls)), la);
+                            }
+                        }
 
                         if *copy_mode && *active && *scroll_offset > 0 {
                             let indicator = format!("[{}/{}]", scroll_offset, scroll_offset);
                             let indicator_width = indicator.len() as u16;
                             if area.width > indicator_width + 2 {
                                 let indicator_x = area.x + area.width - indicator_width - 1;
-                                let indicator_area = Rect::new(indicator_x, area.y, indicator_width, 1);
+                                let indicator_y = if *copy_mode { area.y + 1 } else { area.y };
+                                let indicator_area = Rect::new(indicator_x, indicator_y, indicator_width, 1);
                                 let indicator_span = Span::styled(indicator, Style::default().fg(Color::Black).bg(Color::Yellow));
                                 f.render_widget(Paragraph::new(Line::from(indicator_span)), indicator_area);
                             }
@@ -508,22 +835,84 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         }
                     }
                     LayoutJson::Split { kind, sizes, children } => {
-                        let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                            sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
+                        let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                            sizes.clone()
                         } else {
-                            vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()]
+                            vec![(100 / children.len().max(1)) as u16; children.len()]
                         };
-                        let rects = if kind == "Horizontal" {
-                            Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area)
-                        } else {
-                            Layout::default().direction(Direction::Vertical).constraints(constraints).split(area)
-                        };
-                        for (i, child) in children.iter().enumerate() { render_json(f, child, rects[i], dim_preds); }
+                        let is_horizontal = kind == "Horizontal";
+                        let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+
+                        // Render children first
+                        for (i, child) in children.iter().enumerate() {
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds); }
+                        }
+
+                        // Draw separator lines between children using direct buffer access
+                        let buf = f.buffer_mut();
+                        for i in 0..children.len().saturating_sub(1) {
+                            if i >= rects.len() { break; }
+                            let left_active = has_active_leaf(&children[i]);
+                            let right_active = children.get(i + 1).map_or(false, |c| has_active_leaf(c));
+                            let sep_fg = if left_active || right_active { Color::Green } else { Color::DarkGray };
+                            let sep_style = Style::default().fg(sep_fg);
+
+                            if is_horizontal {
+                                let sep_x = rects[i].x + rects[i].width;
+                                if sep_x < buf.area.x + buf.area.width {
+                                    for y in area.y..area.y + area.height {
+                                        let idx = (y - buf.area.y) as usize * buf.area.width as usize
+                                            + (sep_x - buf.area.x) as usize;
+                                        if idx < buf.content.len() {
+                                            buf.content[idx].set_char('│');
+                                            buf.content[idx].set_style(sep_style);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let sep_y = rects[i].y + rects[i].height;
+                                if sep_y < buf.area.y + buf.area.height {
+                                    for x in area.x..area.x + area.width {
+                                        let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
+                                            + (x - buf.area.x) as usize;
+                                        if idx < buf.content.len() {
+                                            buf.content[idx].set_char('─');
+                                            buf.content[idx].set_style(sep_style);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             render_json(f, &root, chunks[0], dim_preds);
+
+            // ── Left-click drag text selection overlay ────────────────
+            if let (Some(s), Some(e)) = (sel_s, sel_e) {
+                // Normalise so (r0,c0) <= (r1,c1) in reading order
+                let (r0, c0, r1, c1) = if (s.1, s.0) <= (e.1, e.0) {
+                    (s.1, s.0, e.1, e.0)
+                } else {
+                    (e.1, e.0, s.1, s.0)
+                };
+                let buf = f.buffer_mut();
+                let buf_area = buf.area;
+                for row in r0..=r1 {
+                    let col_start = if row == r0 { c0 } else { 0 };
+                    let col_end = if row == r1 { c1 } else { area.width.saturating_sub(1) };
+                    for col in col_start..=col_end {
+                        if row < buf_area.height && col < buf_area.width {
+                            let idx = (row - buf_area.y) as usize * buf_area.width as usize
+                                + (col - buf_area.x) as usize;
+                            if idx < buf.content.len() {
+                                buf.content[idx].set_style(Style::default().fg(Color::Black).bg(Color::LightCyan));
+                            }
+                        }
+                    }
+                }
+            }
 
             if session_chooser {
                 let overlay = Block::default().borders(Borders::ALL).title("choose-session");
@@ -568,17 +957,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     match node {
                         LayoutJson::Leaf { id, .. } => { out.push((*id, area)); }
                         LayoutJson::Split { kind, sizes, children } => {
-                            let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                                sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
+                            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                                sizes.clone()
                             } else {
-                                vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()]
+                                vec![(100 / children.len().max(1)) as u16; children.len()]
                             };
-                            let rects = if kind == "Horizontal" {
-                                Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area)
-                            } else {
-                                Layout::default().direction(Direction::Vertical).constraints(constraints).split(area)
-                            };
-                            for (i, child) in children.iter().enumerate() { rec(child, rects[i], out); }
+                            let is_horizontal = kind == "Horizontal";
+                            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                            for (i, child) in children.iter().enumerate() {
+                                if i < rects.len() { rec(child, rects[i], out); }
+                            }
                         }
                     }
                 }
@@ -643,8 +1031,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 let para = Paragraph::new(format!("title: {}", pane_title_buf));
                 f.render_widget(para, overlay.inner(oa));
             }
+            if command_input {
+                let overlay = Block::default().borders(Borders::ALL).title("command");
+                let oa = centered_rect(60, 3, chunks[0]);
+                f.render_widget(Clear, oa);
+                f.render_widget(&overlay, oa);
+                let para = Paragraph::new(format!(": {}", command_buf));
+                f.render_widget(para, overlay.inner(oa));
+            }
         })?;
         last_dump_time = Instant::now();
+        selection_changed = false;
+        // Cache this frame so we can skip identical re-renders.
+        // Only update cache when we got a genuinely new frame (not selection-only redraw)
+        if got_frame && dump_buf != prev_dump_buf {
+            std::mem::swap(&mut prev_dump_buf, &mut dump_buf);
+        }
+        // DON'T clear last_key_send_time — keep fast-dumping for 100ms
+        // after last keystroke so we catch the ConPTY echo promptly.
+        // The timer expires naturally in the poll_ms calculation above.
         force_dump = false;
     }
 

@@ -14,10 +14,12 @@ use crate::layout::cycle_top_layout;
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
 fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+    use std::io::Write;
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
             let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
+            let _ = master.flush();
         }
         _ => {
             // Default / Utf8 X10-style encoding: \x1b[M Cb Cx Cy (all + 32)
@@ -26,6 +28,7 @@ fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, 
                 let cx = ((col as u8).min(223)) + 32;
                 let cy = ((row as u8).min(223)) + 32;
                 let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
+                let _ = master.flush();
             }
             // X10-style has no release encoding for individual buttons
         }
@@ -434,10 +437,11 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
         .find(|(path, _)| *path == win.active_path)
         .map(|(_, area)| *area);
 
-    /// Convert absolute screen coordinates to pane-local 1-based cell coordinates.
+    /// Convert absolute screen coordinates to pane-local 1-based cell coordinates,
+    /// accounting for the 1px border on each side (Block with Borders::ALL).
     fn pane_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
-        let col = abs_x.saturating_sub(area.x) + 1;
-        let row = abs_y.saturating_sub(area.y) + 1;
+        let col = abs_x.saturating_sub(area.x + 1) + 1;
+        let row = abs_y.saturating_sub(area.y + 1) + 1;
         (col, row)
     }
 
@@ -451,7 +455,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                     LayoutKind::Horizontal => {
                         if me.column >= pos.saturating_sub(tol) && me.column <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: *pos, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
                             on_border = true;
                             break;
@@ -460,7 +464,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                     LayoutKind::Vertical => {
                         if me.row >= pos.saturating_sub(tol) && me.row <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: *pos, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
                             on_border = true;
                             break;
@@ -477,15 +481,21 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 }
             }
 
-            // Forward left-click to child PTY if it has mouse mode enabled
+            // Forward left-click to child pane via Windows Console API
             if !on_border {
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                        if mode != vt100::MouseProtocolMode::None {
-                            let (col, row) = pane_cell(area, me.column, me.row);
-                            let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                            write_mouse_event(&mut active.master, 0, col, row, true, enc);
+                        let col = me.column.saturating_sub(area.x + 1) as i16;
+                        let row = me.row.saturating_sub(area.y + 1) as i16;
+                        if active.child_pid.is_none() {
+                            active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
+                        }
+                        if let Some(pid) = active.child_pid {
+                            crate::platform::mouse_inject::send_mouse_event(
+                                pid, col, row,
+                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
+                                true,
+                            );
                         }
                     }
                 }
@@ -493,95 +503,57 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode != vt100::MouseProtocolMode::None {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 2, col, row, true, enc);
-                    }
-                }
-            }
+            // Right-click not forwarded - reserved for psmux context menu
         }
         MouseEventKind::Down(MouseButton::Middle) => {
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode != vt100::MouseProtocolMode::None {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 1, col, row, true, enc);
-                    }
-                }
-            }
+            // Middle-click not forwarded - reserved for paste
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            let was_dragging = app.drag.is_some();
             app.drag = None;
-            if let Some(area) = active_area {
+            if was_dragging {
+                resize_all_panes(app);
+            } else if let Some(area) = active_area {
+                // Forward mouse release via Windows Console API
                 if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 0, col, row, false, enc);
+                    let col = me.column.saturating_sub(area.x + 1) as i16;
+                    let row = me.row.saturating_sub(area.y + 1) as i16;
+                    if let Some(pid) = active.child_pid {
+                        crate::platform::mouse_inject::send_mouse_event(pid, col, row, 0, 0, true);
                     }
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Right) => {
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 2, col, row, false, enc);
-                    }
-                }
-            }
+            // Not forwarded
         }
         MouseEventKind::Up(MouseButton::Middle) => {
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 1, col, row, false, enc);
-                    }
-                }
-            }
+            // Not forwarded
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
             } else {
-                // Forward drag to child if it has ButtonMotion or AnyMotion mode
+                // Forward drag via Windows Console API
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                        if mode == vt100::MouseProtocolMode::ButtonMotion || mode == vt100::MouseProtocolMode::AnyMotion {
-                            let (col, row) = pane_cell(area, me.column, me.row);
-                            let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                            write_mouse_event(&mut active.master, 32, col, row, true, enc);
+                        let col = me.column.saturating_sub(area.x + 1) as i16;
+                        let row = me.row.saturating_sub(area.y + 1) as i16;
+                        if let Some(pid) = active.child_pid {
+                            crate::platform::mouse_inject::send_mouse_event(
+                                pid, col, row,
+                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
+                                crate::platform::mouse_inject::MOUSE_MOVED,
+                                true,
+                            );
                         }
                     }
                 }
             }
         }
         MouseEventKind::Moved => {
-            // Forward motion to child if it has AnyMotion mode
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                    if mode == vt100::MouseProtocolMode::AnyMotion {
-                        let (col, row) = pane_cell(area, me.column, me.row);
-                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                        write_mouse_event(&mut active.master, 35, col, row, true, enc);
-                    }
-                }
-            }
+            // Don't forward bare motion - only forward drag events
+            // Most TUI apps don't want constant mouse position updates
         }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, Mode::CopyMode) {
@@ -618,7 +590,10 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        let _ = p.master.write_all(text.as_bytes());
+        let _ = p.master.flush(); // push to ConPTY immediately
+    }
     Ok(())
 }
 
@@ -664,7 +639,28 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
             "home" => { let _ = write!(p.master, "\x1b[H"); }
             "end" => { let _ = write!(p.master, "\x1b[F"); }
+            "insert" => { let _ = write!(p.master, "\x1b[2~"); }
             "space" => { let _ = write!(p.master, " "); }
+            s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
+                if let Ok(n) = s[1..].parse::<u8>() {
+                    let seq = match n {
+                        1 => "\x1bOP",
+                        2 => "\x1bOQ",
+                        3 => "\x1bOR",
+                        4 => "\x1bOS",
+                        5 => "\x1b[15~",
+                        6 => "\x1b[17~",
+                        7 => "\x1b[18~",
+                        8 => "\x1b[19~",
+                        9 => "\x1b[20~",
+                        10 => "\x1b[21~",
+                        11 => "\x1b[23~",
+                        12 => "\x1b[24~",
+                        _ => "",
+                    };
+                    if !seq.is_empty() { let _ = write!(p.master, "{}", seq); }
+                }
+            }
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);

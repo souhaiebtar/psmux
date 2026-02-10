@@ -10,13 +10,31 @@ use crate::types::*;
 use crate::tree::*;
 use crate::pane::{create_window, detect_shell};
 use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
+use crate::platform::mouse_inject;
+
+/// Convert screen coordinates to 0-based pane-local coordinates.
+/// No border offset — panes are borderless (tmux-style).
+fn pane_inner_cell_0based(area: Rect, abs_x: u16, abs_y: u16) -> (i16, i16) {
+    let col = abs_x as i16 - area.x as i16;
+    let row = abs_y as i16 - area.y as i16;
+    (col, row)
+}
+
+/// Convert screen coordinates to 1-based pane-local coordinates.
+fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
+    let col = abs_x.saturating_sub(area.x) + 1;
+    let row = abs_y.saturating_sub(area.y) + 1;
+    (col, row)
+}
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
 fn write_mouse_event_remote(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+    use std::io::Write;
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
             let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
+            let _ = master.flush();
         }
         _ => {
             if press {
@@ -24,8 +42,23 @@ fn write_mouse_event_remote(master: &mut Box<dyn portable_pty::MasterPty>, butto
                 let cx = ((col as u8).min(223)) + 32;
                 let cy = ((row as u8).min(223)) + 32;
                 let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
+                let _ = master.flush();
             }
         }
+    }
+}
+
+/// Lazily extract the child PID and inject a mouse event via Windows Console API.
+/// Does the full FreeConsole → AttachConsole → WriteConsoleInput → FreeConsole cycle.
+fn inject_mouse(pane: &mut Pane, col: i16, row: i16, button_state: u32, event_flags: u32) -> bool {
+    // Lazily extract PID on first use
+    if pane.child_pid.is_none() {
+        pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+    }
+    if let Some(pid) = pane.child_pid {
+        mouse_inject::send_mouse_event(pid, col, row, button_state, event_flags, false)
+    } else {
+        false
     }
 }
 
@@ -51,7 +84,29 @@ pub fn toggle_zoom(app: &mut AppState) {
     }
 }
 
+/// Compute tab positions on the server side to match the client's status bar layout.
+/// The client renders: "[session_name] idx: window_name idx: window_name ..."
+pub fn update_tab_positions(app: &mut AppState) {
+    let mut tab_pos: Vec<(usize, u16, u16)> = Vec::new();
+    let mut cursor_x: u16 = 0;
+    // Session label: "[session_name] "
+    let session_label_len = app.session_name.len() as u16 + 3; // '[' + name + ']' + ' '
+    cursor_x += session_label_len;
+    // Window tabs: "idx: window_name " for each window
+    for (i, w) in app.windows.iter().enumerate() {
+        let display_idx = i + app.window_base_index;
+        let label = format!("{}: {} ", display_idx, w.name);
+        let start_x = cursor_x;
+        cursor_x += label.len() as u16;
+        tab_pos.push((i, start_x, cursor_x));
+    }
+    app.tab_positions = tab_pos;
+}
+
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
+    // Recompute tab positions to match client rendering
+    update_tab_positions(app);
+
     // Check tab click on status bar
     let status_row = app.last_window_area.y + app.last_window_area.height;
     if y == status_row {
@@ -92,25 +147,20 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     for (path, kind, idx, pos, total_px) in borders.iter() {
         match kind {
             LayoutKind::Horizontal => {
-                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
+                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: *pos, start_y: y, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
             }
             LayoutKind::Vertical => {
-                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
+                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: *pos, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
             }
         }
     }
 
-    // Forward left-click to child PTY if it has mouse mode enabled
+    // Forward left-click to child pane via Windows Console API
     if !on_border {
         if let Some(area) = active_area {
-            let col = x.saturating_sub(area.x) + 1;
-            let row = y.saturating_sub(area.y) + 1;
+            let (col, row) = pane_inner_cell_0based(area, x, y);
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                if mode != vt100::MouseProtocolMode::None {
-                    let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                    write_mouse_event_remote(&mut active.master, 0, col, row, true, enc);
-                }
+                inject_mouse(active, col, row, mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0);
             }
         }
     }
@@ -136,16 +186,11 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     if let Some(d) = &app.drag {
         adjust_split_sizes(&mut win.root, d, x, y);
     } else {
-        // Forward drag to child if it has ButtonMotion or AnyMotion mode
+        // Forward drag to child pane via Windows Console API
         if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-            let col = x.saturating_sub(area.x) + 1;
-            let row = y.saturating_sub(area.y) + 1;
+            let (col, row) = pane_inner_cell_0based(area, x, y);
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-                if mode == vt100::MouseProtocolMode::ButtonMotion || mode == vt100::MouseProtocolMode::AnyMotion {
-                    let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                    write_mouse_event_remote(&mut active.master, 32, col, row, true, enc);
-                }
+                inject_mouse(active, col, row, mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, mouse_inject::MOUSE_MOVED);
             }
         }
     }
@@ -169,91 +214,62 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
+    // If we were dragging a border, resize all panes to match new layout
+    let was_dragging = app.drag.is_some();
     app.drag = None;
+    if was_dragging {
+        resize_all_panes(app);
+        return;
+    }
 
-    // Forward mouse release to child PTY if it has PressRelease or better
+    // Forward mouse release to child pane via Windows Console API
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let col = x.saturating_sub(area.x) + 1;
-        let row = y.saturating_sub(area.y) + 1;
+        let (col, row) = pane_inner_cell_0based(area, x, y);
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-            if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
-                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                write_mouse_event_remote(&mut active.master, 0, col, row, false, enc);
-            }
+            inject_mouse(active, col, row, 0, 0); // button_state=0 = all buttons released
         }
     }
 }
 
-/// Forward a non-left mouse button press/release to the child PTY (only if child has mouse mode).
+/// Forward a non-left mouse button press/release to the child via Windows Console API.
 pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press: bool) {
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let col = x.saturating_sub(area.x) + 1;
-        let row = y.saturating_sub(area.y) + 1;
-        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-            if (press && mode != vt100::MouseProtocolMode::None)
-                || (!press && mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press)
-            {
-                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                write_mouse_event_remote(&mut active.master, button, col, row, press, enc);
+        let (col, row) = pane_inner_cell_0based(area, x, y);
+        let button_state = if press {
+            match button {
+                1 => mouse_inject::FROM_LEFT_2ND_BUTTON_PRESSED, // middle
+                2 => mouse_inject::RIGHTMOST_BUTTON_PRESSED,     // right
+                _ => 0,
             }
+        } else {
+            0 // release = no buttons pressed
+        };
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            inject_mouse(active, col, row, button_state, 0);
         }
     }
 }
 
-/// Forward mouse motion to the child PTY (only if child has AnyMotion mode).
-pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
-    let win = &mut app.windows[app.active_idx];
-    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-    compute_rects(&win.root, app.last_window_area, &mut rects);
-    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let col = x.saturating_sub(area.x) + 1;
-        let row = y.saturating_sub(area.y) + 1;
-        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
-            if mode == vt100::MouseProtocolMode::AnyMotion {
-                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
-                write_mouse_event_remote(&mut active.master, 35, col, row, true, enc);
-            }
-        }
-    }
+/// Forward mouse motion to the child PTY - currently disabled to avoid garbage.
+/// Most TUI apps don't want constant mouse position updates without button held.
+pub fn remote_mouse_motion(_app: &mut AppState, _x: u16, _y: u16) {
+    // Don't forward bare motion - only forward drag events
 }
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
-    // Convert global terminal coordinates to 1-based pane-local coordinates.
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let inner_w = area.width.saturating_sub(2).max(1);
-    let inner_h = area.height.saturating_sub(2).max(1);
-
-    let col = x
-        .saturating_sub(inner_x)
-        .min(inner_w.saturating_sub(1))
-        .saturating_add(1);
-    let row = y
-        .saturating_sub(inner_y)
-        .min(inner_h.saturating_sub(1))
-        .saturating_add(1);
+    // Convert global terminal coordinates to 1-based pane-local coordinates (no border offset).
+    let col = x.saturating_sub(area.x).min(area.width.saturating_sub(1)).saturating_add(1);
+    let row = y.saturating_sub(area.y).min(area.height.saturating_sub(1)).saturating_add(1);
     (col, row)
 }
 
 fn copy_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
-    // Convert global terminal coordinates to 0-based pane-local coordinates.
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let inner_w = area.width.saturating_sub(2).max(1);
-    let inner_h = area.height.saturating_sub(2).max(1);
-
-    let col = x
-        .saturating_sub(inner_x)
-        .min(inner_w.saturating_sub(1));
-    let row = y
-        .saturating_sub(inner_y)
-        .min(inner_h.saturating_sub(1));
+    // Convert global terminal coordinates to 0-based pane-local coordinates (no border offset).
+    let col = x.saturating_sub(area.x).min(area.width.saturating_sub(1));
+    let row = y.saturating_sub(area.y).min(area.height.saturating_sub(1));
     (row, col)
 }
 
@@ -282,10 +298,13 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
             .map(|(_, area)| *area);
     }
 
-    let (col, row) = target_area.map_or((1, 1), |area| wheel_cell_for_area(area, x, y));
-    let code = if up { 64 } else { 65 };
+    let (col, row) = target_area.map_or((0, 0), |area| pane_inner_cell_0based(area, x, y));
+    // Windows Console API: MOUSE_WHEELED event, button_state high word = wheel delta
+    // WHEEL_DELTA = 120; positive = scroll up, negative = scroll down
+    let wheel_delta: i16 = if up { 120 } else { -120 };
+    let button_state = ((wheel_delta as i32) << 16) as u32;
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-        let _ = write!(p.master, "\x1b[<{};{};{}M", code, col, row);
+        inject_mouse(p, col, row, button_state, mouse_inject::MOUSE_WHEELED);
     }
 }
 
@@ -405,11 +424,14 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
+    
     thread::spawn(move || {
-        let mut local = [0u8; 8192];
+        let mut local = [0u8; 65536];
         loop {
             match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
@@ -419,6 +441,8 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     pane.master = pair.master;
     pane.child = child;
     pane.term = term;
+    pane.data_version = data_version;
+    pane.child_pid = None;
     
     Ok(())
 }

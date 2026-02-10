@@ -16,6 +16,15 @@ pub struct Pane {
     pub last_cols: u16,
     pub id: usize,
     pub title: String,
+    /// Cached child process PID for Windows console mouse injection.
+    /// Lazily extracted on first mouse event.
+    pub child_pid: Option<u32>,
+    /// Monotonic counter incremented by the PTY reader thread each time new
+    /// output is processed.  Checked by the server to know when the screen
+    /// has actually changed (avoids serialising stale frames).
+    pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Timestamp of the last infer_title_from_prompt call (throttled to ~2/s).
+    pub last_title_check: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq)]

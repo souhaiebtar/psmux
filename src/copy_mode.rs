@@ -6,7 +6,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
 #[cfg(windows)]
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
@@ -19,7 +19,7 @@ pub fn enter_copy_mode(app: &mut AppState) {
 }
 
 #[cfg(windows)]
-fn copy_to_system_clipboard(text: &str) {
+pub fn copy_to_system_clipboard(text: &str) {
     const CF_UNICODETEXT: u32 = 13;
 
     // Clipboard can be momentarily locked by other processes; retry briefly.
@@ -61,7 +61,48 @@ fn copy_to_system_clipboard(text: &str) {
 }
 
 #[cfg(not(windows))]
-fn copy_to_system_clipboard(_text: &str) {}
+pub fn copy_to_system_clipboard(_text: &str) {}
+
+/// Read text from the Windows system clipboard.
+#[cfg(windows)]
+pub fn read_from_system_clipboard() -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    for _ in 0..5 {
+        let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
+        if opened == 0 {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let result = unsafe {
+            let hmem = GetClipboardData(CF_UNICODETEXT);
+            if hmem.is_null() {
+                let _ = CloseClipboard();
+                return None;
+            }
+            let ptr = GlobalLock(hmem) as *const u16;
+            if ptr.is_null() {
+                let _ = CloseClipboard();
+                return None;
+            }
+            // Find null terminator
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+                if len > 1_000_000 { break; } // safety limit
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            let text = String::from_utf16_lossy(slice);
+            GlobalUnlock(hmem);
+            let _ = CloseClipboard();
+            Some(text)
+        };
+        return result;
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn read_from_system_clipboard() -> Option<String> { None }
 
 pub fn current_prompt_pos(app: &mut AppState) -> Option<(u16,u16)> {
     let win = &mut app.windows[app.active_idx];

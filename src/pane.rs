@@ -22,18 +22,22 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
     let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     thread::spawn(move || {
-        let mut local = [0u8; 8192];
+        let mut local = [0u8; 65536];
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
                     let mut parser = term_reader.lock().unwrap();
                     parser.process(&local[..n]);
+                    drop(parser);
+                    dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
@@ -41,7 +45,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         }
     });
 
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
+    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now() };
     app.next_pane_id += 1;
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: format!("win {}", app.windows.len()+1), id: app.next_win_id });
     app.next_win_id += 1;
@@ -68,18 +72,22 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
     let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     thread::spawn(move || {
-        let mut local = [0u8; 8192];
+        let mut local = [0u8; 65536];
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
                     let mut parser = term_reader.lock().unwrap();
                     parser.process(&local[..n]);
+                    drop(parser);
+                    dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
@@ -87,7 +95,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         }
     });
 
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
+    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now() };
     app.next_pane_id += 1;
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: format!("win {}", app.windows.len()+1), id: app.next_win_id });
     app.next_win_id += 1;
@@ -104,17 +112,19 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
     thread::spawn(move || {
-        let mut local = [0u8; 8192];
+        let mut local = [0u8; 65536];
         loop {
             match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
         }
     });
-    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now() });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);

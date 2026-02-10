@@ -9,9 +9,9 @@ pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> 
     let mut last: Option<String> = None;
     for r in (0..rows).rev() {
         let mut s = String::new();
-        for c in 0..cols { if let Some(cell) = screen.cell(r, c) { s.push_str(&cell.contents().to_string()); } else { s.push(' '); } }
-        let t = s.trim_end().to_string();
-        if !t.trim().is_empty() { last = Some(t); break; }
+        for c in 0..cols { if let Some(cell) = screen.cell(r, c) { s.push_str(cell.contents()); } else { s.push(' '); } }
+        let t = s.trim_end();
+        if !t.is_empty() { last = Some(t.to_string()); break; }
     }
     let Some(line) = last else { return None };
     let trimmed = line.trim().to_string();
@@ -108,10 +108,19 @@ pub fn base64_decode(encoded: &str) -> Option<String> {
     String::from_utf8(result).ok()
 }
 
-pub fn color_to_name(c: vt100::Color) -> String {
+/// Return color name as a string. Uses static strings for Default and
+/// the 256 indexed colors to avoid heap allocations on every cell.
+pub fn color_to_name(c: vt100::Color) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match c {
-        vt100::Color::Default => "default".to_string(),
-        vt100::Color::Idx(i) => format!("idx:{}", i),
-        vt100::Color::Rgb(r,g,b) => format!("rgb:{},{},{}", r,g,b),
+        vt100::Color::Default => Cow::Borrowed("default"),
+        vt100::Color::Idx(i) => {
+            // Static lookup table for all 256 indexed colors
+            static IDX_STRINGS: std::sync::LazyLock<[String; 256]> = std::sync::LazyLock::new(|| {
+                std::array::from_fn(|i| format!("idx:{}", i))
+            });
+            Cow::Borrowed(&IDX_STRINGS[i as usize])
+        }
+        vt100::Color::Rgb(r,g,b) => Cow::Owned(format!("rgb:{},{},{}", r,g,b)),
     }
 }

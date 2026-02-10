@@ -157,6 +157,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 
                 // Check for PERSISTENT flag and optional TARGET line
                 let mut persistent = false;
+                let mut resp_tx_opt: Option<mpsc::Sender<mpsc::Receiver<String>>> = None;
                 let mut global_target_win: Option<usize> = None;
                 let mut global_target_pane: Option<usize> = None;
                 let mut global_pane_is_id = false;
@@ -173,6 +174,22 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = write_stream.set_nodelay(true);
                     // Use longer read timeout for persistent mode - client controls pacing
                     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
+                    
+                    // Spawn a dedicated writer thread so the read loop never blocks
+                    // waiting for dump-state responses.  The read loop sends oneshot
+                    // receivers here; the writer thread waits for each response and
+                    // writes it to TCP in order.
+                    let mut ws_bg = write_stream.try_clone().unwrap();
+                    let (resp_tx, resp_rx) = mpsc::channel::<mpsc::Receiver<String>>();
+                    std::thread::spawn(move || {
+                        while let Ok(rrx) = resp_rx.recv() {
+                            if let Ok(text) = rrx.recv() {
+                                let _ = write!(ws_bg, "{}\n", text);
+                                let _ = ws_bg.flush();
+                            }
+                        }
+                    });
+                    resp_tx_opt = Some(resp_tx);
                     line.clear();
                     if r.read_line(&mut line).is_err() {
                         return;
@@ -300,11 +317,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "dump-state" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::DumpState(rtx));
-                        if let Ok(text) = rrx.recv() { 
-                            let _ = write!(write_stream, "{}\n", text); 
-                            let _ = write_stream.flush();
+                        if let Some(ref rtx_bg) = resp_tx_opt {
+                            // Persistent mode: hand off to writer thread (non-blocking).
+                            // This lets the read loop keep processing keys immediately.
+                            let _ = rtx_bg.send(rrx);
+                        } else {
+                            // One-shot mode: block and respond inline
+                            if let Ok(text) = rrx.recv() { 
+                                let _ = write!(write_stream, "{}\n", text); 
+                                let _ = write_stream.flush();
+                            }
+                            if !persistent { break; }
                         }
-                        if !persistent { break; }
                     }
                     "send-text" => {
                         if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendText(payload.to_string())); }
@@ -706,24 +730,113 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     });
     let mut state_dirty = true;
     let mut cached_dump_state = String::new();
-    let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
+    let mut cached_data_version: u64 = 0;
+    // Cached metadata JSON — windows/tree/prefix change only on structural
+    // mutations, so we rebuild them lazily via `meta_dirty`.
+    let mut meta_dirty = true;
+    let mut cached_windows_json = String::new();
+    let mut cached_tree_json = String::new();
+    let mut cached_prefix_str = String::new();
+    let mut cached_base_index: usize = 0;
+    let mut cached_pred_dim: bool = false;
+    // Reusable buffer for building the combined JSON envelope.
+    let mut combined_buf = String::with_capacity(32768);
+    // Deferred dump-state: when we send PTY input in the same batch as a
+    // DumpState request, the ConPTY hasn't had time to echo yet.  Instead of
+    // serialising a stale frame, we defer the response and wait for the reader
+    // thread to indicate new data is available (data_version bump) or a short
+    // timeout (3ms), whichever comes first.
+    let mut deferred_dump: Option<mpsc::Sender<String>> = None;
+    let mut deferred_data_version: u64 = 0;
+    let mut deferred_at: Option<std::time::Instant> = None;
+
+    /// Sum data_version counters across all panes in the active window.
+    fn combined_data_version(app: &AppState) -> u64 {
+        let mut v = 0u64;
+        fn walk(node: &Node, v: &mut u64) {
+            match node {
+                Node::Leaf(p) => { *v = v.wrapping_add(p.data_version.load(std::sync::atomic::Ordering::Acquire)); }
+                Node::Split { children, .. } => { for c in children { walk(c, v); } }
+            }
+        }
+        if let Some(win) = app.windows.get(app.active_idx) {
+            walk(&win.root, &mut v);
+        }
+        v
+    }
+
     loop {
         let mut sent_pty_input = false;
-        while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
-            match req {
-                CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
-                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
+        let mut did_work = false;
+
+        // ── Check if deferred dump-state can be served ──────────────────
+        if let Some(ref resp) = deferred_dump {
+            let now_ver = combined_data_version(&app);
+            let timed_out = deferred_at.map_or(false, |t| t.elapsed().as_millis() >= 3);
+            if now_ver != deferred_data_version || timed_out {
+                // Screen has been updated by the reader thread (or timeout).
+                // Force a fresh serialisation.
+                state_dirty = true;
+                // Rebuild metadata cache if structural changes happened.
+                if meta_dirty {
+                    cached_windows_json = list_windows_json(&app)?;
+                    cached_tree_json = list_tree_json(&app)?;
+                    cached_prefix_str = format_key_binding(&app.prefix_key);
+                    cached_base_index = app.window_base_index;
+                    cached_pred_dim = app.prediction_dimming;
+                    meta_dirty = false;
+                }
+                let layout_json = dump_layout_json_fast(&mut app)?;
+                combined_buf.clear();
+                let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
+                    "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{}}}",
+                    layout_json, cached_windows_json, cached_prefix_str, cached_tree_json, cached_base_index, cached_pred_dim
+                ));
+                cached_dump_state.clear();
+                cached_dump_state.push_str(&combined_buf);
+                cached_data_version = combined_data_version(&app);
+                state_dirty = false;
+                let _ = resp.send(combined_buf.clone());
+                deferred_dump = None;
+                deferred_at = None;
+            }
+        }
+
+        // Block on first message with timeout — wakes instantly when a message arrives.
+        // Use 2ms when a deferred dump is pending (fast wakeup to check data_version),
+        // otherwise 5ms for normal housekeeping.
+        let timeout_ms = if deferred_dump.is_some() { 2 } else { 5 };
+        if let Some(rx) = app.control_rx.as_ref() {
+            if let Ok(req) = rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                did_work = true;
+                let mut pending = vec![req];
+                // Drain any additional queued messages without blocking
+                while let Ok(r) = rx.try_recv() {
+                    pending.push(r);
+                }
+                // Process key/command inputs BEFORE dump-state requests.
+                // This ensures ConPTY receives keystrokes before we serialize
+                // the screen, reducing stale-frame responses.
+                pending.sort_by_key(|r| match r {
+                    CtrlReq::DumpState(_) => 1,
+                    CtrlReq::DumpLayout(_) => 1,
+                    _ => 0,
+                });
+                for req in pending {
+                    let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
+                    match req {
+                CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); meta_dirty = true; }
+                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); meta_dirty = true; }
+                CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
                 CtrlReq::CapturePaneRange(resp, s, e) => {
                     if let Some(text) = capture_active_pane_range(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
-                CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); }
-                CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); }
+                CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } meta_dirty = true; }
+                CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
+                CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); meta_dirty = true; }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { "(attached)" } else { "(detached)" };
                     let windows = app.windows.len();
@@ -746,35 +859,43 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::DumpState(resp) => {
                     if !state_dirty
                         && !cached_dump_state.is_empty()
-                        && last_dump_build.elapsed() < Duration::from_millis(120)
+                        && cached_data_version == combined_data_version(&app)
                     {
                         let _ = resp.send(cached_dump_state.clone());
                         continue;
                     }
-                    // Brief yield to let ConPTY + PSReadLine finish rendering after input
-                    // Without this, dump-state can capture an intermediate render state
-                    // (e.g., PSReadLine mid-redraw showing prediction artifacts)
+                    // If we just sent PTY input in this batch, the ConPTY hasn't
+                    // had time to echo yet.  Defer the dump-state response until
+                    // the reader thread processes new output (data_version bump)
+                    // or a short timeout expires.  This avoids sending a stale
+                    // frame that the client renders and immediately replaces.
                     if sent_pty_input {
-                        std::thread::sleep(Duration::from_micros(500));
+                        deferred_data_version = combined_data_version(&app);
+                        deferred_dump = Some(resp);
+                        deferred_at = Some(std::time::Instant::now());
+                        continue;
                     }
-                    let layout_json = dump_layout_json(&mut app)?;
-                    let windows_json = list_windows_json(&app)?;
-                    let tree_json = list_tree_json(&app)?;
-                    let prefix_str = format_key_binding(&app.prefix_key);
-                    let combined = format!(
+                    // Rebuild metadata cache if structural changes happened.
+                    if meta_dirty {
+                        cached_windows_json = list_windows_json(&app)?;
+                        cached_tree_json = list_tree_json(&app)?;
+                        cached_prefix_str = format_key_binding(&app.prefix_key);
+                        cached_base_index = app.window_base_index;
+                        cached_pred_dim = app.prediction_dimming;
+                        meta_dirty = false;
+                    }
+                    let layout_json = dump_layout_json_fast(&mut app)?;
+                    combined_buf.clear();
+                    let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
                         "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{}}}",
-                        layout_json,
-                        windows_json,
-                        prefix_str,
-                        tree_json,
-                        app.window_base_index,
-                        app.prediction_dimming
-                    );
-                    cached_dump_state = combined.clone();
-                    last_dump_build = std::time::Instant::now();
+                        layout_json, cached_windows_json, cached_prefix_str, cached_tree_json, cached_base_index, cached_pred_dim
+                    ));
+                    cached_dump_state.clear();
+                    cached_dump_state.push_str(&combined_buf);
+                    cached_data_version = combined_data_version(&app);
                     state_dirty = false;
                     sent_pty_input = false;
-                    let _ = resp.send(combined);
+                    let _ = resp.send(combined_buf.clone());
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; sent_pty_input = true; }
                 CtrlReq::SendKey(k) => { send_key_to_active(&mut app, &k)?; sent_pty_input = true; }
@@ -788,21 +909,21 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
-                CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
-                CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
-                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); }
-                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); }
-                CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
-                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
-                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); }
-                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); }
+                CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
+                CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } meta_dirty = true; }
+                CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; }
+                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; }
+                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; }
+                CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); state_dirty = true; }
+                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); state_dirty = true; }
+                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); state_dirty = true; }
+                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); state_dirty = true; }
                 CtrlReq::MouseMove(x,y) => { remote_mouse_motion(&mut app, x, y); }
-                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
-                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
-                CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }
-                CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } }
-                CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; }
+                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); state_dirty = true; }
+                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); state_dirty = true; }
+                CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } meta_dirty = true; }
+                CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } meta_dirty = true; }
+                CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; meta_dirty = true; }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ListTree(resp) => { let json = list_tree_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ToggleSync => { app.sync_input = !app.sync_input; }
@@ -909,9 +1030,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::ListPanes(resp) => {
                     let mut output = String::new();
                     let win = &app.windows[app.active_idx];
-                    fn collect_panes(node: &Node, panes: &mut Vec<(usize, u16, u16)>) {
+                    fn collect_panes(node: &Node, panes: &mut Vec<(usize, u16, u16, vt100::MouseProtocolMode, vt100::MouseProtocolEncoding, bool)>) {
                         match node {
-                            Node::Leaf(p) => panes.push((p.id, p.last_cols, p.last_rows)),
+                            Node::Leaf(p) => {
+                                let (mode, enc, alt) = {
+                                    let term = p.term.lock().unwrap();
+                                    let screen = term.screen();
+                                    (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), screen.alternate_screen())
+                                };
+                                panes.push((p.id, p.last_cols, p.last_rows, mode, enc, alt));
+                            }
                             Node::Split { children, .. } => {
                                 for c in children { collect_panes(c, panes); }
                             }
@@ -919,8 +1047,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     let mut panes = Vec::new();
                     collect_panes(&win.root, &mut panes);
-                    for (_i, (id, cols, rows)) in panes.iter().enumerate() {
-                        output.push_str(&format!("%{}: [{}x{}]\n", id, cols, rows));
+                    for (_i, (id, cols, rows, mode, enc, alt)) in panes.iter().enumerate() {
+                        output.push_str(&format!("%{}: [{}x{}] mouse={:?}/{:?} alt={}\n", id, cols, rows, mode, enc, alt));
                     }
                     let _ = resp.send(output);
                 }
@@ -1400,6 +1528,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 state_dirty = true;
             }
         }
+            }
+        }
         // Check if all windows/panes have exited
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
         if any_pruned {
@@ -1413,7 +1543,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             let _ = std::fs::remove_file(&regpath);
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        // recv_timeout already handles the wait; no additional sleep needed.
     }
     Ok(())
 }

@@ -224,6 +224,17 @@ pub fn map_color(name: &str) -> Color {
             }
         }
     }
+    if let Some(hex_str) = name.strip_prefix('#') {
+        if hex_str.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex_str[0..2], 16),
+                u8::from_str_radix(&hex_str[2..4], 16),
+                u8::from_str_radix(&hex_str[4..6], 16),
+            ) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
     match name.to_lowercase().as_str() {
         "black" => Color::Black,
         "red" => Color::Red,
