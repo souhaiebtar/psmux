@@ -13,6 +13,16 @@ use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, 
 use crate::types::*;
 use crate::tree::*;
 
+const PASTE_BUFFER_LIMIT: usize = 10;
+
+fn push_paste_buffer(app: &mut AppState, text: String) {
+    app.paste_buffers.push(text);
+    if app.paste_buffers.len() > PASTE_BUFFER_LIMIT {
+        // Keep newest entries and drop the oldest to avoid unbounded growth.
+        app.paste_buffers.remove(0);
+    }
+}
+
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 
     app.copy_scroll_offset = 0;
@@ -119,20 +129,25 @@ pub fn scroll_to_bottom(app: &mut AppState) {
 
 pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
     let (anchor, pos) = match (app.copy_anchor, app.copy_pos) { (Some(a), Some(p)) => (a,p), _ => return Ok(()) };
-    let win = &mut app.windows[app.active_idx];
-    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
-    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
-    let screen = parser.screen();
-    let r0 = anchor.0.min(pos.0); let r1 = anchor.0.max(pos.0);
-    let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
-    let mut text = String::new();
-    for r in r0..=r1 {
-        for c in c0..=c1 {
-            if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+    let text = {
+        let win = &mut app.windows[app.active_idx];
+        let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
+        let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
+        let screen = parser.screen();
+        let r0 = anchor.0.min(pos.0);
+        let r1 = anchor.0.max(pos.0);
+        let c0 = anchor.1.min(pos.1);
+        let c1 = anchor.1.max(pos.1);
+        let mut text = String::new();
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+            }
+            if r < r1 { text.push('\n'); }
         }
-        if r < r1 { text.push('\n'); }
-    }
-    app.paste_buffers.push(text.clone());
+        text
+    };
+    push_paste_buffer(app, text.clone());
     copy_to_system_clipboard(&text);
     Ok(())
 }
@@ -146,13 +161,16 @@ pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
 }
 
 pub fn capture_active_pane(app: &mut AppState) -> io::Result<()> {
-    let win = &mut app.windows[app.active_idx];
-    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
-    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
-    let screen = parser.screen();
-    let mut text = String::new();
-    for r in 0..p.last_rows { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
-    app.paste_buffers.push(text);
+    let text = {
+        let win = &mut app.windows[app.active_idx];
+        let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
+        let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
+        let screen = parser.screen();
+        let mut text = String::new();
+        for r in 0..p.last_rows { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
+        text
+    };
+    push_paste_buffer(app, text);
     Ok(())
 }
 
