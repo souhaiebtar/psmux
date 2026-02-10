@@ -570,9 +570,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             Block::default().borders(Borders::ALL)
                         };
                         let inner = pane_block.inner(area);
-                        let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
+                        f.render_widget(pane_block, area);
+                        f.render_widget(Clear, inner);
                         if use_full_cells || rows_v2.is_empty() {
+                            let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
                             for r in 0..inner.height.min(content.len() as u16) {
                                 let mut spans: Vec<Span> = Vec::with_capacity(inner.width as usize);
                                 let row = &content[r as usize];
@@ -616,54 +618,55 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 }
                                 lines.push(Line::from(spans));
                             }
+                            let para = Paragraph::new(Text::from(lines));
+                            f.render_widget(para, inner);
                         } else {
+                            let buf = f.buffer_mut();
                             for r in 0..inner.height.min(rows_v2.len() as u16) {
                                 let row_runs = &rows_v2[r as usize].runs;
-                                let mut spans: Vec<Span> = Vec::with_capacity(row_runs.len());
+                                let y = inner.y + r;
+                                let mut x = inner.x;
                                 let mut c: u16 = 0;
-                                let mut merged_style: Option<Style> = None;
-                                let mut merged_text = String::with_capacity(inner.width as usize);
                                 for run in row_runs {
-                                    if c >= inner.width { break; }
+                                    if c >= inner.width {
+                                        break;
+                                    }
                                     let mut fg = map_color_code(run.fg);
                                     let mut bg = map_color_code(run.bg);
-                                    if run.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
-                                    if *active && dim_preds && !*alternate_screen
+                                    if run.flags & 16 != 0 {
+                                        std::mem::swap(&mut fg, &mut bg);
+                                    }
+                                    if *active
+                                        && dim_preds
+                                        && !*alternate_screen
                                         && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
                                     {
                                         fg = dim_color(fg);
                                     }
                                     let mut style = Style::default().fg(fg).bg(bg);
-                                    if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
-                                    if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
-                                    if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                                    if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text = if run.text.is_empty() { " " } else { run.text.as_str() };
-                                    match merged_style {
-                                        Some(prev) if prev == style => {
-                                            merged_text.push_str(text);
-                                        }
-                                        Some(prev) => {
-                                            spans.push(Span::styled(std::mem::take(&mut merged_text), prev));
-                                            merged_text.push_str(text);
-                                            merged_style = Some(style);
-                                        }
-                                        None => {
-                                            merged_text.push_str(text);
-                                            merged_style = Some(style);
-                                        }
+                                    if run.flags & 1 != 0 {
+                                        style = style.add_modifier(Modifier::DIM);
                                     }
+                                    if run.flags & 2 != 0 {
+                                        style = style.add_modifier(Modifier::BOLD);
+                                    }
+                                    if run.flags & 4 != 0 {
+                                        style = style.add_modifier(Modifier::ITALIC);
+                                    }
+                                    if run.flags & 8 != 0 {
+                                        style = style.add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    let text = if run.text.is_empty() { " " } else { run.text.as_str() };
+                                    let rem = inner.width.saturating_sub(c) as usize;
+                                    let (nx, _) = buf.set_stringn(x, y, text, rem, style);
+                                    if nx <= x {
+                                        break;
+                                    }
+                                    x = nx;
                                     c = c.saturating_add(run.width.max(1));
                                 }
-                                if let Some(style) = merged_style {
-                                    spans.push(Span::styled(merged_text, style));
-                                }
-                                lines.push(Line::from(spans));
                             }
                         }
-                        f.render_widget(pane_block, area);
-                        let para = Paragraph::new(Text::from(lines));
-                        f.render_widget(para, inner);
 
                         if *copy_mode && *active && *scroll_offset > 0 {
                             let indicator = format!("[{}/{}]", scroll_offset, scroll_offset);
