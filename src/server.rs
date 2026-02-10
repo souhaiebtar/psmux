@@ -103,6 +103,11 @@ fn prune_stale_pipe_panes(app: &mut AppState) {
     }
 }
 
+fn prune_wait_channels(app: &mut AppState) {
+    app.wait_channels
+        .retain(|_, ch| ch.locked || !ch.waiters.is_empty());
+}
+
 pub fn run_server(session_name: String, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -1531,6 +1536,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     };
                 }
             }
+            prune_wait_channels(&mut app);
             if mutates_state {
                 state_dirty = true;
             }
