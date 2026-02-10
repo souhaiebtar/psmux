@@ -145,6 +145,10 @@ pub struct AppState {
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
+    /// Reusable scratch buffer for compute_rects results
+    pub scratch_rects: Vec<(Vec<usize>, ratatui::prelude::Rect)>,
+    /// Reusable scratch buffer for compute_split_borders results
+    pub scratch_borders: Vec<(Vec<usize>, LayoutKind, usize, u16)>,
 }
 
 pub struct DragState {

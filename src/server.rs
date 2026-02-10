@@ -169,6 +169,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         pipe_panes: Vec::new(),
         last_window_idx: 0,
         last_pane_path: Vec::new(),
+        scratch_rects: Vec::new(),
+        scratch_borders: Vec::new(),
     };
     load_config(&mut app);
     // Create initial window with optional command
