@@ -542,11 +542,37 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 }
                             }
                             MouseEventKind::Down(MouseButton::Right) => {
-                                // Right-click: paste from clipboard (pwsh behavior)
-                                if let Some(text) = read_from_system_clipboard() {
-                                    if !text.is_empty() {
-                                        let encoded = base64_encode(&text);
-                                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                                // pwsh-style: right-click with active selection → copy + clear
+                                // right-click without selection → paste from clipboard
+                                if rsel_start.is_some() && rsel_dragged {
+                                    // Copy selection to clipboard and clear it
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                            let text = extract_selection_text(
+                                                &state.layout,
+                                                last_sent_size.0,
+                                                last_sent_size.1,
+                                                s, e,
+                                            );
+                                            if !text.is_empty() {
+                                                copy_to_system_clipboard(&text);
+                                            }
+                                        }
+                                    }
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                } else {
+                                    // No selection — paste from clipboard
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                    if let Some(text) = read_from_system_clipboard() {
+                                        if !text.is_empty() {
+                                            let encoded = base64_encode(&text);
+                                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                                        }
                                     }
                                 }
                             }

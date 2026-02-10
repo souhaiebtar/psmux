@@ -152,6 +152,43 @@ pub struct AppState {
     pub last_pane_path: Vec<usize>,
     /// Tab positions on status bar: (window_index, x_start, x_end)
     pub tab_positions: Vec<(usize, u16, u16)>,
+    /// history-limit: scrollback buffer size (default 2000)
+    pub history_limit: usize,
+    /// display-time: how long messages are shown (ms, default 750)
+    pub display_time_ms: u64,
+    /// display-panes-time: how long pane overlay is shown (ms, default 1000)
+    pub display_panes_time_ms: u64,
+    /// pane-base-index: first pane id (default 0)
+    pub pane_base_index: usize,
+    /// focus-events: pass focus events to apps
+    pub focus_events: bool,
+    /// mode-keys: vi or emacs (stored for compat, default emacs)
+    pub mode_keys: String,
+    /// status: whether status bar is shown
+    pub status_visible: bool,
+    /// status-position: "top" or "bottom" (default "bottom")
+    pub status_position: String,
+    /// status-style: stored for compat
+    pub status_style: String,
+    /// default-command / default-shell: shell to launch for new panes
+    pub default_shell: String,
+    /// word-separators: characters that delimit words in copy mode
+    pub word_separators: String,
+    /// renumber-windows: auto-renumber on close
+    pub renumber_windows: bool,
+    /// monitor-activity / visual-activity: stored for compat
+    pub monitor_activity: bool,
+    pub visual_activity: bool,
+    /// remain-on-exit: keep panes open after process exits
+    pub remain_on_exit: bool,
+    /// aggressive-resize: resize window to smallest attached client
+    pub aggressive_resize: bool,
+    /// set-titles: update terminal title
+    pub set_titles: bool,
+    /// set-titles-string: format for terminal title
+    pub set_titles_string: String,
+    /// Environment variables set via set-environment
+    pub environment: std::collections::HashMap<String, String>,
 }
 
 pub struct DragState {

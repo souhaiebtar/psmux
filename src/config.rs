@@ -43,6 +43,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         let rest = &l[7..];
         parse_option_value(app, rest, true);
     }
+    else if l.starts_with("setw ") || l.starts_with("set-window-option ") {
+        // setw maps to the same option parser (tmux window options overlap)
+        parse_set_option(app, l);
+    }
     else if l.starts_with("bind-key ") || l.starts_with("bind ") {
         parse_bind_key(app, l);
     }
@@ -53,6 +57,31 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         let parts: Vec<&str> = l.splitn(2, ' ').collect();
         if parts.len() > 1 {
             source_file(app, parts[1].trim());
+        }
+    }
+    else if l.starts_with("run-shell ") || l.starts_with("run ") {
+        // Silently accept run-shell (tmux compat) — could execute in future
+    }
+    else if l.starts_with("if-shell ") || l.starts_with("if ") {
+        // Silently accept if-shell (tmux compat) — complex conditional not supported
+    }
+    else if l.starts_with("set-hook ") {
+        // Parse set-hook: set-hook [-g] hook-name command
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        let mut i = 1;
+        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
+        if i + 1 < parts.len() {
+            let hook = parts[i].to_string();
+            let cmd = parts[i+1..].join(" ");
+            app.hooks.entry(hook).or_insert_with(Vec::new).push(cmd);
+        }
+    }
+    else if l.starts_with("set-environment ") || l.starts_with("setenv ") {
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        let mut i = 1;
+        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
+        if i + 1 < parts.len() {
+            app.environment.insert(parts[i].to_string(), parts[i+1..].join(" "));
         }
     }
 }
@@ -112,9 +141,15 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         }
         "cursor-style" => env::set_var("PSMUX_CURSOR_STYLE", value),
         "cursor-blink" => env::set_var("PSMUX_CURSOR_BLINK", if matches!(value, "on"|"true"|"1") { "1" } else { "0" }),
-        "status" => {}
-        "status-style" => {}
-        "status-position" => {}
+        "status" => {
+            app.status_visible = matches!(value, "on" | "true" | "1" | "2");
+        }
+        "status-style" => {
+            app.status_style = value.to_string();
+        }
+        "status-position" => {
+            app.status_position = value.to_string();
+        }
         "status-interval" => {}
         "status-justify" => {}
         "base-index" => {
@@ -122,20 +157,82 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 app.window_base_index = idx;
             }
         }
-        "renumber-windows" => {}
-        "mode-keys" => {}
+        "pane-base-index" => {
+            if let Ok(idx) = value.parse::<usize>() {
+                app.pane_base_index = idx;
+            }
+        }
+        "history-limit" => {
+            if let Ok(limit) = value.parse::<usize>() {
+                app.history_limit = limit;
+            }
+        }
+        "display-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_time_ms = ms;
+            }
+        }
+        "display-panes-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_panes_time_ms = ms;
+            }
+        }
+        "default-command" | "default-shell" => {
+            app.default_shell = value.to_string();
+        }
+        "word-separators" => {
+            app.word_separators = value.to_string();
+        }
+        "renumber-windows" => {
+            app.renumber_windows = matches!(value, "on" | "true" | "1");
+        }
+        "mode-keys" => {
+            app.mode_keys = value.to_string();
+        }
+        "focus-events" => {
+            app.focus_events = matches!(value, "on" | "true" | "1");
+        }
+        "monitor-activity" => {
+            app.monitor_activity = matches!(value, "on" | "true" | "1");
+        }
+        "visual-activity" => {
+            app.visual_activity = matches!(value, "on" | "true" | "1");
+        }
+        "remain-on-exit" => {
+            app.remain_on_exit = matches!(value, "on" | "true" | "1");
+        }
+        "aggressive-resize" => {
+            app.aggressive_resize = matches!(value, "on" | "true" | "1");
+        }
+        "set-titles" => {
+            app.set_titles = matches!(value, "on" | "true" | "1");
+        }
+        "set-titles-string" => {
+            app.set_titles_string = value.to_string();
+        }
         "status-keys" => {}
-        "history-limit" => {}
         "pane-border-style" => {}
         "pane-active-border-style" => {}
         "window-status-format" => {}
         "window-status-current-format" => {}
         "window-status-separator" => {}
-        "remain-on-exit" => {}
-        "set-titles" => {}
-        "set-titles-string" => {}
         "automatic-rename" => {}
         "allow-rename" => {}
+        "terminal-overrides" => {}
+        "default-terminal" => {}
+        "update-environment" => {}
+        "bell-action" => {}
+        "visual-bell" => {}
+        "activity-action" => {}
+        "silence-action" => {}
+        "monitor-silence" => {}
+        "message-style" | "message-command-style" => {}
+        "clock-mode-colour" | "clock-mode-style" => {}
+        "pane-border-format" | "pane-border-status" => {}
+        "popup-style" | "popup-border-style" | "popup-border-lines" => {}
+        "window-style" | "window-active-style" => {}
+        "wrap-search" => {}
+        "lock-after-time" | "lock-command" => {}
         _ => {}
     }
 }

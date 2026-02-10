@@ -65,6 +65,25 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         last_window_idx: 0,
         last_pane_path: Vec::new(),
         tab_positions: Vec::new(),
+        history_limit: 2000,
+        display_time_ms: 750,
+        display_panes_time_ms: 1000,
+        pane_base_index: 0,
+        focus_events: false,
+        mode_keys: "emacs".to_string(),
+        status_visible: true,
+        status_position: "bottom".to_string(),
+        status_style: String::new(),
+        default_shell: String::new(),
+        word_separators: " -_@".to_string(),
+        renumber_windows: false,
+        monitor_activity: false,
+        visual_activity: false,
+        remain_on_exit: false,
+        aggressive_resize: false,
+        set_titles: false,
+        set_titles_string: String::new(),
+        environment: std::collections::HashMap::new(),
     };
     load_config(&mut app);
     // Create initial window with optional command
@@ -277,21 +296,21 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                 }
                 match cmd {
-                    "new-window" => {
+                    "new-window" | "neww" => {
                         let cmd_str: Option<String> = args.iter()
                             .find(|a| !a.starts_with('-'))
                             .map(|s| s.trim_matches('"').to_string());
                         let _ = tx.send(CtrlReq::NewWindow(cmd_str));
                     }
-                    "split-window" => {
+                    "split-window" | "splitw" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
                         let cmd_str: Option<String> = args.iter()
                             .find(|a| !a.starts_with('-'))
                             .map(|s| s.trim_matches('"').to_string());
                         let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str));
                     }
-                    "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
-                    "capture-pane" => {
+                    "kill-pane" | "killp" => { let _ = tx.send(CtrlReq::KillPane); }
+                    "capture-pane" | "capturep" => {
                         let print_stdout = args.iter().any(|a| *a == "-p");
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::CapturePane(rtx));
@@ -343,6 +362,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "send-key" => {
                         if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendKey(payload.to_string())); }
                     }
+                    "zoom-pane" | "resizep" if args.iter().any(|a| *a == "-Z") => { let _ = tx.send(CtrlReq::ZoomPane); }
                     "zoom-pane" => { let _ = tx.send(CtrlReq::ZoomPane); }
                     "copy-enter" => { let _ = tx.send(CtrlReq::CopyEnter); }
                     "copy-move" => {
@@ -393,10 +413,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         let y = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
                         let _ = tx.send(CtrlReq::ScrollDown(x, y));
                     }
-                    "next-window" => { let _ = tx.send(CtrlReq::NextWindow); }
-                    "previous-window" => { let _ = tx.send(CtrlReq::PrevWindow); }
-                    "rename-window" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
-                    "list-windows" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } if !persistent { break; } }
+                    "next-window" | "next" => { let _ = tx.send(CtrlReq::NextWindow); }
+                    "previous-window" | "prev" => { let _ = tx.send(CtrlReq::PrevWindow); }
+                    "rename-window" | "renamew" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
+                    "list-windows" | "lsw" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } if !persistent { break; } }
                     "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } if !persistent { break; } }
                     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
                     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
@@ -405,7 +425,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
                         let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
                     }
-                    "select-pane" => {
+                    "select-pane" | "selectp" => {
                         let dir = if args.iter().any(|a| *a == "-U") { "U" }
                             else if args.iter().any(|a| *a == "-D") { "D" }
                             else if args.iter().any(|a| *a == "-L") { "L" }
@@ -413,18 +433,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             else { "" };
                         let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
                     }
-                    "select-window" => {
+                    "select-window" | "selectw" => {
                         if let Some(idx) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
                             let _ = tx.send(CtrlReq::SelectWindow(idx));
                         }
                     }
-                    "list-panes" => {
+                    "list-panes" | "lsp" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ListPanes(rtx));
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "kill-window" => { let _ = tx.send(CtrlReq::KillWindow); }
+                    "kill-window" | "killw" => { let _ = tx.send(CtrlReq::KillWindow); }
                     "kill-session" => { let _ = tx.send(CtrlReq::KillSession); }
                     "has-session" => {
                         let (rtx, rrx) = mpsc::channel::<bool>();
@@ -433,18 +453,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             if !exists { std::process::exit(1); }
                         }
                     }
-                    "rename-session" => {
+                    "rename-session" | "rename" => {
                         if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
                             let _ = tx.send(CtrlReq::RenameSession((*name).to_string()));
                         }
                     }
-                    "swap-pane" => {
+                    "swap-pane" | "swapp" => {
                         let dir = if args.iter().any(|a| *a == "-U") { "U" }
                             else if args.iter().any(|a| *a == "-D") { "D" }
                             else { "D" };
                         let _ = tx.send(CtrlReq::SwapPane(dir.to_string()));
                     }
-                    "resize-pane" => {
+                    "resize-pane" | "resizep" => {
                         let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
                         let dir = if args.iter().any(|a| *a == "-U") { "U" }
                             else if args.iter().any(|a| *a == "-D") { "D" }
@@ -457,14 +477,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
                         let _ = tx.send(CtrlReq::SetBuffer(content));
                     }
-                    "paste-buffer" => {
+                    "paste-buffer" | "pasteb" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ShowBuffer(rtx));
                         if let Ok(text) = rrx.recv() {
                             let _ = tx.send(CtrlReq::SendText(text));
                         }
                     }
-                    "list-buffers" => {
+                    "list-buffers" | "lsb" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ListBuffers(rtx));
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
@@ -477,27 +497,27 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if !persistent { break; }
                     }
                     "delete-buffer" => { let _ = tx.send(CtrlReq::DeleteBuffer); }
-                    "display-message" => {
+                    "display-message" | "display" => {
                         let fmt = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt));
                         if let Ok(text) = rrx.recv() { let _ = writeln!(write_stream, "{}", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "last-window" => { let _ = tx.send(CtrlReq::LastWindow); }
-                    "last-pane" => { let _ = tx.send(CtrlReq::LastPane); }
-                    "rotate-window" => {
+                    "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
+                    "last-pane" | "lastp" => { let _ = tx.send(CtrlReq::LastPane); }
+                    "rotate-window" | "rotatew" => {
                         let reverse = args.iter().any(|a| *a == "-D");
                         let _ = tx.send(CtrlReq::RotateWindow(reverse));
                     }
-                    "display-panes" => { let _ = tx.send(CtrlReq::DisplayPanes); }
-                    "break-pane" => { let _ = tx.send(CtrlReq::BreakPane); }
-                    "join-pane" => {
+                    "display-panes" | "displayp" => { let _ = tx.send(CtrlReq::DisplayPanes); }
+                    "break-pane" | "breakp" => { let _ = tx.send(CtrlReq::BreakPane); }
+                    "join-pane" | "joinp" => {
                         if let Some(wid) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
                             let _ = tx.send(CtrlReq::JoinPane(wid));
                         }
                     }
-                    "respawn-pane" => { let _ = tx.send(CtrlReq::RespawnPane); }
+                    "respawn-pane" | "respawnp" => { let _ = tx.send(CtrlReq::RespawnPane); }
                     "session-info" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::SessionInfo(rtx));
@@ -526,7 +546,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "set-option" | "set" => {
+                    "set-option" | "set" | "set-window-option" | "setw" => {
                         let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
                         if non_flag_args.len() >= 2 {
                             let option = non_flag_args[0].to_string();
@@ -546,30 +566,30 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             let _ = tx.send(CtrlReq::SourceFile(path.to_string()));
                         }
                     }
-                    "move-window" => {
+                    "move-window" | "movew" => {
                         let target = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok());
                         let _ = tx.send(CtrlReq::MoveWindow(target));
                     }
-                    "swap-window" => {
+                    "swap-window" | "swapw" => {
                         if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
                             let _ = tx.send(CtrlReq::SwapWindow(target));
                         }
                     }
-                    "link-window" => {
+                    "link-window" | "linkw" => {
                         let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
                         let _ = tx.send(CtrlReq::LinkWindow(target));
                     }
-                    "unlink-window" => {
+                    "unlink-window" | "unlinkw" => {
                         let _ = tx.send(CtrlReq::UnlinkWindow);
                     }
-                    "find-window" => {
+                    "find-window" | "findw" => {
                         let pattern = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::FindWindow(rtx, pattern));
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "move-pane" => {
+                    "move-pane" | "movep" => {
                         if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
                             let _ = tx.send(CtrlReq::MovePane(target));
                         }
@@ -586,20 +606,20 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         };
                         let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout));
                     }
-                    "select-layout" => {
+                    "select-layout" | "selectl" => {
                         let layout = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"tiled").to_string();
                         let _ = tx.send(CtrlReq::SelectLayout(layout));
                     }
                     "next-layout" => {
                         let _ = tx.send(CtrlReq::NextLayout);
                     }
-                    "list-clients" => {
+                    "list-clients" | "lsc" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ListClients(rtx));
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "switch-client" => {
+                    "switch-client" | "switchc" => {
                         let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
                         let _ = tx.send(CtrlReq::SwitchClient(target));
                     }
@@ -618,15 +638,15 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "clear-history" => {
                         let _ = tx.send(CtrlReq::ClearHistory);
                     }
-                    "save-buffer" => {
+                    "save-buffer" | "saveb" => {
                         let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
                         let _ = tx.send(CtrlReq::SaveBuffer(path));
                     }
-                    "load-buffer" => {
+                    "load-buffer" | "loadb" => {
                         let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
                         let _ = tx.send(CtrlReq::LoadBuffer(path));
                     }
-                    "set-environment" => {
+                    "set-environment" | "setenv" => {
                         let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
                         if non_flag.len() >= 2 {
                             let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), non_flag[1].to_string()));
@@ -634,7 +654,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), String::new()));
                         }
                     }
-                    "show-environment" => {
+                    "show-environment" | "showenv" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
@@ -707,6 +727,31 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         let command = non_flag.join(" ");
                         let prompt_str = prompt.unwrap_or_else(|| format!("Run '{}'?", command));
                         let _ = tx.send(CtrlReq::ConfirmBefore(prompt_str, command));
+                    }
+                    // tmux standard aliases
+                    "detach-client" | "detach" => { let _ = tx.send(CtrlReq::ClientDetach); }
+                    "attach-session" | "attach" => { let _ = tx.send(CtrlReq::ClientAttach); }
+                    "kill-server" => { let _ = tx.send(CtrlReq::KillServer); }
+                    "choose-tree" | "choose-window" | "choose-session" => {
+                        // These are interactive choosers — send a dump that client handles
+                        // For now, map to listing which the client renders as a chooser
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ListTree(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        if !persistent { break; }
+                    }
+                    "copy-mode" => { let _ = tx.send(CtrlReq::CopyEnter); }
+                    "clock-mode" => {} // not implemented but accepted
+                    "show-messages" | "showmsgs" => {} // not implemented but accepted
+                    "command-prompt" => {} // accepted (client handles internally)
+                    "list-sessions" | "ls" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        if !persistent { break; }
+                    }
+                    "new-session" | "new" => {
+                        // Accept but ignore in server context (requires a new process)
                     }
                     _ => {}
                 }
@@ -1200,6 +1245,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.window_base_index = idx;
                             }
                         }
+                        "pane-base-index" => {
+                            if let Ok(idx) = value.parse::<usize>() {
+                                app.pane_base_index = idx;
+                            }
+                        }
                         "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
                         "prefix" => {
                             if let Some(kc) = parse_key_string(&value) {
@@ -1211,84 +1261,82 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.escape_time_ms = ms;
                             }
                         }
+                        "history-limit" => {
+                            if let Ok(limit) = value.parse::<usize>() {
+                                app.history_limit = limit;
+                            }
+                        }
+                        "display-time" => {
+                            if let Ok(ms) = value.parse::<u64>() {
+                                app.display_time_ms = ms;
+                            }
+                        }
+                        "display-panes-time" => {
+                            if let Ok(ms) = value.parse::<u64>() {
+                                app.display_panes_time_ms = ms;
+                            }
+                        }
+                        "mode-keys" => { app.mode_keys = value; }
+                        "status" => { app.status_visible = matches!(value.as_str(), "on" | "true" | "1" | "2"); }
+                        "status-position" => { app.status_position = value; }
+                        "status-style" => { app.status_style = value; }
+                        "focus-events" => { app.focus_events = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "renumber-windows" => { app.renumber_windows = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "remain-on-exit" => { app.remain_on_exit = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "set-titles" => { app.set_titles = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "set-titles-string" => { app.set_titles_string = value; }
+                        "default-command" | "default-shell" => { app.default_shell = value; }
+                        "word-separators" => { app.word_separators = value; }
+                        "aggressive-resize" => { app.aggressive_resize = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "monitor-activity" => { app.monitor_activity = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "visual-activity" => { app.visual_activity = matches!(value.as_str(), "on" | "true" | "1"); }
                         "prediction-dimming" | "dim-predictions" => {
                             app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
                         }
-                        _ => {}
+                        "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", &value); }
+                        "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", if matches!(value.as_str(), "on"|"true"|"1") { "1" } else { "0" }); }
+                        _ => {} // silently ignore unknown options (tmux compat)
                     }
                 }
                 CtrlReq::ShowOptions(resp) => {
                     let mut output = String::new();
+                    output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
+                    output.push_str(&format!("base-index {}\n", app.window_base_index));
+                    output.push_str(&format!("pane-base-index {}\n", app.pane_base_index));
+                    output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
+                    output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
+                    output.push_str(&format!("status {}\n", if app.status_visible { "on" } else { "off" }));
+                    output.push_str(&format!("status-position {}\n", app.status_position));
                     output.push_str(&format!("status-left \"{}\"\n", app.status_left));
                     output.push_str(&format!("status-right \"{}\"\n", app.status_right));
-                    output.push_str(&format!("base-index {}\n", app.window_base_index));
-                    output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
-                    output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
-                    output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
+                    output.push_str(&format!("history-limit {}\n", app.history_limit));
+                    output.push_str(&format!("display-time {}\n", app.display_time_ms));
+                    output.push_str(&format!("display-panes-time {}\n", app.display_panes_time_ms));
+                    output.push_str(&format!("mode-keys {}\n", app.mode_keys));
+                    output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
+                    output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
+                    output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
+                    output.push_str(&format!("set-titles {}\n", if app.set_titles { "on" } else { "off" }));
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
                     ));
+                    if !app.default_shell.is_empty() {
+                        output.push_str(&format!("default-shell {}\n", app.default_shell));
+                    }
+                    output.push_str(&format!("word-separators \"{}\"\n", app.word_separators));
                     let _ = resp.send(output);
                 }
                 CtrlReq::SourceFile(path) => {
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        for line in contents.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') { continue; }
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.is_empty() { continue; }
-                            match parts[0] {
-                                "set" | "set-option" => {
-                                    if parts.len() >= 3 {
-                                        let opt_idx = if parts.get(1) == Some(&"-g") { 2 } else { 1 };
-                                        if let (Some(opt), Some(val)) = (parts.get(opt_idx), parts.get(opt_idx + 1)) {
-                                            match *opt {
-                                                "status-left" => { app.status_left = parts[opt_idx + 1..].join(" ").trim_matches('"').to_string(); }
-                                                "status-right" => { app.status_right = parts[opt_idx + 1..].join(" ").trim_matches('"').to_string(); }
-                                                "base-index" => {
-                                                    if let Ok(idx) = val.parse::<usize>() {
-                                                        app.window_base_index = idx;
-                                                    }
-                                                }
-                                                "mouse" => { app.mouse_enabled = *val == "on" || *val == "true" || *val == "1"; }
-                                                "prefix" => { if let Some(kc) = parse_key_string(val) { app.prefix_key = kc; } }
-                                                "escape-time" => { if let Ok(ms) = val.parse::<u64>() { app.escape_time_ms = ms; } }
-                                                "prediction-dimming" | "dim-predictions" => {
-                                                    app.prediction_dimming = !matches!(*val, "off" | "false" | "0");
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                                "bind" | "bind-key" => {
-                                    if parts.len() >= 3 {
-                                        let key_idx = if parts.get(1).map(|s| s.starts_with('-')).unwrap_or(false) { 2 } else { 1 };
-                                        if let Some(key_str) = parts.get(key_idx) {
-                                            if let Some(kc) = parse_key_string(key_str) {
-                                                let cmd = parts[key_idx + 1..].join(" ");
-                                                if let Some(act) = parse_command_to_action(&cmd) {
-                                                    app.binds.retain(|b| b.key != kc);
-                                                    app.binds.push(Bind { key: kc, action: act });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                "unbind" | "unbind-key" => {
-                                    if parts.len() >= 2 {
-                                        let key_idx = if parts.get(1).map(|s| s.starts_with('-')).unwrap_or(false) { 2 } else { 1 };
-                                        if let Some(key_str) = parts.get(key_idx) {
-                                            if let Some(kc) = parse_key_string(key_str) {
-                                                app.binds.retain(|b| b.key != kc);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                    // Reuse full config parser for source-file (handles all options, binds, etc.)
+                    let expanded = if path.starts_with('~') {
+                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                        path.replacen('~', &home, 1)
+                    } else {
+                        path.clone()
+                    };
+                    if let Ok(contents) = std::fs::read_to_string(&expanded) {
+                        parse_config_content(&mut app, &contents);
                     }
                 }
                 CtrlReq::MoveWindow(target) => {
@@ -1407,12 +1455,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                 }
                 CtrlReq::SetEnvironment(key, value) => {
+                    app.environment.insert(key.clone(), value.clone());
                     env::set_var(&key, &value);
                 }
                 CtrlReq::ShowEnvironment(resp) => {
                     let mut output = String::new();
+                    // Show psmux/tmux-specific environment vars
+                    for (key, value) in &app.environment {
+                        output.push_str(&format!("{}={}\n", key, value));
+                    }
+                    // Also show inherited PSMUX_/TMUX_ vars from process env
                     for (key, value) in env::vars() {
-                        if key.starts_with("PSMUX") || key.starts_with("TMUX") {
+                        if (key.starts_with("PSMUX") || key.starts_with("TMUX")) && !app.environment.contains_key(&key) {
                             output.push_str(&format!("{}={}\n", key, value));
                         }
                     }

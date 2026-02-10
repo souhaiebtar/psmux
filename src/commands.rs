@@ -23,7 +23,7 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
     if parts.is_empty() { return None; }
     
     match parts[0] {
-        "display-panes" => Some(Action::DisplayPanes),
+        "display-panes" | "displayp" => Some(Action::DisplayPanes),
         "new-window" | "neww" => Some(Action::NewWindow),
         "split-window" | "splitw" => {
             if parts.iter().any(|p| *p == "-h") {
@@ -32,15 +32,16 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::SplitVertical)
             }
         }
-        "kill-pane" => Some(Action::KillPane),
+        "kill-pane" | "killp" => Some(Action::KillPane),
         "next-window" | "next" => Some(Action::NextWindow),
         "previous-window" | "prev" => Some(Action::PrevWindow),
         "copy-mode" => Some(Action::CopyMode),
-        "paste-buffer" => Some(Action::Paste),
+        "paste-buffer" | "pasteb" => Some(Action::Paste),
         "detach-client" | "detach" => Some(Action::Detach),
         "rename-window" | "renamew" => Some(Action::RenameWindow),
-        "choose-window" | "choose-tree" => Some(Action::WindowChooser),
+        "choose-window" | "choose-tree" | "choose-session" => Some(Action::WindowChooser),
         "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") => Some(Action::ZoomPane),
+        "zoom-pane" => Some(Action::ZoomPane),
         "select-pane" | "selectp" => {
             if parts.iter().any(|p| *p == "-U") {
                 Some(Action::MoveFocus(FocusDir::Up))
@@ -54,6 +55,31 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::Command(cmd.to_string()))
             }
         }
+        "last-window" | "last" => Some(Action::Command("last-window".to_string())),
+        "last-pane" | "lastp" => Some(Action::Command("last-pane".to_string())),
+        "swap-pane" | "swapp" => Some(Action::Command(cmd.to_string())),
+        "resize-pane" | "resizep" => Some(Action::Command(cmd.to_string())),
+        "rotate-window" | "rotatew" => Some(Action::Command(cmd.to_string())),
+        "break-pane" | "breakp" => Some(Action::Command(cmd.to_string())),
+        "respawn-pane" | "respawnp" => Some(Action::Command(cmd.to_string())),
+        "kill-window" | "killw" => Some(Action::Command(cmd.to_string())),
+        "kill-session" => Some(Action::Command(cmd.to_string())),
+        "select-window" | "selectw" => Some(Action::Command(cmd.to_string())),
+        "toggle-sync" => Some(Action::Command("toggle-sync".to_string())),
+        "send-keys" => Some(Action::Command(cmd.to_string())),
+        "set-option" | "set" | "setw" | "set-window-option" => Some(Action::Command(cmd.to_string())),
+        "source-file" | "source" => Some(Action::Command(cmd.to_string())),
+        "select-layout" | "selectl" => Some(Action::Command(cmd.to_string())),
+        "next-layout" => Some(Action::Command("next-layout".to_string())),
+        "confirm-before" | "confirm" => Some(Action::Command(cmd.to_string())),
+        "display-menu" | "menu" => Some(Action::Command(cmd.to_string())),
+        "display-popup" | "popup" => Some(Action::Command(cmd.to_string())),
+        "pipe-pane" | "pipep" => Some(Action::Command(cmd.to_string())),
+        "rename-session" | "rename" => Some(Action::Command(cmd.to_string())),
+        "clear-history" => Some(Action::Command("clear-history".to_string())),
+        "set-buffer" | "setb" => Some(Action::Command(cmd.to_string())),
+        "delete-buffer" | "deleteb" => Some(Action::Command("delete-buffer".to_string())),
+        "display-message" | "display" => Some(Action::Command(cmd.to_string())),
         _ => Some(Action::Command(cmd.to_string()))
     }
 }
@@ -421,7 +447,121 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                 close_on_exit: true,
             };
         }
-        _ => {}
+        "resize-pane" | "resizep" => {
+            if parts.iter().any(|p| *p == "-Z") {
+                toggle_zoom(app);
+            } else {
+                // Forward to server for actual resize
+                if let Some(port) = app.control_port {
+                    let _ = send_control_to_port(port, &format!("{}\n", cmd));
+                }
+            }
+        }
+        "swap-pane" | "swapp" => {
+            if let Some(port) = app.control_port {
+                let dir = if parts.iter().any(|p| *p == "-U") { "-U" } else { "-D" };
+                let _ = send_control_to_port(port, &format!("swap-pane {}\n", dir));
+            }
+        }
+        "rotate-window" | "rotatew" => {
+            if let Some(port) = app.control_port {
+                let flag = if parts.iter().any(|p| *p == "-D") { "-D" } else { "" };
+                let _ = send_control_to_port(port, &format!("rotate-window {}\n", flag));
+            }
+        }
+        "break-pane" | "breakp" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, "break-pane\n");
+            }
+        }
+        "respawn-pane" | "respawnp" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, "respawn-pane\n");
+            }
+        }
+        "toggle-sync" => {
+            app.sync_input = !app.sync_input;
+        }
+        "set-option" | "set" | "set-window-option" | "setw" => {
+            // Forward to server for option handling
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "bind-key" | "bind" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "unbind-key" | "unbind" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "source-file" | "source" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "send-keys" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "detach-client" | "detach" => {
+            // handled by caller to set quit flag
+        }
+        "rename-session" => {
+            if let Some(name) = parts.get(1) {
+                app.session_name = name.to_string();
+            }
+        }
+        "select-layout" | "selectl" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "next-layout" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, "next-layout\n");
+            }
+        }
+        "pipe-pane" | "pipep" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
+        "choose-tree" | "choose-window" => {
+            app.mode = Mode::WindowChooser { selected: app.active_idx };
+        }
+        "paste-buffer" | "pasteb" => {
+            paste_latest(app)?;
+        }
+        "set-buffer" => {
+            if let Some(text) = parts.get(1) {
+                app.paste_buffers.insert(0, text.to_string());
+                if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+            }
+        }
+        "delete-buffer" => {
+            if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
+        }
+        "clear-history" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, "clear-history\n");
+            }
+        }
+        "kill-session" => {
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, "kill-session\n");
+            }
+        }
+        _ => {
+            // Forward unknown commands to server (catch-all for tmux compat)
+            if let Some(port) = app.control_port {
+                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            }
+        }
     }
     Ok(())
 }
