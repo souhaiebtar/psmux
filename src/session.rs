@@ -52,6 +52,17 @@ pub fn sanitize_session_name(name: &str) -> String {
     }
 }
 
+fn validate_session_name(name: &str) -> io::Result<()> {
+    if is_valid_session_name(name) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid session name: {}", name),
+        ))
+    }
+}
+
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
@@ -90,6 +101,7 @@ pub fn cleanup_stale_port_files() {
 
 /// Read the session key from the key file
 pub fn read_session_key(session: &str) -> io::Result<String> {
+    validate_session_name(session)?;
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let keypath = format!("{}\\.psmux\\{}.key", home, session);
     std::fs::read_to_string(&keypath).map(|s| s.trim().to_string())
@@ -125,6 +137,7 @@ pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<S
 pub fn send_control(line: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    validate_session_name(&target)?;
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
@@ -143,6 +156,7 @@ pub fn send_control(line: String) -> io::Result<()> {
 pub fn send_control_with_response(line: String) -> io::Result<String> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    validate_session_name(&target)?;
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
@@ -184,6 +198,9 @@ pub fn resolve_last_session_name() -> Option<String> {
     let last = std::fs::read_to_string(format!("{}\\last_session", dir)).ok();
     if let Some(name) = last {
         let name = name.trim().to_string();
+        if !is_valid_session_name(&name) {
+            return None;
+        }
         let p = format!("{}\\{}.port", dir, name);
         if std::path::Path::new(&p).exists() { return Some(name); }
     }
@@ -192,7 +209,11 @@ pub fn resolve_last_session_name() -> Option<String> {
         for e in rd.flatten() {
             if let Some(fname) = e.file_name().to_str() {
                 if let Some((base, ext)) = fname.rsplit_once('.') {
-                    if ext == "port" { if let Ok(md) = e.metadata() { picks.push((base.to_string(), md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))); } }
+                    if ext == "port" && is_valid_session_name(base) {
+                        if let Ok(md) = e.metadata() {
+                            picks.push((base.to_string(), md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
+                        }
+                    }
                 }
             }
         }
@@ -203,6 +224,9 @@ pub fn resolve_last_session_name() -> Option<String> {
 
 pub fn resolve_default_session_name() -> Option<String> {
     if let Ok(name) = env::var("PSMUX_DEFAULT_SESSION") {
+        if !is_valid_session_name(&name) {
+            return None;
+        }
         let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
         let p = format!("{}\\.psmux\\{}.port", home, name);
         if std::path::Path::new(&p).exists() { return Some(name); }
@@ -213,6 +237,9 @@ pub fn resolve_default_session_name() -> Option<String> {
         if let Ok(text) = std::fs::read_to_string(cfg) {
             let line = text.lines().find(|l| !l.trim().is_empty())?;
             let name = if let Some(rest) = line.strip_prefix("default-session ") { rest.trim().to_string() } else { line.trim().to_string() };
+            if !is_valid_session_name(&name) {
+                continue;
+            }
             let p = format!("{}\\.psmux\\{}.port", home, name);
             if std::path::Path::new(&p).exists() { return Some(name); }
         }
