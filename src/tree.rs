@@ -1,4 +1,5 @@
-use std::io::{self, Write};
+use std::io;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use ratatui::prelude::*;
 
@@ -325,26 +326,17 @@ pub fn focus_pane_by_index(app: &mut AppState, idx: usize) {
     }
 }
 
-/// Consume and clear output-dirty flags for all panes in a tree.
-/// Returns true if at least one pane had fresh output since the last check.
-pub fn consume_output_dirty(node: &Node) -> bool {
-    match node {
-        Node::Leaf(p) => p.output_dirty.swap(false, Ordering::Relaxed),
-        Node::Split { children, .. } => children.iter().any(consume_output_dirty),
-    }
-}
-
 /// Consume and collect pane ids that had fresh output since the last check.
-pub fn consume_output_dirty_ids(node: &Node, out: &mut Vec<usize>) {
+pub fn consume_output_dirty_set(node: &Node, out: &mut HashSet<usize>) {
     match node {
         Node::Leaf(p) => {
             if p.output_dirty.swap(false, Ordering::Relaxed) {
-                out.push(p.id);
+                out.insert(p.id);
             }
         }
         Node::Split { children, .. } => {
             for child in children {
-                consume_output_dirty_ids(child, out);
+                consume_output_dirty_set(child, out);
             }
         }
     }

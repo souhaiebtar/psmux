@@ -1,6 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -372,31 +370,11 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
     Ok((s, title_changed))
 }
 
-fn pane_delta_fingerprint(delta: &PaneDeltaJson) -> u64 {
-    let mut h = DefaultHasher::new();
-    delta.id.hash(&mut h);
-    delta.cursor_row.hash(&mut h);
-    delta.cursor_col.hash(&mut h);
-    delta.alternate_screen.hash(&mut h);
-    for row in &delta.rows_v2 {
-        row.runs.len().hash(&mut h);
-        for run in &row.runs {
-            run.text.hash(&mut h);
-            run.fg.hash(&mut h);
-            run.bg.hash(&mut h);
-            run.flags.hash(&mut h);
-            run.width.hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
 /// Build pane-only deltas for dirty panes in the active window.
 /// Returns (delta_json, title_changed, changed_pane_count).
 pub fn dump_panes_delta_json(
     app: &mut AppState,
     dirty_panes: &HashSet<usize>,
-    pane_fingerprints: &mut HashMap<usize, u64>,
 ) -> io::Result<(String, bool, usize)> {
     const FLAG_DIM: u8 = 1;
     const FLAG_BOLD: u8 = 2;
@@ -473,7 +451,6 @@ pub fn dump_panes_delta_json(
         cur_path: &mut Vec<usize>,
         active_path: &[usize],
         dirty_panes: &HashSet<usize>,
-        pane_fingerprints: &mut HashMap<usize, u64>,
         title_changed: &mut bool,
         out: &mut Vec<PaneDeltaJson>,
     ) {
@@ -486,7 +463,6 @@ pub fn dump_panes_delta_json(
                         cur_path,
                         active_path,
                         dirty_panes,
-                        pane_fingerprints,
                         title_changed,
                         out,
                     );
@@ -523,11 +499,7 @@ pub fn dump_panes_delta_json(
                     alternate_screen,
                     rows_v2: build_rows_v2(&screen, p.last_rows, p.last_cols),
                 };
-                let fp = pane_delta_fingerprint(&delta);
-                if pane_fingerprints.get(&p.id).copied() != Some(fp) {
-                    pane_fingerprints.insert(p.id, fp);
-                    out.push(delta);
-                }
+                out.push(delta);
             }
         }
     }
@@ -541,7 +513,6 @@ pub fn dump_panes_delta_json(
         &mut path,
         &win.active_path,
         dirty_panes,
-        pane_fingerprints,
         &mut title_changed,
         &mut panes,
     );

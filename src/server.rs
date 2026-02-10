@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -118,14 +118,6 @@ fn prune_stale_pipe_panes(app: &mut AppState) {
         }
         app.pipe_panes.remove(i);
     }
-}
-
-fn prune_pane_fingerprints(app: &AppState, pane_fingerprints: &mut HashMap<usize, u64>) {
-    let mut live_pane_ids: HashSet<usize> = HashSet::new();
-    for win in &app.windows {
-        collect_live_pane_ids(&win.root, &mut live_pane_ids);
-    }
-    pane_fingerprints.retain(|pane_id, _| live_pane_ids.contains(pane_id));
 }
 
 fn prune_wait_channels(app: &mut AppState) {
@@ -806,7 +798,6 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let mut cached_dump_state: Arc<str> = Arc::from("");
     let mut cached_windows_json = String::new();
     let mut cached_tree_json = String::new();
-    let mut pane_fingerprints: HashMap<usize, u64> = HashMap::new();
     let mut last_dump_build = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         let mut sent_pty_input = false;
@@ -814,9 +805,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         let mut dirty_pane_ids: HashSet<usize> = HashSet::new();
         if app.attached_clients > 0 {
             for win in &app.windows {
-                let mut pane_ids = Vec::new();
-                consume_output_dirty_ids(&win.root, &mut pane_ids);
-                dirty_pane_ids.extend(pane_ids);
+                consume_output_dirty_set(&win.root, &mut dirty_pane_ids);
             }
             if !dirty_pane_ids.is_empty() {
                 state_dirty = true;
@@ -931,7 +920,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             std::thread::sleep(Duration::from_micros(500));
                         }
                         let (delta_json, title_changed, changed_panes) =
-                            dump_panes_delta_json(&mut app, &dirty_pane_ids, &mut pane_fingerprints)?;
+                            dump_panes_delta_json(&mut app, &dirty_pane_ids)?;
                         if title_changed {
                             metadata_dirty = true;
                         }
@@ -1632,7 +1621,6 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
         if any_pruned {
             prune_stale_pipe_panes(&mut app);
-            prune_pane_fingerprints(&app, &mut pane_fingerprints);
             // A pane exited naturally - resize remaining panes to fill the space
             resize_all_panes(&mut app);
             state_dirty = true;
