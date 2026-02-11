@@ -20,11 +20,17 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     while i < len {
         if bytes[i] == b'#' && i + 1 < len {
             if bytes[i + 1] == b'{' {
-                // #{variable_name} syntax
-                if let Some(close) = bytes[i+2..].iter().position(|&c| c == b'}') {
-                    let var = &fmt[i+2..i+2+close];
-                    result.push_str(&expand_format_var_for_window(var, app, win_idx));
-                    i += close + 3; // skip #{ ... }
+                // #{variable_name} or #{?cond,true,false} syntax
+                // Find matching closing brace (handle nesting)
+                if let Some(close) = find_matching_brace(fmt, i + 2) {
+                    let var = &fmt[i+2..close];
+                    if var.starts_with('?') {
+                        // Conditional: #{?cond,true_branch,false_branch}
+                        result.push_str(&expand_conditional(var, app, win_idx));
+                    } else {
+                        result.push_str(&expand_format_var_for_window(var, app, win_idx));
+                    }
+                    i = close + 1; // skip past }
                     continue;
                 }
             }
@@ -81,10 +87,13 @@ fn expand_format_var_for_window(var: &str, app: &AppState, win_idx: usize) -> St
         "window_active" => if win_idx == app.active_idx { "1".into() } else { "0".into() },
         "window_panes" => count_panes(&win.root).to_string(),
         "window_flags" => {
-            if win_idx == app.active_idx { "*".into() }
-            else if win_idx == app.last_window_idx { "-".into() }
-            else { String::new() }
+            let mut flags = String::new();
+            if win_idx == app.active_idx { flags.push('*'); }
+            else if win_idx == app.last_window_idx { flags.push('-'); }
+            if win.activity_flag { flags.push('#'); }
+            flags
         }
+        "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
         "pane_index" => {
             get_active_pane_id(&win.root, &win.active_path).unwrap_or(0).to_string()
         }
@@ -96,7 +105,18 @@ fn expand_format_var_for_window(var: &str, app: &AppState, win_idx: usize) -> St
             if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_rows.to_string() } else { "0".into() }
         }
         "pane_active" => "1".to_string(),
-        "pane_current_command" => String::new(),
+        "pane_current_command" => {
+            // Try to get the running command from pane title inference
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if !p.title.is_empty() { p.title.clone() } else { "shell".into() }
+            } else { String::new() }
+        }
+        "pane_current_path" => {
+            // Best-effort: use pane title which often contains the cwd
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                p.title.clone()
+            } else { String::new() }
+        }
         "pane_pid" => {
             if let Some(p) = active_pane(&win.root, &win.active_path) {
                 p.child_pid.map(|pid| pid.to_string()).unwrap_or_default()
@@ -125,4 +145,72 @@ fn hostname_cached() -> String {
             .or_else(|_| env::var("HOSTNAME"))
             .unwrap_or_default()
     }).clone()
+}
+
+/// Find the matching closing brace for `#{...}`, handling nested `#{...}` inside.
+/// `start` is the index of the first character after `#{`.
+/// Returns the index of the matching `}`.
+fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'}' {
+            depth -= 1;
+            if depth == 0 { return Some(i); }
+        } else if i + 1 < bytes.len() && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            depth += 1;
+            i += 1; // skip the '{'
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Expand a tmux conditional: `?cond,true_branch,false_branch`
+/// `cond` is a format variable name. Truthy if non-empty and not "0".
+fn expand_conditional(expr: &str, app: &AppState, win_idx: usize) -> String {
+    // Skip the leading '?'
+    let body = &expr[1..];
+    // Split on first comma for condition, then find second comma for branches
+    // Handle nested #{...} in branches by tracking brace depth
+    let (cond, true_branch, false_branch) = split_conditional(body);
+    
+    let cond_val = expand_format_for_window(&format!("#{{{}}}",cond), app, win_idx);
+    let is_true = !cond_val.is_empty() && cond_val != "0";
+    
+    if is_true {
+        expand_format_for_window(&true_branch, app, win_idx)
+    } else {
+        expand_format_for_window(&false_branch, app, win_idx)
+    }
+}
+
+/// Split conditional body `cond,true_branch,false_branch` respecting nested #{...}.
+fn split_conditional(s: &str) -> (String, String, String) {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut commas: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && commas.len() < 2 {
+        if i + 1 < bytes.len() && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'}' && depth > 0 {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b',' && depth == 0 {
+            commas.push(i);
+        }
+        i += 1;
+    }
+    match commas.len() {
+        0 => (s.to_string(), String::new(), String::new()),
+        1 => (s[..commas[0]].to_string(), s[commas[0]+1..].to_string(), String::new()),
+        _ => (s[..commas[0]].to_string(), s[commas[0]+1..commas[1]].to_string(), s[commas[1]+1..].to_string()),
+    }
 }

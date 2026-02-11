@@ -40,6 +40,10 @@ pub struct Window {
     pub active_path: Vec<usize>,
     pub name: String,
     pub id: usize,
+    /// Activity flag: set when pane output is received while window is not active
+    pub activity_flag: bool,
+    /// Last observed combined data_version for activity detection
+    pub last_seen_version: u64,
 }
 
 /// A menu item for display-menu
@@ -108,6 +112,11 @@ pub enum Mode {
         command: String,
         input: String,
     },
+    /// Copy-mode search input
+    CopySearch {
+        input: String,
+        forward: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,8 +139,17 @@ pub struct AppState {
     pub copy_anchor: Option<(u16,u16)>,
     pub copy_pos: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,
+    /// Copy-mode search query
+    pub copy_search_query: String,
+    /// Copy-mode search matches: (row, col_start, col_end) in screen coords
+    pub copy_search_matches: Vec<(u16, u16, u16)>,
+    /// Current match index in copy_search_matches
+    pub copy_search_idx: usize,
+    /// Search direction: true = forward (/), false = backward (?)
+    pub copy_search_forward: bool,
     pub display_map: Vec<(usize, Vec<usize>)>,
-    pub binds: Vec<Bind>,
+    /// Key tables: "prefix" (default), "root", "copy-mode-vi", "copy-mode-emacs", etc.
+    pub key_tables: std::collections::HashMap<String, Vec<Bind>>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_name: String,
@@ -177,6 +195,8 @@ pub struct AppState {
     pub word_separators: String,
     /// renumber-windows: auto-renumber on close
     pub renumber_windows: bool,
+    /// automatic-rename: update window name from active pane's running command
+    pub automatic_rename: bool,
     /// monitor-activity / visual-activity: stored for compat
     pub monitor_activity: bool,
     pub visual_activity: bool,
@@ -225,8 +245,12 @@ impl AppState {
             copy_anchor: None,
             copy_pos: None,
             copy_scroll_offset: 0,
+            copy_search_query: String::new(),
+            copy_search_matches: Vec::new(),
+            copy_search_idx: 0,
+            copy_search_forward: true,
             display_map: Vec::new(),
-            binds: Vec::new(),
+            key_tables: std::collections::HashMap::new(),
             control_rx: None,
             control_port: None,
             session_name,
@@ -254,6 +278,7 @@ impl AppState {
             default_shell: String::new(),
             word_separators: " -_@".to_string(),
             renumber_windows: false,
+            automatic_rename: true,
             monitor_activity: false,
             visual_activity: false,
             remain_on_exit: false,
@@ -370,7 +395,7 @@ pub enum CtrlReq {
     BreakPane,
     JoinPane(usize),
     RespawnPane,
-    BindKey(String, String),
+    BindKey(String, String, String),
     UnbindKey(String),
     ListKeys(mpsc::Sender<String>),
     SetOption(String, String),

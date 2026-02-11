@@ -475,11 +475,32 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); if !persistent { let _ = write!(write_stream, "ok\n"); } }
                     "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); if !persistent { let _ = write!(write_stream, "ok\n"); } }
                     "bind-key" | "bind" => {
-                        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                        let mut table = "prefix".to_string();
+                        let mut i = 0;
+                        while i < args.len() {
+                            if args[i] == "-T" && i + 1 < args.len() {
+                                table = args[i + 1].to_string();
+                                i += 2; continue;
+                            } else if args[i] == "-n" {
+                                table = "root".to_string();
+                            }
+                            i += 1;
+                        }
+                        let non_flag_args: Vec<&str> = {
+                            let mut out = Vec::new();
+                            let mut j = 0;
+                            while j < args.len() {
+                                if args[j] == "-T" { j += 2; continue; }
+                                if args[j].starts_with('-') { j += 1; continue; }
+                                out.push(args[j]);
+                                j += 1;
+                            }
+                            out
+                        };
                         if non_flag_args.len() >= 2 {
                             let key = non_flag_args[0].to_string();
                             let command = non_flag_args[1..].join(" ");
-                            let _ = tx.send(CtrlReq::BindKey(key, command));
+                            let _ = tx.send(CtrlReq::BindKey(table, key, command));
                         }
                     }
                     "unbind-key" | "unbind" => {
@@ -814,6 +835,38 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         v
     }
 
+    /// Per-window data version for activity detection
+    fn window_data_version(win: &Window) -> u64 {
+        let mut v = 0u64;
+        fn walk(node: &Node, v: &mut u64) {
+            match node {
+                Node::Leaf(p) => { *v = v.wrapping_add(p.data_version.load(std::sync::atomic::Ordering::Acquire)); }
+                Node::Split { children, .. } => { for c in children { walk(c, v); } }
+            }
+        }
+        walk(&win.root, &mut v);
+        v
+    }
+
+    /// Check non-active windows for output activity and set their activity_flag
+    fn check_window_activity(app: &mut AppState) {
+        if !app.monitor_activity { return; }
+        let active = app.active_idx;
+        for (i, win) in app.windows.iter_mut().enumerate() {
+            if i == active {
+                // Active window: clear flag, update version
+                win.activity_flag = false;
+                win.last_seen_version = window_data_version(win);
+                continue;
+            }
+            let cur = window_data_version(win);
+            if cur != win.last_seen_version {
+                win.activity_flag = true;
+                win.last_seen_version = cur;
+            }
+        }
+    }
+
     loop {
         let mut sent_pty_input = false;
         let mut did_work = false;
@@ -837,6 +890,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     meta_dirty = false;
                 }
                 let layout_json = dump_layout_json_fast(&mut app)?;
+                // automatic-rename: copy active pane's inferred title to window name
+                if app.automatic_rename {
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(p) = active_pane(&win.root, &win.active_path) {
+                        if !p.title.is_empty() && win.name != p.title {
+                            win.name = p.title.clone();
+                            meta_dirty = true; // window list changed
+                        }
+                    }
+                }
+                // monitor-activity: flag non-active windows with output
+                check_window_activity(&mut app);
                 combined_buf.clear();
                 let ss_escaped = cached_status_style.replace('"', "\\\"" );
                 let sl_expanded = expand_format(&app.status_left, &app).replace('"', "\\\"");
@@ -1238,55 +1303,60 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::RespawnPane => {
                     respawn_active_pane(&mut app)?;
                 }
-                CtrlReq::BindKey(key, command) => {
+                CtrlReq::BindKey(table_name, key, command) => {
                     if let Some(kc) = parse_key_string(&key) {
                         let action = parse_command_to_action(&command);
                         if let Some(act) = action {
-                            app.binds.retain(|b| b.key != kc);
-                            app.binds.push(Bind { key: kc, action: act });
+                            let table = app.key_tables.entry(table_name).or_default();
+                            table.retain(|b| b.key != kc);
+                            table.push(Bind { key: kc, action: act });
                         }
                     }
                 }
                 CtrlReq::UnbindKey(key) => {
                     if let Some(kc) = parse_key_string(&key) {
-                        app.binds.retain(|b| b.key != kc);
+                        for table in app.key_tables.values_mut() {
+                            table.retain(|b| b.key != kc);
+                        }
                     }
                 }
                 CtrlReq::ListKeys(resp) => {
                     let mut output = String::from(
-                        "bind-key c new-window\n\
-                         bind-key n next-window\n\
-                         bind-key p previous-window\n\
-                         bind-key % split-window -h\n\
-                         bind-key \" split-window -v\n\
-                         bind-key x kill-pane\n\
-                         bind-key d detach-client\n\
-                         bind-key w choose-window\n\
-                         bind-key , rename-window\n\
-                         bind-key $ rename-session\n\
-                         bind-key space next-layout\n\
-                         bind-key [ copy-mode\n\
-                         bind-key ] paste-buffer\n\
-                         bind-key : command-prompt\n\
-                         bind-key q display-panes\n\
-                         bind-key z resize-pane -Z\n\
-                         bind-key o select-pane -t +\n\
-                         bind-key ; last-pane\n\
-                         bind-key l last-window\n\
-                         bind-key { swap-pane -U\n\
-                         bind-key } swap-pane -D\n\
-                         bind-key ! break-pane\n\
-                         bind-key & kill-window\n\
-                         bind-key Up select-pane -U\n\
-                         bind-key Down select-pane -D\n\
-                         bind-key Left select-pane -L\n\
-                         bind-key Right select-pane -R\n\
-                         bind-key ? list-keys\n"
+                        "bind-key -T prefix c new-window\n\
+                         bind-key -T prefix n next-window\n\
+                         bind-key -T prefix p previous-window\n\
+                         bind-key -T prefix % split-window -h\n\
+                         bind-key -T prefix \" split-window -v\n\
+                         bind-key -T prefix x kill-pane\n\
+                         bind-key -T prefix d detach-client\n\
+                         bind-key -T prefix w choose-window\n\
+                         bind-key -T prefix , rename-window\n\
+                         bind-key -T prefix $ rename-session\n\
+                         bind-key -T prefix space next-layout\n\
+                         bind-key -T prefix [ copy-mode\n\
+                         bind-key -T prefix ] paste-buffer\n\
+                         bind-key -T prefix : command-prompt\n\
+                         bind-key -T prefix q display-panes\n\
+                         bind-key -T prefix z resize-pane -Z\n\
+                         bind-key -T prefix o select-pane -t +\n\
+                         bind-key -T prefix ; last-pane\n\
+                         bind-key -T prefix l last-window\n\
+                         bind-key -T prefix { swap-pane -U\n\
+                         bind-key -T prefix } swap-pane -D\n\
+                         bind-key -T prefix ! break-pane\n\
+                         bind-key -T prefix & kill-window\n\
+                         bind-key -T prefix Up select-pane -U\n\
+                         bind-key -T prefix Down select-pane -D\n\
+                         bind-key -T prefix Left select-pane -L\n\
+                         bind-key -T prefix Right select-pane -R\n\
+                         bind-key -T prefix ? list-keys\n"
                     );
-                    for bind in &app.binds {
-                        let key_str = format_key_binding(&bind.key);
-                        let action_str = format_action(&bind.action);
-                        output.push_str(&format!("bind-key {} {}\n", key_str, action_str));
+                    for (table_name, binds) in &app.key_tables {
+                        for bind in binds {
+                            let key_str = format_key_binding(&bind.key);
+                            let action_str = format_action(&bind.action);
+                            output.push_str(&format!("bind-key -T {} {} {}\n", table_name, key_str, action_str));
+                        }
                     }
                     let _ = resp.send(output);
                 }
@@ -1344,6 +1414,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         "aggressive-resize" => { app.aggressive_resize = matches!(value.as_str(), "on" | "true" | "1"); }
                         "monitor-activity" => { app.monitor_activity = matches!(value.as_str(), "on" | "true" | "1"); }
                         "visual-activity" => { app.visual_activity = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "synchronize-panes" => { app.sync_input = matches!(value.as_str(), "on" | "true" | "1"); }
+                        "automatic-rename" => { app.automatic_rename = matches!(value.as_str(), "on" | "true" | "1"); }
                         "prediction-dimming" | "dim-predictions" => {
                             app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
                         }
@@ -1374,6 +1446,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     output.push_str(&format!("mode-keys {}\n", app.mode_keys));
                     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
                     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
+                    output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
+                    output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
+                    output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
                     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
                     output.push_str(&format!("set-titles {}\n", if app.set_titles { "on" } else { "off" }));
                     output.push_str(&format!(

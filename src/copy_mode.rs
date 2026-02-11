@@ -212,6 +212,69 @@ pub fn save_latest_buffer(app: &mut AppState, file: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Search the active pane's screen content for a query string.
+/// Populates `app.copy_search_matches` with (row, col_start, col_end) tuples.
+/// If forward is true, sorts matches top-to-bottom; otherwise bottom-to-top.
+pub fn search_copy_mode(app: &mut AppState, query: &str, forward: bool) {
+    app.copy_search_matches.clear();
+    app.copy_search_idx = 0;
+    if query.is_empty() { return; }
+
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    let screen = parser.screen();
+    let query_lower = query.to_lowercase();
+    let qlen = query_lower.len() as u16;
+
+    // Scan all visible rows
+    for r in 0..p.last_rows {
+        // Build the row text
+        let mut row_text = String::with_capacity(p.last_cols as usize);
+        for c in 0..p.last_cols {
+            if let Some(cell) = screen.cell(r, c) {
+                let t = cell.contents();
+                if t.is_empty() { row_text.push(' '); } else { row_text.push_str(t); }
+            } else {
+                row_text.push(' ');
+            }
+        }
+        // Case-insensitive search
+        let row_lower = row_text.to_lowercase();
+        let mut start = 0;
+        while let Some(pos) = row_lower[start..].find(&query_lower) {
+            let col_start = (start + pos) as u16;
+            let col_end = col_start + qlen;
+            app.copy_search_matches.push((r, col_start, col_end));
+            start += pos + 1;
+        }
+    }
+
+    if !forward {
+        app.copy_search_matches.reverse();
+    }
+}
+
+/// Jump to the next search match in copy mode.
+pub fn search_next(app: &mut AppState) {
+    if app.copy_search_matches.is_empty() { return; }
+    app.copy_search_idx = (app.copy_search_idx + 1) % app.copy_search_matches.len();
+    let (r, c, _) = app.copy_search_matches[app.copy_search_idx];
+    app.copy_pos = Some((r, c));
+}
+
+/// Jump to the previous search match in copy mode.
+pub fn search_prev(app: &mut AppState) {
+    if app.copy_search_matches.is_empty() { return; }
+    if app.copy_search_idx == 0 {
+        app.copy_search_idx = app.copy_search_matches.len() - 1;
+    } else {
+        app.copy_search_idx -= 1;
+    }
+    let (r, c, _) = app.copy_search_matches[app.copy_search_idx];
+    app.copy_pos = Some((r, c));
+}
+
 pub fn capture_active_pane_range(app: &mut AppState, s: Option<u16>, e: Option<u16>) -> io::Result<Option<String>> {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };

@@ -170,6 +170,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 Mode::RenamePrompt { .. } => "REN", 
                 Mode::RenameSessionPrompt { .. } => "REN-S",
                 Mode::CopyMode => "CPY", 
+                Mode::CopySearch { .. } => "SEARCH",
                 Mode::PaneChooser { .. } => "PANE",
                 Mode::MenuMode { .. } => "MENU",
                 Mode::PopupMode { .. } => "POPUP",
@@ -354,6 +355,22 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 
                 f.render_widget(Clear, confirm_area);
                 f.render_widget(para, confirm_area);
+            }
+
+            // Render Copy-mode search prompt
+            if let Mode::CopySearch { input, forward } = &app.mode {
+                let dir = if *forward { "/" } else { "?" };
+                let width = (input.len() as u16 + 10).min(80).max(30);
+                let search_area = Rect {
+                    x: area.x,
+                    y: area.y + area.height.saturating_sub(2),
+                    width: width.min(area.width),
+                    height: 1,
+                };
+                let text = format!("{}{}", dir, input);
+                let para = Paragraph::new(text)
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black));
+                f.render_widget(para, search_area);
             }
         })?;
 

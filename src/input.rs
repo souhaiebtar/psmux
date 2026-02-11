@@ -58,7 +58,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             let elapsed = armed_at.elapsed().as_millis() as u64;
             
             let key_tuple = (key.code, key.modifiers);
-            if let Some(bind) = app.binds.iter().find(|b| b.key == key_tuple).cloned() {
+            if let Some(bind) = app.key_tables.get("prefix").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 app.mode = Mode::Passthrough;
                 return execute_action(app, &bind.action);
             }
@@ -331,6 +331,47 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('G') => { scroll_to_bottom(app); }
                 KeyCode::Char('v') => { if let Some((r,c)) = current_prompt_pos(app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+                // --- copy-mode search ---
+                KeyCode::Char('/') => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                }
+                KeyCode::Char('?') => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                }
+                KeyCode::Char('n') => { search_next(app); }
+                KeyCode::Char('N') => { search_prev(app); }
+                _ => {}
+            }
+            Ok(false)
+        }
+        Mode::CopySearch { .. } => {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel search, return to copy mode
+                    app.mode = Mode::CopyMode;
+                }
+                KeyCode::Enter => {
+                    // Execute search
+                    if let Mode::CopySearch { ref input, forward } = app.mode {
+                        let query = input.clone();
+                        let fwd = forward;
+                        app.copy_search_query = query.clone();
+                        app.copy_search_forward = fwd;
+                        search_copy_mode(app, &query, fwd);
+                        // Jump to first match
+                        if !app.copy_search_matches.is_empty() {
+                            let (r, c, _) = app.copy_search_matches[0];
+                            app.copy_pos = Some((r, c));
+                        }
+                    }
+                    app.mode = Mode::CopyMode;
+                }
+                KeyCode::Backspace => {
+                    if let Mode::CopySearch { ref mut input, .. } = app.mode { let _ = input.pop(); }
+                }
+                KeyCode::Char(c) => {
+                    if let Mode::CopySearch { ref mut input, .. } = app.mode { input.push(c); }
+                }
                 _ => {}
             }
             Ok(false)
@@ -487,35 +528,51 @@ pub fn move_focus(app: &mut AppState, dir: FocusDir) {
 }
 
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
-    let win = &mut app.windows[app.active_idx];
-    let Some(active) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
-    match key.code {
+    // Encode the key into bytes
+    let encoded: Vec<u8> = match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-            let _ = active.master.write_all(&[0x1b, ctrl_char]);
+            vec![0x1b, ctrl_char]
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
-            let _ = write!(active.master, "\x1b{}", c);
+            format!("\x1b{}", c).into_bytes()
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-            let _ = active.master.write_all(&[ctrl_char]);
+            vec![ctrl_char]
         }
         KeyCode::Char(c) if (c as u8) >= 0x01 && (c as u8) <= 0x1A => {
-            let _ = active.master.write_all(&[c as u8]);
+            vec![c as u8]
         }
         KeyCode::Char(c) => {
-            let _ = write!(active.master, "{}", c);
+            format!("{}", c).into_bytes()
         }
-        KeyCode::Enter => { let _ = write!(active.master, "\r"); }
-        KeyCode::Tab => { let _ = write!(active.master, "\t"); }
-        KeyCode::Backspace => { let _ = write!(active.master, "\x08"); }
-        KeyCode::Esc => { let _ = write!(active.master, "\x1b"); }
-        KeyCode::Left => { let _ = write!(active.master, "\x1b[D"); }
-        KeyCode::Right => { let _ = write!(active.master, "\x1b[C"); }
-        KeyCode::Up => { let _ = write!(active.master, "\x1b[A"); }
-        KeyCode::Down => { let _ = write!(active.master, "\x1b[B"); }
-        _ => {}
+        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::Backspace => b"\x08".to_vec(),
+        KeyCode::Esc => b"\x1b".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        _ => return Ok(()),
+    };
+
+    if app.sync_input {
+        // Fan out to ALL panes in the current window
+        let win = &mut app.windows[app.active_idx];
+        fn write_all_panes(node: &mut Node, data: &[u8]) {
+            match node {
+                Node::Leaf(p) => { let _ = p.master.write_all(data); }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
+            }
+        }
+        write_all_panes(&mut win.root, &encoded);
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = active.master.write_all(&encoded);
+        }
     }
     Ok(())
 }
@@ -719,10 +776,22 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 }
 
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
-    let win = &mut app.windows[app.active_idx];
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-        let _ = p.master.write_all(text.as_bytes());
-        let _ = p.master.flush(); // push to ConPTY immediately
+    if app.sync_input {
+        // Fan out to ALL panes in the current window
+        let win = &mut app.windows[app.active_idx];
+        fn write_all_panes(node: &mut Node, text: &[u8]) {
+            match node {
+                Node::Leaf(p) => { let _ = p.master.write_all(text); let _ = p.master.flush(); }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, text); } }
+            }
+        }
+        write_all_panes(&mut win.root, text.as_bytes());
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = p.master.write_all(text.as_bytes());
+            let _ = p.master.flush();
+        }
     }
     Ok(())
 }

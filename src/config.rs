@@ -216,7 +216,12 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "window-status-format" => { app.window_status_format = value.to_string(); }
         "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
         "window-status-separator" => { app.window_status_separator = value.to_string(); }
-        "automatic-rename" => {}
+        "automatic-rename" => {
+            app.automatic_rename = matches!(value, "on" | "true" | "1");
+        }
+        "synchronize-panes" => {
+            app.sync_input = matches!(value, "on" | "true" | "1");
+        }
         "allow-rename" => {}
         "terminal-overrides" => {}
         "default-terminal" => {}
@@ -269,8 +274,9 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
     
     if let Some(key) = parse_key_name(key_str) {
         if let Some(action) = parse_command_to_action(&command) {
-            app.binds.retain(|b| b.key != key);
-            app.binds.push(Bind { key, action });
+            let table = app.key_tables.entry(_key_table).or_default();
+            table.retain(|b| b.key != key);
+            table.push(Bind { key, action });
         }
     }
 }
@@ -294,13 +300,16 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
     }
     
     if unbind_all {
-        app.binds.clear();
+        app.key_tables.clear();
         return;
     }
     
     if i < parts.len() {
         if let Some(key) = parse_key_name(parts[i]) {
-            app.binds.retain(|b| b.key != key);
+            // Remove from all tables
+            for table in app.key_tables.values_mut() {
+                table.retain(|b| b.key != key);
+            }
         }
     }
 }
