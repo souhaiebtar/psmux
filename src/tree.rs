@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use ratatui::prelude::*;
 
 use crate::types::*;
+use crate::platform::process_kill;
 
 /// Split an area into sub-rects with 1px gaps between them for separator lines.
 /// Matches tmux-style gapless panes with single-character separators.
@@ -79,10 +80,12 @@ pub fn kill_leaf(node: &mut Node, path: &Vec<usize>) {
     *node = remove_node(std::mem::replace(node, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] }), path);
 }
 
-/// Kill a node and all its child processes before dropping it
+/// Kill a node and all its child processes before dropping it.
+/// Uses platform-specific process tree killing to ensure all descendant
+/// processes (shells, sub-processes, servers, etc.) are terminated.
 pub fn kill_node(mut n: Node) {
     match &mut n {
-        Node::Leaf(p) => { let _ = p.child.kill(); }
+        Node::Leaf(p) => { process_kill::kill_process_tree(&mut p.child); }
         Node::Split { children, .. } => {
             for child in children.iter_mut() {
                 kill_all_children(child);
@@ -188,7 +191,7 @@ pub fn resize_all_panes(app: &mut AppState) {
 
 pub fn kill_all_children(node: &mut Node) {
     match node {
-        Node::Leaf(p) => { let _ = p.child.kill(); }
+        Node::Leaf(p) => { process_kill::kill_process_tree(&mut p.child); }
         Node::Split { children, .. } => { for child in children.iter_mut() { kill_all_children(child); } }
     }
 }
@@ -391,11 +394,23 @@ pub fn focus_pane_by_index(app: &mut AppState, idx: usize) {
     }
 }
 
-/// Count the number of leaf nodes in a tree
-fn count_leaves(node: &Node) -> usize {
+/// Count the number of leaf (pane) nodes in a tree.
+pub fn count_panes(node: &Node) -> usize {
     match node {
         Node::Leaf(_) => 1,
-        Node::Split { children, .. } => children.iter().map(count_leaves).sum(),
+        Node::Split { children, .. } => children.iter().map(count_panes).sum(),
+    }
+}
+
+/// Immutable reference to the active pane (follows path through splits).
+pub fn active_pane<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Pane> {
+    match node {
+        Node::Leaf(p) => Some(p),
+        Node::Split { children, .. } => {
+            if path.is_empty() { return None; }
+            let idx = path[0].min(children.len().saturating_sub(1));
+            active_pane(&children[idx], &path[1..])
+        }
     }
 }
 
@@ -403,11 +418,11 @@ fn count_leaves(node: &Node) -> usize {
 pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
     let mut any_pruned = false;
     for i in (0..app.windows.len()).rev() {
-        let leaves_before = count_leaves(&app.windows[i].root);
+        let leaves_before = count_panes(&app.windows[i].root);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
         match prune_exited(root) {
             Some(new_root) => {
-                let leaves_after = count_leaves(&new_root);
+                let leaves_after = count_panes(&new_root);
                 if leaves_after < leaves_before {
                     any_pruned = true;
                 }

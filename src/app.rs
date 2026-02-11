@@ -32,60 +32,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         .get()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
 
-    let mut app = AppState {
-        windows: Vec::new(),
-        active_idx: 0,
-        mode: Mode::Passthrough,
-        escape_time_ms: 500,
-        prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
-        prediction_dimming: crate::rendering::dim_predictions_enabled(),
-        drag: None,
-        last_window_area: Rect { x: 0, y: 0, width: 0, height: 0 },
-        mouse_enabled: true,
-        paste_buffers: Vec::new(),
-        status_left: "psmux:#I".to_string(),
-        status_right: "%H:%M".to_string(),
-        window_base_index: 1,
-        copy_anchor: None,
-        copy_pos: None,
-        copy_scroll_offset: 0,
-        display_map: Vec::new(),
-        binds: Vec::new(),
-        control_rx: None,
-        control_port: None,
-        session_name: env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string()),
-        attached_clients: 1,
-        created_at: Local::now(),
-        next_win_id: 1,
-        next_pane_id: 1,
-        zoom_saved: None,
-        sync_input: false,
-        hooks: std::collections::HashMap::new(),
-        wait_channels: std::collections::HashMap::new(),
-        pipe_panes: Vec::new(),
-        last_window_idx: 0,
-        last_pane_path: Vec::new(),
-        tab_positions: Vec::new(),
-        history_limit: 2000,
-        display_time_ms: 750,
-        display_panes_time_ms: 1000,
-        pane_base_index: 0,
-        focus_events: false,
-        mode_keys: "emacs".to_string(),
-        status_visible: true,
-        status_position: "bottom".to_string(),
-        status_style: String::new(),
-        default_shell: String::new(),
-        word_separators: " -_@".to_string(),
-        renumber_windows: false,
-        monitor_activity: false,
-        visual_activity: false,
-        remain_on_exit: false,
-        aggressive_resize: false,
-        set_titles: false,
-        set_titles_string: String::new(),
-        environment: std::collections::HashMap::new(),
-    };
+    let mut app = AppState::new(
+        env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string())
+    );
+    app.last_window_area = Rect { x: 0, y: 0, width: 0, height: 0 };
+    app.attached_clients = 1;
 
     load_config(&mut app);
 
@@ -217,6 +168,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 Mode::CommandPrompt { .. } => ":", 
                 Mode::WindowChooser { .. } => "W", 
                 Mode::RenamePrompt { .. } => "REN", 
+                Mode::RenameSessionPrompt { .. } => "REN-S",
                 Mode::CopyMode => "CPY", 
                 Mode::PaneChooser { .. } => "PANE",
                 Mode::MenuMode { .. } => "MENU",
@@ -282,6 +234,13 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
             if let Mode::RenamePrompt { input } = &app.mode {
                 let overlay = Paragraph::new(format!("rename: {}", input)).block(Block::default().borders(Borders::ALL).title("rename window"));
+                let oa = centered_rect(60, 3, area);
+                f.render_widget(Clear, oa);
+                f.render_widget(overlay, oa);
+            }
+
+            if let Mode::RenameSessionPrompt { input } = &app.mode {
+                let overlay = Paragraph::new(format!("rename: {}", input)).block(Block::default().borders(Borders::ALL).title("rename session"));
                 let oa = centered_rect(60, 3, area);
                 f.render_widget(Clear, oa);
                 f.render_widget(overlay, oa);

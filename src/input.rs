@@ -10,7 +10,8 @@ use crate::tree::*;
 use crate::pane::*;
 use crate::commands::*;
 use crate::copy_mode::*;
-use crate::layout::cycle_top_layout;
+use crate::layout::{cycle_top_layout, apply_layout};
+use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
 fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
@@ -63,6 +64,32 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             }
             
             let handled = match key.code {
+                // Alt+Arrow: resize pane by 5 (must be before plain arrows)
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_vertical(app, -5); true
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_vertical(app, 5); true
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_horizontal(app, -5); true
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_horizontal(app, 5); true
+                }
+                // Ctrl+Arrow: resize pane by 1 (must be before plain arrows)
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_vertical(app, -1); true
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_vertical(app, 1); true
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_horizontal(app, -1); true
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_horizontal(app, 1); true
+                }
                 KeyCode::Left => { move_focus(app, FocusDir::Left); true }
                 KeyCode::Right => { move_focus(app, FocusDir::Right); true }
                 KeyCode::Up => { move_focus(app, FocusDir::Up); true }
@@ -105,7 +132,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('x') => {
-                    kill_active_pane(app)?;
+                    app.mode = Mode::ConfirmMode {
+                        prompt: "kill-pane? (y/n)".into(),
+                        command: "kill-pane".into(),
+                        input: String::new(),
+                    };
                     true
                 }
                 KeyCode::Char('d') => {
@@ -130,6 +161,90 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         if n <= 10 { app.display_map.push((n, path)); } else { break; }
                     }
                     app.mode = Mode::PaneChooser { opened_at: Instant::now() };
+                    true
+                }
+                // --- zoom pane (z) ---
+                KeyCode::Char('z') => { toggle_zoom(app); true }
+                // --- next pane (o) ---
+                KeyCode::Char('o') => {
+                    let win = &app.windows[app.active_idx];
+                    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+                    compute_rects(&win.root, app.last_window_area, &mut rects);
+                    if let Some(cur) = rects.iter().position(|r| r.0 == win.active_path) {
+                        let next = (cur + 1) % rects.len();
+                        let new_path = rects[next].0.clone();
+                        let win = &mut app.windows[app.active_idx];
+                        app.last_pane_path = win.active_path.clone();
+                        win.active_path = new_path;
+                    }
+                    true
+                }
+                // --- last pane (;) ---
+                KeyCode::Char(';') => {
+                    let win = &mut app.windows[app.active_idx];
+                    if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
+                        let tmp = win.active_path.clone();
+                        win.active_path = app.last_pane_path.clone();
+                        app.last_pane_path = tmp;
+                    }
+                    true
+                }
+                // --- last window (l) ---
+                KeyCode::Char('l') => {
+                    if app.last_window_idx < app.windows.len() {
+                        let tmp = app.active_idx;
+                        app.active_idx = app.last_window_idx;
+                        app.last_window_idx = tmp;
+                    }
+                    true
+                }
+                // --- swap pane up/left ({) ---
+                KeyCode::Char('{') => { swap_pane(app, FocusDir::Up); true }
+                // --- swap pane down/right (}) ---
+                KeyCode::Char('}') => { swap_pane(app, FocusDir::Down); true }
+                // --- break pane to new window (!) ---
+                KeyCode::Char('!') => { break_pane_to_window(app); true }
+                // --- kill window (&) with confirmation ---
+                KeyCode::Char('&') => {
+                    app.mode = Mode::ConfirmMode {
+                        prompt: "kill-window? (y/n)".into(),
+                        command: "kill-window".into(),
+                        input: String::new(),
+                    };
+                    true
+                }
+                // --- rename session ($) ---
+                KeyCode::Char('$') => {
+                    app.mode = Mode::RenameSessionPrompt { input: String::new() };
+                    true
+                }
+                // --- Meta+1..5 preset layouts (like tmux) ---
+                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "even-horizontal"); true
+                }
+                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "even-vertical"); true
+                }
+                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "main-horizontal"); true
+                }
+                KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "main-vertical"); true
+                }
+                KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "tiled"); true
+                }
+                // --- display pane info (i) ---
+                KeyCode::Char('i') => {
+                    // Display window/pane info in status bar (tmux prefix+i)
+                    let win = &app.windows[app.active_idx];
+                    let pane_count = crate::tree::count_panes(&win.root);
+                    app.status_right = format!(
+                        "#{} ({}) [{}x{}] panes:{}", 
+                        app.active_idx, win.name,
+                        app.last_window_area.width, app.last_window_area.height,
+                        pane_count
+                    );
                     true
                 }
                 _ => false,
@@ -173,6 +288,21 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Enter => { if let Mode::RenamePrompt { input } = &mut app.mode { app.windows[app.active_idx].name = input.clone(); app.mode = Mode::Passthrough; } }
                 KeyCode::Backspace => { if let Mode::RenamePrompt { input } = &mut app.mode { let _ = input.pop(); } }
                 KeyCode::Char(c) => { if let Mode::RenamePrompt { input } = &mut app.mode { input.push(c); } }
+                _ => {}
+            }
+            Ok(false)
+        }
+        Mode::RenameSessionPrompt { .. } => {
+            match key.code {
+                KeyCode::Esc => { app.mode = Mode::Passthrough; }
+                KeyCode::Enter => {
+                    if let Mode::RenameSessionPrompt { input } = &mut app.mode {
+                        app.session_name = input.clone();
+                        app.mode = Mode::Passthrough;
+                    }
+                }
+                KeyCode::Backspace => { if let Mode::RenameSessionPrompt { input } = &mut app.mode { let _ = input.pop(); } }
+                KeyCode::Char(c) => { if let Mode::RenameSessionPrompt { input } = &mut app.mode { input.push(c); } }
                 _ => {}
             }
             Ok(false)

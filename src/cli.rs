@@ -18,18 +18,26 @@ USAGE:
 
 COMMANDS:
     (no command)        Start a new session or attach to existing one
-    new-session         Create a new session
+    new-session, new    Create a new session
         -s <name>       Session name (default: "default")
-        -d              Start detached (in background)        -- <cmd> [args] Run a specific command instead of the default shell    attach, attach-session
+        -d              Start detached (in background)
+        -- <cmd> [args] Run a specific command instead of the default shell
+    a, at, attach, attach-session
                         Attach to an existing session
         -t <name>       Target session name
     ls, list-sessions   List all active sessions
-    new-window          Create a new window in current session
-    split-window        Split current pane
+    new-window, neww    Create a new window in current session
+    split-window, splitw Split current pane
         -h              Split horizontally (side by side)
         -v              Split vertically (top/bottom, default)
-    kill-pane           Close the current pane
-    capture-pane        Capture the content of current pane
+    kill-pane, killp    Close the current pane
+    kill-window, killw  Close the current window
+    kill-session, kill-ses
+                        Kill a session
+    kill-server         Kill all sessions
+    capture-pane, capturep
+                        Capture the content of current pane
+    send-keys, send     Send keys to a pane
     server              Run as a server (internal use)
     help                Show this help message
     version             Show version information

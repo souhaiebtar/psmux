@@ -12,6 +12,7 @@ mod input;
 mod layout;
 mod window_ops;
 mod util;
+mod format;
 mod server;
 mod client;
 mod app;
@@ -168,7 +169,7 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            "attach" | "attach-session" => {
+            "a" | "at" | "attach" | "attach-session" => {
                 let name = args
                     .iter()
                     .position(|a| a == "-t")
@@ -284,7 +285,7 @@ fn main() -> io::Result<()> {
                     // Continue to attach below...
                 }
             }
-            "new-window" => {
+            "new-window" | "neww" => {
                 // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
                 let cmd_arg = cmd_args.iter().skip(1).find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("");
                 if cmd_arg.is_empty() {
@@ -295,7 +296,7 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            "split-window" => {
+            "split-window" | "splitw" => {
                 let flag = if cmd_args.iter().any(|a| *a == "-h") { "-h" } else { "-v" };
                 // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
                 let cmd_arg = cmd_args.iter().skip(1).find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("");
@@ -307,8 +308,8 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            "kill-pane" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
-            "capture-pane" => {
+            "kill-pane" | "killp" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
+            "capture-pane" | "capturep" => {
                 // Parse optional flags - cmd_args[0] is command, start from 1
                 let mut cmd = "capture-pane".to_string();
                 let mut i = 1;
@@ -351,7 +352,7 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             // send-keys - Send keys to a pane (critical for scripting)
-            "send-keys" | "send" => {
+            "send-keys" | "send" | "send-key" => {
                 let mut literal = false;
                 let mut keys: Vec<String> = Vec::new();
                 // Skip the command itself (index 0 in cmd_args), start at index 1
@@ -495,7 +496,7 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             // kill-session - Kill a session
-            "kill-session" => {
+            "kill-session" | "kill-ses" => {
                 let mut target: Option<String> = None;
                 let mut i = 1;
                 while i < cmd_args.len() {
@@ -818,7 +819,7 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             // respawn-pane - Restart the pane's process
-            "respawn-pane" | "respawnp" => {
+            "respawn-pane" | "respawnp" | "resp" => {
                 let mut cmd = "respawn-pane".to_string();
                 let mut i = 1;
                 while i < cmd_args.len() {
@@ -1049,11 +1050,13 @@ fn main() -> io::Result<()> {
                         // Treat condition as format string - non-empty and non-zero is true
                         !cond.is_empty() && cond != "0"
                     } else {
-                        // Run shell command
+                        // Run shell command - suppress stdout/stderr so it doesn't leak to terminal
                         #[cfg(windows)]
                         {
                             std::process::Command::new("cmd")
                                 .args(["/C", &cond])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
                                 .status()
                                 .map(|s| s.success())
                                 .unwrap_or(false)
@@ -1062,6 +1065,8 @@ fn main() -> io::Result<()> {
                         {
                             std::process::Command::new("sh")
                                 .args(["-c", &cond])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
                                 .status()
                                 .map(|s| s.success())
                                 .unwrap_or(false)
@@ -1071,12 +1076,19 @@ fn main() -> io::Result<()> {
                     let cmd_to_run = if success { Some(true_cmd) } else { cmd_false };
                     
                     if let Some(cmd) = cmd_to_run {
-                        if background {
-                            // Run in background
-                            send_control(format!("{}\n", cmd))?;
+                        // Re-quote multi-word arguments for TCP transport
+                        let needs_quoting = cmd.contains(' ');
+                        let tcp_cmd = if needs_quoting {
+                            // The command string may contain spaces (e.g. "display-message -p hello")
+                            // Send it as-is since it's already a full command line
+                            format!("{}\n", cmd)
                         } else {
-                            // Execute as psmux command
-                            send_control(format!("{}\n", cmd))?;
+                            format!("{}\n", cmd)
+                        };
+                        // Use send_control_with_response to capture any output from the chosen command
+                        let resp = send_control_with_response(tcp_cmd)?;
+                        if !resp.is_empty() {
+                            print!("{}", resp);
                         }
                     }
                 }

@@ -114,7 +114,16 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
             Err(_) => break,
         }
     }
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    let result = String::from_utf8_lossy(&buf).to_string();
+    // Strip the "OK\n" AUTH response prefix if present
+    let result = if result.starts_with("OK\n") {
+        result[3..].to_string()
+    } else if result.starts_with("OK\r\n") {
+        result[4..].to_string()
+    } else {
+        result
+    };
+    Ok(result)
 }
 
 /// Send a control message to a specific port

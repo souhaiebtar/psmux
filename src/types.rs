@@ -88,6 +88,7 @@ pub enum Mode {
     CommandPrompt { input: String },
     WindowChooser { selected: usize },
     RenamePrompt { input: String },
+    RenameSessionPrompt { input: String },
     CopyMode,
     PaneChooser { opened_at: Instant },
     /// Interactive menu mode
@@ -189,6 +190,84 @@ pub struct AppState {
     pub set_titles_string: String,
     /// Environment variables set via set-environment
     pub environment: std::collections::HashMap<String, String>,
+    /// pane-border-style: style for inactive pane borders
+    pub pane_border_style: String,
+    /// pane-active-border-style: style for active pane borders
+    pub pane_active_border_style: String,
+    /// window-status-format: format for inactive window tabs
+    pub window_status_format: String,
+    /// window-status-current-format: format for active window tab
+    pub window_status_current_format: String,
+    /// window-status-separator: between window status entries
+    pub window_status_separator: String,
+}
+
+impl AppState {
+    /// Create a new AppState with sensible defaults.
+    /// Caller should set `session_name` and call `load_config()` after construction.
+    pub fn new(session_name: String) -> Self {
+        Self {
+            windows: Vec::new(),
+            active_idx: 0,
+            mode: Mode::Passthrough,
+            escape_time_ms: 500,
+            prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+            prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            drag: None,
+            last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
+            mouse_enabled: true,
+            paste_buffers: Vec::new(),
+            status_left: "psmux:#I".to_string(),
+            status_right: "%H:%M".to_string(),
+            window_base_index: 1,
+            copy_anchor: None,
+            copy_pos: None,
+            copy_scroll_offset: 0,
+            display_map: Vec::new(),
+            binds: Vec::new(),
+            control_rx: None,
+            control_port: None,
+            session_name,
+            attached_clients: 0,
+            created_at: Local::now(),
+            next_win_id: 1,
+            next_pane_id: 1,
+            zoom_saved: None,
+            sync_input: false,
+            hooks: std::collections::HashMap::new(),
+            wait_channels: std::collections::HashMap::new(),
+            pipe_panes: Vec::new(),
+            last_window_idx: 0,
+            last_pane_path: Vec::new(),
+            tab_positions: Vec::new(),
+            history_limit: 2000,
+            display_time_ms: 750,
+            display_panes_time_ms: 1000,
+            pane_base_index: 0,
+            focus_events: false,
+            mode_keys: "emacs".to_string(),
+            status_visible: true,
+            status_position: "bottom".to_string(),
+            status_style: String::new(),
+            default_shell: String::new(),
+            word_separators: " -_@".to_string(),
+            renumber_windows: false,
+            monitor_activity: false,
+            visual_activity: false,
+            remain_on_exit: false,
+            aggressive_resize: false,
+            set_titles: false,
+            set_titles_string: String::new(),
+            environment: std::collections::HashMap::new(),
+            pane_border_style: String::new(),
+            pane_active_border_style: "fg=green".to_string(),
+            window_status_format: "#I:#W#F".to_string(),
+            window_status_current_format: "#I:#W#F".to_string(),
+            window_status_separator: " ".to_string(),
+        }
+    }
 }
 
 pub struct DragState {

@@ -60,10 +60,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         }
     }
     else if l.starts_with("run-shell ") || l.starts_with("run ") {
-        // Silently accept run-shell (tmux compat) — could execute in future
+        parse_run_shell(app, l);
     }
     else if l.starts_with("if-shell ") || l.starts_with("if ") {
-        // Silently accept if-shell (tmux compat) — complex conditional not supported
+        parse_if_shell(app, l);
     }
     else if l.starts_with("set-hook ") {
         // Parse set-hook: set-hook [-g] hook-name command
@@ -211,11 +211,11 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             app.set_titles_string = value.to_string();
         }
         "status-keys" => {}
-        "pane-border-style" => {}
-        "pane-active-border-style" => {}
-        "window-status-format" => {}
-        "window-status-current-format" => {}
-        "window-status-separator" => {}
+        "pane-border-style" => { app.pane_border_style = value.to_string(); }
+        "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }
+        "window-status-format" => { app.window_status_format = value.to_string(); }
+        "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
+        "window-status-separator" => { app.window_status_separator = value.to_string(); }
         "automatic-rename" => {}
         "allow-rename" => {}
         "terminal-overrides" => {}
@@ -530,4 +530,102 @@ pub fn format_key_binding(key: &(KeyCode, KeyModifiers)) -> String {
     
     result.push_str(&key_str);
     result
+}
+
+/// Execute a run-shell / run command from config.
+/// Syntax: run-shell [-b] <command>
+/// Without -b, output is silently discarded (we're in config parsing).
+/// With -b, the command runs in the background.
+fn parse_run_shell(_app: &mut AppState, line: &str) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 { return; }
+    let mut background = false;
+    let mut cmd_parts: Vec<&str> = Vec::new();
+    for p in &parts[1..] {
+        if *p == "-b" { background = true; }
+        else { cmd_parts.push(p); }
+    }
+    let shell_cmd = cmd_parts.join(" ");
+    // Strip surrounding quotes if present
+    let shell_cmd = shell_cmd.trim_matches(|c| c == '\'' || c == '"');
+    if shell_cmd.is_empty() { return; }
+
+    if background {
+        #[cfg(windows)]
+        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).spawn(); }
+        #[cfg(not(windows))]
+        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).spawn(); }
+    } else {
+        #[cfg(windows)]
+        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).output(); }
+        #[cfg(not(windows))]
+        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).output(); }
+    }
+}
+
+/// Execute an if-shell / if command from config.
+/// Syntax: if-shell [-bF] <condition> <true-cmd> [<false-cmd>]
+/// Runs the condition command (or evaluates format with -F), then executes the
+/// appropriate branch command as a config line.
+fn parse_if_shell(app: &mut AppState, line: &str) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 { return; }
+
+    let mut format_mode = false;
+    let mut _background = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < parts.len() {
+        match parts[i] {
+            "-b" => { _background = true; }
+            "-F" => { format_mode = true; }
+            "-bF" | "-Fb" => { _background = true; format_mode = true; }
+            "-t" => { i += 1; } // skip target
+            s => {
+                // Handle quoted strings that might span multiple parts
+                if s.starts_with('"') || s.starts_with('\'') {
+                    let quote = s.chars().next().unwrap();
+                    if s.ends_with(quote) && s.len() > 1 {
+                        positional.push(s[1..s.len()-1].to_string());
+                    } else {
+                        let mut buf = s[1..].to_string();
+                        i += 1;
+                        while i < parts.len() {
+                            buf.push(' ');
+                            buf.push_str(parts[i]);
+                            if parts[i].ends_with(quote) {
+                                buf.truncate(buf.len() - 1);
+                                break;
+                            }
+                            i += 1;
+                        }
+                        positional.push(buf);
+                    }
+                } else {
+                    positional.push(s.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if positional.len() < 2 { return; }
+    let condition = &positional[0];
+    let true_cmd = &positional[1];
+    let false_cmd = positional.get(2);
+
+    let success = if format_mode {
+        !condition.is_empty() && condition != "0"
+    } else {
+        #[cfg(windows)]
+        { std::process::Command::new("cmd").args(["/C", condition]).status().map(|s| s.success()).unwrap_or(false) }
+        #[cfg(not(windows))]
+        { std::process::Command::new("sh").args(["-c", condition]).status().map(|s| s.success()).unwrap_or(false) }
+    };
+
+    let cmd_to_run = if success { Some(true_cmd) } else { false_cmd };
+    if let Some(cmd) = cmd_to_run {
+        // Execute the branch as a config line (recursive — supports set, bind, source, etc.)
+        parse_config_line(app, cmd);
+    }
 }
