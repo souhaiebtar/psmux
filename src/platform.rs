@@ -468,6 +468,9 @@ pub mod process_info {
         fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
         fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
         fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn FreeConsole() -> i32;
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetConsoleProcessList(process_list: *mut u32, process_count: u32) -> u32;
     }
 
     #[link(name = "ntdll")]
@@ -577,18 +580,84 @@ pub mod process_info {
         Some(path.trim_end_matches('\\').to_string())
     }
 
-    /// Get the name of the deepest child process (the actual running command in the pane).
+    /// Get the name of the foreground process in the pane.
+    /// Tries process-tree walk first, then falls back to GetConsoleProcessList
+    /// which correctly handles ConPTY's process reparenting on Windows.
     pub fn get_foreground_process_name(pid: u32) -> Option<String> {
-        let deepest = find_foreground_child_pid(pid);
-        let target = deepest.unwrap_or(pid);
-        get_process_name(target)
+        // Fast path: walk the process tree.
+        if let Some(target) = find_foreground_child_pid(pid) {
+            if target != pid {
+                if let Some(name) = get_process_name(target) {
+                    return Some(name);
+                }
+            }
+        }
+        // Slow path: query console process list (handles ConPTY reparenting).
+        if let Some(fg_pid) = get_console_foreground_pid(pid) {
+            if let Some(name) = get_process_name(fg_pid) {
+                return Some(name);
+            }
+        }
+        // Final fallback: shell's own process name.
+        get_process_name(pid)
     }
 
-    /// Get the CWD of the deepest child process.
+    /// Get the CWD of the foreground process in the pane.
     pub fn get_foreground_cwd(pid: u32) -> Option<String> {
-        let deepest = find_foreground_child_pid(pid);
-        let target = deepest.unwrap_or(pid);
-        get_process_cwd(target)
+        if let Some(target) = find_foreground_child_pid(pid) {
+            if target != pid {
+                if let Some(cwd) = get_process_cwd(target) {
+                    return Some(cwd);
+                }
+            }
+        }
+        if let Some(fg_pid) = get_console_foreground_pid(pid) {
+            if let Some(cwd) = get_process_cwd(fg_pid) {
+                return Some(cwd);
+            }
+        }
+        get_process_cwd(pid)
+    }
+
+    /// Use GetConsoleProcessList to find the foreground process in a ConPTY.
+    ///
+    /// On Windows with ConPTY, child processes spawned by the shell may not
+    /// appear as descendants in the process tree (their parent PID can point
+    /// to psmux or conhost instead of the shell).  However, all processes in
+    /// a ConPTY share the same console session.  By attaching to the shell's
+    /// console and calling GetConsoleProcessList we get every PID in that
+    /// session, then pick the most recently created non-shell, non-system one.
+    fn get_console_foreground_pid(shell_pid: u32) -> Option<u32> {
+        unsafe {
+            FreeConsole();
+            if AttachConsole(shell_pid) == 0 {
+                return None;
+            }
+            let mut pids = [0u32; 64];
+            let count = GetConsoleProcessList(pids.as_mut_ptr(), 64);
+            FreeConsole();
+
+            if count == 0 { return None; }
+            let count = count.min(64) as usize;
+
+            // Sort descending by PID (highest ≈ most recently created).
+            let mut candidates: Vec<u32> = pids[..count].iter()
+                .copied()
+                .filter(|&p| p != 0 && p != shell_pid)
+                .collect();
+            candidates.sort_unstable_by(|a, b| b.cmp(a));
+
+            // Pick the first non-system process.
+            for pid in candidates {
+                if let Some(name) = get_process_name(pid) {
+                    let lower = format!("{}.exe", name.to_lowercase());
+                    if !is_system_exe(&lower) {
+                        return Some(pid);
+                    }
+                }
+            }
+            None
+        }
     }
 
     /// Known system/infrastructure processes that should be skipped when

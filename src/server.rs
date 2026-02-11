@@ -1271,6 +1271,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     for win in app.windows.iter_mut() {
                         if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
                             if p.dead { continue; }
+                            // Throttle: only check foreground process every ~500ms
+                            // (GetConsoleProcessList involves console attach/detach)
+                            if p.last_title_check.elapsed() < std::time::Duration::from_millis(500) {
+                                continue;
+                            }
+                            p.last_title_check = std::time::Instant::now();
                             // Lazily resolve child PID if not yet known
                             if p.child_pid.is_none() {
                                 p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
