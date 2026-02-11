@@ -1245,6 +1245,40 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         let mut sent_pty_input = false;
         let mut did_work = false;
 
+        // ── Automatic rename: resolve foreground process name (like tmux) ──
+        // Runs every loop iteration but throttled per-pane to ~1s.
+        {
+            let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+            if app.automatic_rename && !in_copy {
+                for win in app.windows.iter_mut() {
+                    if win.manual_rename { continue; }
+                    if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                        if p.dead { continue; }
+                        if p.last_title_check.elapsed() < std::time::Duration::from_millis(1000) {
+                            continue;
+                        }
+                        p.last_title_check = std::time::Instant::now();
+                        if p.child_pid.is_none() {
+                            p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
+                        }
+                        let new_name = if let Some(pid) = p.child_pid {
+                            crate::platform::process_info::get_foreground_process_name(pid)
+                                .unwrap_or_else(|| "shell".into())
+                        } else if !p.title.is_empty() {
+                            p.title.clone()
+                        } else {
+                            continue;
+                        };
+                        if !new_name.is_empty() && win.name != new_name {
+                            win.name = new_name;
+                            meta_dirty = true;
+                            state_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Check if deferred dump-state can be served ──────────────────
         if let Some(ref resp) = deferred_dump {
             let now_ver = combined_data_version(&app);
@@ -1264,39 +1298,6 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     meta_dirty = false;
                 }
                 let layout_json = dump_layout_json_fast(&mut app)?;
-                // automatic-rename: use the actual foreground process name (like tmux)
-                // Skip when in copy mode — the pane screen isn't showing a prompt
-                let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
-                if app.automatic_rename && !in_copy {
-                    for win in app.windows.iter_mut() {
-                        // Respect manual renames — don't auto-rename windows the user renamed
-                        if win.manual_rename { continue; }
-                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                            if p.dead { continue; }
-                            // Throttle: only check foreground process every ~1s
-                            if p.last_title_check.elapsed() < std::time::Duration::from_millis(1000) {
-                                continue;
-                            }
-                            p.last_title_check = std::time::Instant::now();
-                            // Lazily resolve child PID if not yet known
-                            if p.child_pid.is_none() {
-                                p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
-                            }
-                            let new_name = if let Some(pid) = p.child_pid {
-                                crate::platform::process_info::get_foreground_process_name(pid)
-                                    .unwrap_or_else(|| "shell".into())
-                            } else if !p.title.is_empty() {
-                                p.title.clone()
-                            } else {
-                                continue;
-                            };
-                            if !new_name.is_empty() && win.name != new_name {
-                                win.name = new_name;
-                                meta_dirty = true;
-                            }
-                        }
-                    }
-                }
                 // monitor-activity: flag non-active windows with output
                 check_window_activity(&mut app);
 
