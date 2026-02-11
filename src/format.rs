@@ -132,6 +132,40 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
         return expand_boolean_and(rest, app, win_idx);
     }
 
+    // Loop expansion: #{W:format} = iterate windows, #{P:format} = iterate panes, #{S:format} = iterate sessions
+    if expr.len() >= 3 && expr.as_bytes()[1] == b':' {
+        match first {
+            b'W' => {
+                // #{W:fmt} — expand fmt once per window, join with spaces
+                let inner_fmt = &expr[2..];
+                let mut parts = Vec::new();
+                for wi in 0..app.windows.len() {
+                    parts.push(expand_format_for_window(inner_fmt, app, wi));
+                }
+                return parts.join(" ");
+            }
+            b'P' => {
+                // #{P:fmt} — expand fmt once per pane in the current window
+                let inner_fmt = &expr[2..];
+                let mut parts = Vec::new();
+                if let Some(win) = app.windows.get(win_idx) {
+                    let mut pane_ids = Vec::new();
+                    collect_pane_ids(&win.root, &mut pane_ids);
+                    for pid in pane_ids {
+                        parts.push(expand_format_for_pane(inner_fmt, app, win_idx, pid));
+                    }
+                }
+                return parts.join(" ");
+            }
+            b'S' => {
+                // #{S:fmt} — expand fmt once per session (single session in psmux)
+                let inner_fmt = &expr[2..];
+                return expand_format_for_window(inner_fmt, app, win_idx);
+            }
+            _ => {}
+        }
+    }
+
     // Modifier chain: check if there's a modifier prefix
     if let Some(result) = try_expand_modifier_chain(expr, app, win_idx) {
         return result;

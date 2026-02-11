@@ -347,8 +347,8 @@ pub enum Action {
 pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>, Option<String>),
-    SplitWindow(LayoutKind, Option<String>),
+    NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
     KillPane,
     CapturePane(mpsc::Sender<String>),
     FocusWindow(usize),
@@ -392,6 +392,7 @@ pub enum CtrlReq {
     ToggleSync,
     SetPaneTitle(String),
     SendKeys(String, bool),
+    SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String),
     SelectWindow(usize),
     ListPanes(mpsc::Sender<String>),
@@ -420,6 +421,8 @@ pub enum CtrlReq {
     UnbindKey(String),
     ListKeys(mpsc::Sender<String>),
     SetOption(String, String),
+    SetOptionUnset(String),  // set-option -u
+    SetOptionAppend(String, String),  // set-option -a
     ShowOptions(mpsc::Sender<String>),
     SourceFile(String),
     MoveWindow(Option<usize>),

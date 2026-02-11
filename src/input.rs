@@ -323,6 +323,15 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             Ok(false)
         }
         Mode::CopyMode => {
+            // Check copy-mode key table for user bindings first (used by plugins like tmux-yank)
+            let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
+            let key_tuple = (key.code, key.modifiers);
+            if let Some(bind) = app.key_tables.get(table_name)
+                .and_then(|t| t.iter().find(|b| b.key == key_tuple))
+                .cloned()
+            {
+                return execute_action(app, &bind.action);
+            }
             // Handle find-char pending state (waiting for char after f/F/t/T)
             if let Some(pending) = app.copy_find_char_pending.take() {
                 if let KeyCode::Char(ch) = key.code {

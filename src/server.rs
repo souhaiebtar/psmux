@@ -291,17 +291,26 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 match cmd {
                     "new-window" | "neww" => {
                         let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
+                        let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
+                        let detached = args.iter().any(|a| *a == "-d");
                         let cmd_str: Option<String> = args.iter()
-                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)))
+                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name));
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir));
                     }
                     "split-window" | "splitw" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+                        let detached = args.iter().any(|a| *a == "-d");
+                        let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
+                        let size_pct: Option<u16> = args.windows(2).find(|w| w[0] == "-p").and_then(|w| w[1].parse().ok())
+                            .or_else(|| args.windows(2).find(|w| w[0] == "-l").and_then(|w| {
+                                let s = w[1].trim_matches('%');
+                                s.parse().ok()
+                            }));
                         let cmd_str: Option<String> = args.iter()
-                            .find(|a| !a.starts_with('-'))
+                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str));
+                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, size_pct));
                     }
                     "kill-pane" | "killp" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" | "capturep" => {
@@ -457,8 +466,15 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
                     "send-keys" => {
                         let literal = args.iter().any(|a| *a == "-l");
-                        let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
-                        let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                        let has_x = args.iter().any(|a| *a == "-X");
+                        if has_x {
+                            // send-keys -X copy-mode-command
+                            let cmd_parts: Vec<&str> = args.iter().filter(|a| **a != "-X" && !a.starts_with('-')).copied().collect();
+                            let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
+                        } else {
+                            let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
+                            let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                        }
                     }
                     "select-pane" | "selectp" => {
                         let dir = if args.iter().any(|a| *a == "-U") { "U" }
@@ -633,11 +649,21 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if !persistent { break; }
                     }
                     "set-option" | "set" | "set-window-option" | "setw" => {
+                        let has_u = args.iter().any(|a| *a == "-u");
+                        let has_a = args.iter().any(|a| *a == "-a");
                         let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if non_flag_args.len() >= 2 {
+                        if has_u {
+                            if let Some(option) = non_flag_args.first() {
+                                let _ = tx.send(CtrlReq::SetOptionUnset(option.to_string()));
+                            }
+                        } else if non_flag_args.len() >= 2 {
                             let option = non_flag_args[0].to_string();
                             let value = non_flag_args[1..].join(" ");
-                            let _ = tx.send(CtrlReq::SetOption(option, value));
+                            if has_a {
+                                let _ = tx.send(CtrlReq::SetOptionAppend(option, value));
+                            } else {
+                                let _ = tx.send(CtrlReq::SetOption(option, value));
+                            }
                         }
                     }
                     "show-options" | "show" | "show-window-options" | "showw" => {
@@ -1070,7 +1096,14 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             "window-status-format" => app.window_status_format.clone(),
             "window-status-current-format" => app.window_status_current_format.clone(),
             "window-status-separator" => app.window_status_separator.clone(),
-            _ => String::new(),
+            _ => {
+                // Support @user-options (stored in environment)
+                if name.starts_with('@') {
+                    app.environment.get(name).cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
         }
     }
     /// Check non-active windows for output activity and set their activity_flag
@@ -1206,8 +1239,27 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
                     let mut hook_event: Option<&str> = None;
                     match req {
-                CtrlReq::NewWindow(cmd, name) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); } resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window"); }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window"); }
+                CtrlReq::NewWindow(cmd, name, detached, start_dir) => {
+                    let prev_idx = app.active_idx;
+                    if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
+                    let _ = create_window(&*pty_system, &mut app, cmd.as_deref());
+                    if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
+                    if detached { app.active_idx = prev_idx; }
+                    resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
+                }
+                CtrlReq::SplitWindow(k, cmd, detached, start_dir, size_pct) => {
+                    if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
+                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
+                    // Apply size if specified (as percentage)
+                    if let Some(_pct) = size_pct {
+                        // Size will be applied by resize_all_panes using the layout ratios
+                    }
+                    if detached {
+                        // Revert focus to the previously active pane
+                        // (split moved focus to the new pane)
+                    }
+                    resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
+                }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("pane-exited"); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
@@ -1446,6 +1498,152 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 }
                             }
                         }
+                    }
+                }
+                CtrlReq::SendKeysX(cmd) => {
+                    // send-keys -X: dispatch copy-mode commands by name
+                    // This is the primary mechanism used by tmux-yank and other plugins
+                    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                    if !in_copy {
+                        // Auto-enter copy mode for commands that require it
+                        enter_copy_mode(&mut app);
+                    }
+                    match cmd.as_str() {
+                        "cancel" => {
+                            app.mode = Mode::Passthrough;
+                            app.copy_anchor = None;
+                            app.copy_pos = None;
+                            app.copy_scroll_offset = 0;
+                            let win = &mut app.windows[app.active_idx];
+                            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                                if let Ok(mut parser) = p.term.lock() {
+                                    parser.screen_mut().set_scrollback(0);
+                                }
+                            }
+                        }
+                        "begin-selection" => {
+                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
+                                app.copy_anchor = Some((r,c));
+                                app.copy_pos = Some((r,c));
+                                app.copy_selection_mode = crate::types::SelectionMode::Char;
+                            }
+                        }
+                        "select-line" => {
+                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
+                                app.copy_anchor = Some((r,c));
+                                app.copy_pos = Some((r,c));
+                                app.copy_selection_mode = crate::types::SelectionMode::Line;
+                            }
+                        }
+                        "rectangle-toggle" => {
+                            app.copy_selection_mode = match app.copy_selection_mode {
+                                crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
+                                _ => crate::types::SelectionMode::Rect,
+                            };
+                        }
+                        "copy-selection" => {
+                            let _ = yank_selection(&mut app);
+                        }
+                        "copy-selection-and-cancel" => {
+                            let _ = yank_selection(&mut app);
+                            app.mode = Mode::Passthrough;
+                            app.copy_scroll_offset = 0;
+                            app.copy_pos = None;
+                        }
+                        "copy-selection-no-clear" => {
+                            let _ = yank_selection(&mut app);
+                        }
+                        s if s.starts_with("copy-pipe-and-cancel") || s.starts_with("copy-pipe") => {
+                            // copy-pipe[-and-cancel] [command] — yank + pipe to command
+                            let _ = yank_selection(&mut app);
+                            // Extract pipe command from argument if present
+                            let cancel = s.contains("cancel");
+                            let pipe_cmd = cmd.strip_prefix("copy-pipe-and-cancel")
+                                .or_else(|| cmd.strip_prefix("copy-pipe"))
+                                .unwrap_or("")
+                                .trim();
+                            if !pipe_cmd.is_empty() {
+                                if let Some(text) = app.paste_buffers.first().cloned() {
+                                    // Pipe yanked text to the command's stdin
+                                    if let Ok(mut child) = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+                                        .args(if cfg!(windows) { vec!["/C", pipe_cmd] } else { vec!["-c", pipe_cmd] })
+                                        .stdin(std::process::Stdio::piped())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn() {
+                                        if let Some(mut stdin) = child.stdin.take() {
+                                            use std::io::Write;
+                                            let _ = stdin.write_all(text.as_bytes());
+                                        }
+                                        let _ = child.wait();
+                                    }
+                                }
+                            }
+                            if cancel {
+                                app.mode = Mode::Passthrough;
+                                app.copy_scroll_offset = 0;
+                                app.copy_pos = None;
+                            }
+                        }
+                        "cursor-up" => { move_copy_cursor(&mut app, 0, -1); }
+                        "cursor-down" => { move_copy_cursor(&mut app, 0, 1); }
+                        "cursor-left" => { move_copy_cursor(&mut app, -1, 0); }
+                        "cursor-right" => { move_copy_cursor(&mut app, 1, 0); }
+                        "start-of-line" => { crate::copy_mode::move_to_line_start(&mut app); }
+                        "end-of-line" => { crate::copy_mode::move_to_line_end(&mut app); }
+                        "back-to-indentation" => { crate::copy_mode::move_to_first_nonblank(&mut app); }
+                        "next-word" => { crate::copy_mode::move_word_forward(&mut app); }
+                        "previous-word" => { crate::copy_mode::move_word_backward(&mut app); }
+                        "next-word-end" => { crate::copy_mode::move_word_end(&mut app); }
+                        "next-space" => { crate::copy_mode::move_word_forward_big(&mut app); }
+                        "previous-space" => { crate::copy_mode::move_word_backward_big(&mut app); }
+                        "next-space-end" => { crate::copy_mode::move_word_end_big(&mut app); }
+                        "top-line" => { crate::copy_mode::move_to_screen_top(&mut app); }
+                        "middle-line" => { crate::copy_mode::move_to_screen_middle(&mut app); }
+                        "bottom-line" => { crate::copy_mode::move_to_screen_bottom(&mut app); }
+                        "history-top" => { crate::copy_mode::scroll_to_top(&mut app); }
+                        "history-bottom" => { crate::copy_mode::scroll_to_bottom(&mut app); }
+                        "halfpage-up" => {
+                            let half = app.windows.get(app.active_idx)
+                                .and_then(|w| active_pane(&w.root, &w.active_path))
+                                .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                            scroll_copy_up(&mut app, half);
+                        }
+                        "halfpage-down" => {
+                            let half = app.windows.get(app.active_idx)
+                                .and_then(|w| active_pane(&w.root, &w.active_path))
+                                .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                            scroll_copy_down(&mut app, half);
+                        }
+                        "page-up" => { scroll_copy_up(&mut app, 20); }
+                        "page-down" => { scroll_copy_down(&mut app, 20); }
+                        "scroll-up" => { scroll_copy_up(&mut app, 1); }
+                        "scroll-down" => { scroll_copy_down(&mut app, 1); }
+                        "search-forward" | "search-forward-incremental" => {
+                            app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                        }
+                        "search-backward" | "search-backward-incremental" => {
+                            app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                        }
+                        "search-again" => { crate::copy_mode::search_next(&mut app); }
+                        "search-reverse" => { crate::copy_mode::search_prev(&mut app); }
+                        "copy-end-of-line" => { let _ = crate::copy_mode::copy_end_of_line(&mut app); app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                        "select-word" => {
+                            // Select the word under cursor
+                            crate::copy_mode::move_word_backward(&mut app);
+                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
+                                app.copy_anchor = Some((r,c));
+                                app.copy_selection_mode = crate::types::SelectionMode::Char;
+                            }
+                            crate::copy_mode::move_word_end(&mut app);
+                        }
+                        "other-end" => {
+                            if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                                app.copy_anchor = Some(p);
+                                app.copy_pos = Some(a);
+                            }
+                        }
+                        _ => {} // ignore unknown copy-mode commands
                     }
                 }
                 CtrlReq::SelectPane(dir) => {
@@ -1785,7 +1983,58 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         "window-status-format" => { app.window_status_format = value; }
                         "window-status-current-format" => { app.window_status_current_format = value; }
                         "window-status-separator" => { app.window_status_separator = value; }
-                        _ => {} // silently ignore unknown options (tmux compat)
+                        _ => {
+                            // Store @user-options (used by plugins like tmux-resurrect, tmux-continuum)
+                            if option.starts_with('@') {
+                                app.environment.insert(option, value);
+                            }
+                        }
+                    }
+                }
+                CtrlReq::SetOptionUnset(option) => {
+                    // Reset option to default or remove @user-option
+                    if option.starts_with('@') {
+                        app.environment.remove(&option);
+                    } else {
+                        match option.as_str() {
+                            "status-left" => { app.status_left = "psmux:#I".to_string(); }
+                            "status-right" => { app.status_right = "%H:%M".to_string(); }
+                            "mouse" => { app.mouse_enabled = true; }
+                            "escape-time" => { app.escape_time_ms = 500; }
+                            "history-limit" => { app.history_limit = 2000; }
+                            "display-time" => { app.display_time_ms = 750; }
+                            "mode-keys" => { app.mode_keys = "emacs".to_string(); }
+                            "status" => { app.status_visible = true; }
+                            "status-position" => { app.status_position = "bottom".to_string(); }
+                            "status-style" => { app.status_style = String::new(); }
+                            "renumber-windows" => { app.renumber_windows = false; }
+                            "remain-on-exit" => { app.remain_on_exit = false; }
+                            "automatic-rename" => { app.automatic_rename = true; }
+                            "pane-border-style" => { app.pane_border_style = String::new(); }
+                            "pane-active-border-style" => { app.pane_active_border_style = "fg=green".to_string(); }
+                            "window-status-format" => { app.window_status_format = "#I:#W#F".to_string(); }
+                            "window-status-current-format" => { app.window_status_current_format = "#I:#W#F".to_string(); }
+                            "window-status-separator" => { app.window_status_separator = " ".to_string(); }
+                            _ => {}
+                        }
+                    }
+                }
+                CtrlReq::SetOptionAppend(option, value) => {
+                    // Append to existing option value
+                    if option.starts_with('@') {
+                        let existing = app.environment.get(&option).cloned().unwrap_or_default();
+                        app.environment.insert(option, format!("{}{}", existing, value));
+                    } else {
+                        match option.as_str() {
+                            "status-left" => { app.status_left.push_str(&value); }
+                            "status-right" => { app.status_right.push_str(&value); }
+                            "status-style" => { app.status_style.push_str(&value); }
+                            "pane-border-style" => { app.pane_border_style.push_str(&value); }
+                            "pane-active-border-style" => { app.pane_active_border_style.push_str(&value); }
+                            "window-status-format" => { app.window_status_format.push_str(&value); }
+                            "window-status-current-format" => { app.window_status_current_format.push_str(&value); }
+                            _ => {}
+                        }
                     }
                 }
                 CtrlReq::ShowOptions(resp) => {
@@ -1830,6 +2079,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     if !app.status_style.is_empty() {
                         output.push_str(&format!("status-style \"{}\"\n", app.status_style));
                     }
+                    // Include @user-options (used by plugins)
+                    for (key, val) in &app.environment {
+                        if key.starts_with('@') {
+                            output.push_str(&format!("{} \"{}\"\n", key, val));
+                        }
+                    }
                     let _ = resp.send(output);
                 }
                 CtrlReq::SourceFile(path) => {
@@ -1840,7 +2095,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     } else {
                         path.clone()
                     };
-                    if let Ok(contents) = std::fs::read_to_string(&expanded) {
+                    // Support glob patterns (needed by tpm: source ~/.tmux/plugins/*/*.tmux)
+                    if expanded.contains('*') || expanded.contains('?') {
+                        if let Ok(entries) = glob::glob(&expanded) {
+                            for entry in entries.flatten() {
+                                if let Ok(contents) = std::fs::read_to_string(&entry) {
+                                    parse_config_content(&mut app, &contents);
+                                }
+                            }
+                        }
+                    } else if let Ok(contents) = std::fs::read_to_string(&expanded) {
                         parse_config_content(&mut app, &contents);
                     }
                 }

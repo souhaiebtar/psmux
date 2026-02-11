@@ -119,7 +119,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let cmd_str: Option<String> = args.iter()
                             .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name));
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, false, None));
                     }
                     "split-window" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
@@ -127,7 +127,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let cmd_str: Option<String> = args.iter()
                             .find(|a| !a.starts_with('-'))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str));
+                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, false, None, None));
                     }
                     "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" => {
@@ -428,13 +428,13 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let req = if let Some(rx) = app.control_rx.as_ref() { rx.try_recv().ok() } else { None };
             let Some(req) = req else { break; };
             match req {
-                CtrlReq::NewWindow(cmd, name) => {
+                CtrlReq::NewWindow(cmd, name, _detached, _start_dir) => {
                     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
