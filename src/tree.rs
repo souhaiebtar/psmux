@@ -264,11 +264,19 @@ pub fn get_split_mut<'a>(node: &'a mut Node, path: &Vec<usize>) -> Option<&'a mu
     Some(cur)
 }
 
-pub fn prune_exited(n: Node) -> Option<Node> {
+pub fn prune_exited(n: Node, remain_on_exit: bool) -> Option<Node> {
     match n {
         Node::Leaf(mut p) => {
+            if p.dead { return Some(Node::Leaf(p)); }
             match p.child.try_wait() {
-                Ok(Some(_)) => None,
+                Ok(Some(_)) => {
+                    if remain_on_exit {
+                        p.dead = true;
+                        Some(Node::Leaf(p))
+                    } else {
+                        None
+                    }
+                }
                 _ => Some(Node::Leaf(p)),
             }
         }
@@ -276,7 +284,7 @@ pub fn prune_exited(n: Node) -> Option<Node> {
             let mut new_children: Vec<Node> = Vec::new();
             let mut new_sizes: Vec<u16> = Vec::new();
             for (i, child) in children.into_iter().enumerate() {
-                if let Some(c) = prune_exited(child) {
+                if let Some(c) = prune_exited(child, remain_on_exit) {
                     new_children.push(c);
                     new_sizes.push(sizes.get(i).copied().unwrap_or(0));
                 }
@@ -416,11 +424,12 @@ pub fn active_pane<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Pane> {
 
 /// Reap exited children from the app. Returns (all_empty, any_pruned).
 pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
+    let remain = app.remain_on_exit;
     let mut any_pruned = false;
     for i in (0..app.windows.len()).rev() {
         let leaves_before = count_panes(&app.windows[i].root);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
-        match prune_exited(root) {
+        match prune_exited(root, remain) {
             Some(new_root) => {
                 let leaves_after = count_panes(&new_root);
                 if leaves_after < leaves_before {

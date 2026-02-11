@@ -902,6 +902,35 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 // monitor-activity: flag non-active windows with output
                 check_window_activity(&mut app);
+
+                // set-titles: emit terminal title escape sequence
+                if app.set_titles && app.attached_clients > 0 {
+                    let title_fmt = if app.set_titles_string.is_empty() {
+                        "#S:#I:#W".to_string()
+                    } else {
+                        app.set_titles_string.clone()
+                    };
+                    let expanded_title = expand_format(&title_fmt, &app);
+                    // Cache to avoid re-emitting identical title every frame
+                    use std::sync::OnceLock;
+                    use std::sync::Mutex as StdMutex;
+                    static LAST_TITLE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+                    let cache = LAST_TITLE.get_or_init(|| StdMutex::new(None));
+                    let mut guard = cache.lock().unwrap();
+                    let changed = match guard.as_ref() {
+                        Some(prev) => prev != &expanded_title,
+                        None => true,
+                    };
+                    if changed {
+                        // OSC 2 (set window title) + BEL
+                        let _ = std::io::Write::write_all(
+                            &mut std::io::stdout(),
+                            format!("\x1b]2;{}\x07", expanded_title).as_bytes(),
+                        );
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        *guard = Some(expanded_title);
+                    }
+                }
                 combined_buf.clear();
                 let ss_escaped = cached_status_style.replace('"', "\\\"" );
                 let sl_expanded = expand_format(&app.status_left, &app).replace('"', "\\\"");
@@ -1451,6 +1480,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
                     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
                     output.push_str(&format!("set-titles {}\n", if app.set_titles { "on" } else { "off" }));
+                    if !app.set_titles_string.is_empty() {
+                        output.push_str(&format!("set-titles-string \"{}\"\n", app.set_titles_string));
+                    }
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }

@@ -25,6 +25,8 @@ pub struct Pane {
     pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Timestamp of the last infer_title_from_prompt call (throttled to ~2/s).
     pub last_title_check: Instant,
+    /// True when the child process has exited but remain-on-exit keeps the pane visible.
+    pub dead: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]

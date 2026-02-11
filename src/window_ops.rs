@@ -443,6 +443,7 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     pane.term = term;
     pane.data_version = data_version;
     pane.child_pid = None;
+    pane.dead = false;
     
     Ok(())
 }

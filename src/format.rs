@@ -20,13 +20,16 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     while i < len {
         if bytes[i] == b'#' && i + 1 < len {
             if bytes[i + 1] == b'{' {
-                // #{variable_name} or #{?cond,true,false} syntax
+                // #{variable_name} or #{?cond,true,false} or #{=N:var} syntax
                 // Find matching closing brace (handle nesting)
                 if let Some(close) = find_matching_brace(fmt, i + 2) {
                     let var = &fmt[i+2..close];
                     if var.starts_with('?') {
                         // Conditional: #{?cond,true_branch,false_branch}
                         result.push_str(&expand_conditional(var, app, win_idx));
+                    } else if var.starts_with('=') {
+                        // Truncation: #{=N:var} - truncate to N chars
+                        result.push_str(&expand_truncation(var, app, win_idx));
                     } else {
                         result.push_str(&expand_format_var_for_window(var, app, win_idx));
                     }
@@ -122,6 +125,48 @@ fn expand_format_var_for_window(var: &str, app: &AppState, win_idx: usize) -> St
                 p.child_pid.map(|pid| pid.to_string()).unwrap_or_default()
             } else { String::new() }
         }
+        "cursor_x" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if let Ok(parser) = p.term.lock() {
+                    let (_, c) = parser.screen().cursor_position();
+                    return c.to_string();
+                }
+            }
+            "0".into()
+        }
+        "cursor_y" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if let Ok(parser) = p.term.lock() {
+                    let (r, _) = parser.screen().cursor_position();
+                    return r.to_string();
+                }
+            }
+            "0".into()
+        }
+        "pane_in_mode" => {
+            match app.mode {
+                crate::types::Mode::CopyMode | crate::types::Mode::CopySearch { .. } => "1".into(),
+                _ => "0".into(),
+            }
+        }
+        "pane_synchronized" => if app.sync_input { "1".into() } else { "0".into() },
+        "pane_dead" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if p.dead { return "1".into(); }
+            }
+            "0".into()
+        }
+        "client_width" => app.last_window_area.width.to_string(),
+        "client_height" => (app.last_window_area.height + if app.status_visible { 1 } else { 0 }).to_string(),
+        "history_size" | "history_limit" => app.history_limit.to_string(),
+        "alternate_on" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if let Ok(parser) = p.term.lock() {
+                    if parser.screen().alternate_screen() { return "1".into(); }
+                }
+            }
+            "0".into()
+        }
         "host" | "hostname" => hostname_cached(),
         "host_short" => {
             let h = hostname_cached();
@@ -176,13 +221,43 @@ fn expand_conditional(expr: &str, app: &AppState, win_idx: usize) -> String {
     // Handle nested #{...} in branches by tracking brace depth
     let (cond, true_branch, false_branch) = split_conditional(body);
     
-    let cond_val = expand_format_for_window(&format!("#{{{}}}",cond), app, win_idx);
-    let is_true = !cond_val.is_empty() && cond_val != "0";
+    // Check for comparison operators: ==, !=
+    let is_true = if let Some(eq_pos) = cond.find("==") {
+        let lhs = expand_format_for_window(&format!("#{{{}}}",&cond[..eq_pos]), app, win_idx);
+        let rhs = expand_format_for_window(&format!("#{{{}}}",&cond[eq_pos+2..]), app, win_idx);
+        lhs == rhs
+    } else if let Some(neq_pos) = cond.find("!=") {
+        let lhs = expand_format_for_window(&format!("#{{{}}}",&cond[..neq_pos]), app, win_idx);
+        let rhs = expand_format_for_window(&format!("#{{{}}}",&cond[neq_pos+2..]), app, win_idx);
+        lhs != rhs
+    } else {
+        let cond_val = expand_format_for_window(&format!("#{{{}}}",&cond), app, win_idx);
+        !cond_val.is_empty() && cond_val != "0"
+    };
     
     if is_true {
         expand_format_for_window(&true_branch, app, win_idx)
     } else {
         expand_format_for_window(&false_branch, app, win_idx)
+    }
+}
+
+/// Expand truncation: `=N:variable` - truncate expanded variable to N characters.
+fn expand_truncation(expr: &str, app: &AppState, win_idx: usize) -> String {
+    // expr = "=N:var" — skip the leading '='
+    let body = &expr[1..];
+    if let Some(colon_pos) = body.find(':') {
+        let n_str = &body[..colon_pos];
+        let var = &body[colon_pos + 1..];
+        let expanded = expand_format_for_window(&format!("#{{{}}}" ,var), app, win_idx);
+        if let Ok(n) = n_str.parse::<usize>() {
+            if expanded.len() > n {
+                return expanded[..n].to_string();
+            }
+        }
+        expanded
+    } else {
+        String::new()
     }
 }
 

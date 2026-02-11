@@ -122,6 +122,180 @@ pub fn move_copy_cursor(app: &mut AppState, dx: i16, dy: i16) {
     app.copy_pos = Some((nr,nc));
 }
 
+/// Helper: read a full row of text from the active pane's screen.
+fn read_row_text(app: &mut AppState, row: u16) -> Option<(String, u16)> {
+    let win = &mut app.windows[app.active_idx];
+    let p = active_pane_mut(&mut win.root, &win.active_path)?;
+    let parser = p.term.lock().ok()?;
+    let screen = parser.screen();
+    let cols = p.last_cols;
+    let mut text = String::with_capacity(cols as usize);
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(row, c) {
+            let t = cell.contents();
+            if t.is_empty() { text.push(' '); } else { text.push_str(t); }
+        } else {
+            text.push(' ');
+        }
+    }
+    Some((text, cols))
+}
+
+/// Get the current copy-mode cursor position (from copy_pos or screen cursor).
+fn get_copy_pos(app: &mut AppState) -> Option<(u16, u16)> {
+    if let Some(pos) = app.copy_pos { return Some(pos); }
+    current_prompt_pos(app)
+}
+
+/// Move cursor to start of line (0 key in vi copy mode).
+pub fn move_to_line_start(app: &mut AppState) {
+    if let Some((r, _)) = get_copy_pos(app) {
+        app.copy_pos = Some((r, 0));
+    }
+}
+
+/// Move cursor to end of line ($ key in vi copy mode).
+pub fn move_to_line_end(app: &mut AppState) {
+    if let Some((r, _)) = get_copy_pos(app) {
+        let win = &app.windows[app.active_idx];
+        if let Some(p) = active_pane(&win.root, &win.active_path) {
+            let cols = p.last_cols;
+            app.copy_pos = Some((r, cols.saturating_sub(1)));
+        }
+    }
+}
+
+/// Move cursor to first non-blank character (^ key in vi copy mode).
+pub fn move_to_first_nonblank(app: &mut AppState) {
+    if let Some((r, _)) = get_copy_pos(app) {
+        if let Some((text, _)) = read_row_text(app, r) {
+            let col = text.find(|c: char| !c.is_whitespace()).unwrap_or(0) as u16;
+            app.copy_pos = Some((r, col));
+        }
+    }
+}
+
+/// Classify a character for word boundary detection.
+/// Returns: 0 = whitespace, 1 = word char (alnum/_), 2 = punctuation/other
+#[inline]
+fn char_class(ch: char, seps: &str) -> u8 {
+    if ch.is_whitespace() { 0 }
+    else if seps.contains(ch) { 2 }
+    else if ch.is_alphanumeric() || ch == '_' { 1 }
+    else { 2 }
+}
+
+/// Move cursor to start of next word (w key in vi copy mode).
+pub fn move_word_forward(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = c as usize;
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+
+    // Phase 1: skip current word class
+    if col < bytes.len() {
+        let cls = char_class(bytes[col], &seps);
+        while col < bytes.len() && char_class(bytes[col], &seps) == cls { col += 1; }
+    }
+    // Phase 2: skip whitespace
+    while col < bytes.len() && bytes[col].is_whitespace() { col += 1; }
+
+    if col < cols as usize {
+        app.copy_pos = Some((r, col as u16));
+    } else {
+        // Wrap to next line
+        let nr = (r + 1).min(rows.saturating_sub(1));
+        if nr != r {
+            if let Some((next_text, _)) = read_row_text(app, nr) {
+                let next_bytes: Vec<char> = next_text.chars().collect();
+                let mut nc = 0usize;
+                while nc < next_bytes.len() && next_bytes[nc].is_whitespace() { nc += 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else {
+                app.copy_pos = Some((nr, 0));
+            }
+        }
+    }
+}
+
+/// Move cursor to start of previous word (b key in vi copy mode).
+pub fn move_word_backward(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, _) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = c as usize;
+
+    if col == 0 {
+        // Wrap to previous line
+        if r > 0 {
+            let nr = r - 1;
+            if let Some((prev_text, prev_cols)) = read_row_text(app, nr) {
+                let prev_bytes: Vec<char> = prev_text.chars().collect();
+                let mut nc = (prev_cols as usize).min(prev_bytes.len()).saturating_sub(1);
+                while nc > 0 && prev_bytes[nc].is_whitespace() { nc -= 1; }
+                let cls = char_class(prev_bytes[nc], &seps);
+                while nc > 0 && char_class(prev_bytes[nc - 1], &seps) == cls { nc -= 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else {
+                app.copy_pos = Some((r - 1, 0));
+            }
+        }
+        return;
+    }
+
+    // Phase 1: move left past whitespace
+    while col > 0 && bytes[col - 1].is_whitespace() { col -= 1; }
+    // Phase 2: move left past current word class
+    if col > 0 {
+        let cls = char_class(bytes[col - 1], &seps);
+        while col > 0 && char_class(bytes[col - 1], &seps) == cls { col -= 1; }
+    }
+    app.copy_pos = Some((r, col as u16));
+}
+
+/// Move cursor to end of current word (e key in vi copy mode).
+pub fn move_word_end(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = (c as usize) + 1; // start one past current position
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+
+    // Skip whitespace
+    while col < bytes.len() && bytes[col].is_whitespace() { col += 1; }
+    // Find end of word class
+    if col < bytes.len() {
+        let cls = char_class(bytes[col], &seps);
+        while col + 1 < bytes.len() && char_class(bytes[col + 1], &seps) == cls { col += 1; }
+    }
+
+    if col < cols as usize {
+        app.copy_pos = Some((r, col as u16));
+    } else {
+        let nr = (r + 1).min(rows.saturating_sub(1));
+        if nr != r {
+            if let Some((next_text, _)) = read_row_text(app, nr) {
+                let next_bytes: Vec<char> = next_text.chars().collect();
+                let mut nc = 0usize;
+                while nc < next_bytes.len() && next_bytes[nc].is_whitespace() { nc += 1; }
+                let cls = if nc < next_bytes.len() { char_class(next_bytes[nc], &seps) } else { 0 };
+                while nc + 1 < next_bytes.len() && char_class(next_bytes[nc + 1], &seps) == cls { nc += 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else {
+                app.copy_pos = Some((nr, 0));
+            }
+        }
+    }
+}
+
 pub fn scroll_copy_up(app: &mut AppState, lines: usize) {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };

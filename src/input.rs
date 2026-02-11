@@ -51,6 +51,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 app.mode = Mode::Prefix { armed_at: Instant::now() };
                 return Ok(false);
             }
+            // Check root key table for bindings (bind-key -n / bind-key -T root)
+            let key_tuple = (key.code, key.modifiers);
+            if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
+                return execute_action(app, &bind.action);
+            }
             forward_key_to_active(app, key)?;
             Ok(false)
         }
@@ -325,10 +330,36 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Right | KeyCode::Char('l') => { move_copy_cursor(app, 1, 0); }
                 KeyCode::Up | KeyCode::Char('k') => { scroll_copy_up(app, 1); }
                 KeyCode::Down | KeyCode::Char('j') => { scroll_copy_down(app, 1); }
-                KeyCode::PageUp | KeyCode::Char('b') => { scroll_copy_up(app, 10); }
-                KeyCode::PageDown | KeyCode::Char('f') => { scroll_copy_down(app, 10); }
+                // Page scroll: C-b / PageUp = page up, C-f / PageDown = page down
+                KeyCode::PageUp => { scroll_copy_up(app, 10); }
+                KeyCode::PageDown => { scroll_copy_down(app, 10); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 10); }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 10); }
+                // Half-page scroll: C-u / C-d
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                    scroll_copy_up(app, half);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                    scroll_copy_down(app, half);
+                }
                 KeyCode::Char('g') => { scroll_to_top(app); }
                 KeyCode::Char('G') => { scroll_to_bottom(app); }
+                // Word motions: w = next word, b = prev word, e = end of word
+                KeyCode::Char('w') => { crate::copy_mode::move_word_forward(app); }
+                KeyCode::Char('b') => { crate::copy_mode::move_word_backward(app); }
+                KeyCode::Char('e') => { crate::copy_mode::move_word_end(app); }
+                // Line motions: 0 = start, $ = end, ^ = first non-blank
+                KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
+                KeyCode::Char('^') => { crate::copy_mode::move_to_first_nonblank(app); }
+                KeyCode::Home => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::End => { crate::copy_mode::move_to_line_end(app); }
                 KeyCode::Char('v') => { if let Some((r,c)) = current_prompt_pos(app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
                 // --- copy-mode search ---
@@ -563,7 +594,8 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         fn write_all_panes(node: &mut Node, data: &[u8]) {
             match node {
-                Node::Leaf(p) => { let _ = p.master.write_all(data); }
+                Node::Leaf(p) if !p.dead => { let _ = p.master.write_all(data); }
+                Node::Leaf(_) => {}
                 Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
             }
         }
@@ -571,7 +603,9 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            let _ = active.master.write_all(&encoded);
+            if !active.dead {
+                let _ = active.master.write_all(&encoded);
+            }
         }
     }
     Ok(())
