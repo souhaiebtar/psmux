@@ -387,6 +387,7 @@ pub enum CtrlReq {
     RenameWindow(String),
     ListWindows(mpsc::Sender<String>),
     ListWindowsTmux(mpsc::Sender<String>),
+    ListWindowsFormat(mpsc::Sender<String>, String),
     ListTree(mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
@@ -394,6 +395,7 @@ pub enum CtrlReq {
     SelectPane(String),
     SelectWindow(usize),
     ListPanes(mpsc::Sender<String>),
+    ListPanesFormat(mpsc::Sender<String>, String),
     KillWindow,
     KillSession,
     HasSession(mpsc::Sender<bool>),
@@ -402,6 +404,7 @@ pub enum CtrlReq {
     ResizePane(String, u16),
     SetBuffer(String),
     ListBuffers(mpsc::Sender<String>),
+    ListBuffersFormat(mpsc::Sender<String>, String),
     ShowBuffer(mpsc::Sender<String>),
     ShowBufferAt(mpsc::Sender<String>, usize),
     DeleteBuffer,
@@ -451,6 +454,11 @@ pub enum CtrlReq {
     ResizePaneAbsolute(String, u16),
     ShowOptionValue(mpsc::Sender<String>, String),
     ChooseBuffer(mpsc::Sender<String>),
+    ServerInfo(mpsc::Sender<String>),
+    SendPrefix,
+    PrevLayout,
+    ResizeWindow(String, u16),
+    RespawnWindow,
 }
 
 /// Wait-for operation types

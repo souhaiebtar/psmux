@@ -119,14 +119,36 @@ pub fn current_prompt_pos(app: &mut AppState) -> Option<(u16,u16)> {
 pub fn move_copy_cursor(app: &mut AppState, dx: i16, dy: i16) {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
-    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     // Use tracked copy_pos if available, otherwise fall back to terminal cursor
     let (r, c) = app.copy_pos.unwrap_or_else(|| parser.screen().cursor_position());
     let rows = p.last_rows;
     let cols = p.last_cols;
-    let nr = (r as i16 + dy).max(0).min(rows as i16 - 1) as u16;
+    let desired_r = r as i16 + dy;
     let nc = (c as i16 + dx).max(0).min(cols as i16 - 1) as u16;
-    app.copy_pos = Some((nr, nc));
+    // If cursor would move above the visible area, scroll up into scrollback
+    if desired_r < 0 {
+        let scroll_lines = (-desired_r) as usize;
+        let current = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(current.saturating_add(scroll_lines));
+        app.copy_scroll_offset = parser.screen().scrollback();
+        app.copy_pos = Some((0, nc));
+    }
+    // If cursor would move below the visible area, scroll down (reduce scrollback)
+    else if desired_r >= rows as i16 {
+        let scroll_lines = (desired_r - rows as i16 + 1) as usize;
+        let current = parser.screen().scrollback();
+        if current > 0 {
+            parser.screen_mut().set_scrollback(current.saturating_sub(scroll_lines));
+            app.copy_scroll_offset = parser.screen().scrollback();
+            app.copy_pos = Some((rows.saturating_sub(1), nc));
+        } else {
+            // Already at bottom, clamp
+            app.copy_pos = Some((rows.saturating_sub(1), nc));
+        }
+    } else {
+        app.copy_pos = Some((desired_r as u16, nc));
+    }
 }
 
 /// Helper: read a full row of text from the active pane's screen.

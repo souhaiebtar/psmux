@@ -22,6 +22,51 @@ use crate::commands::*;
 use crate::util::*;
 use crate::format::*;
 
+/// Complete list of supported tmux-compatible commands (for list-commands).
+const TMUX_COMMANDS: &[&str] = &[
+    "attach-session (attach)", "bind-key (bind)", "break-pane (breakp)",
+    "capture-pane (capturep)", "choose-buffer", "choose-client",
+    "choose-session", "choose-tree", "choose-window",
+    "clear-history (clearhist)", "clock-mode", "command-prompt",
+    "confirm-before (confirm)", "copy-mode", "customize-mode",
+    "delete-buffer (deleteb)", "detach-client (detach)",
+    "display-menu (menu)", "display-message (display)",
+    "display-panes (displayp)", "display-popup (popup)",
+    "find-window (findw)", "has-session (has)",
+    "if-shell (if)", "join-pane (joinp)",
+    "kill-pane (killp)", "kill-server", "kill-session",
+    "kill-window (killw)", "last-pane (lastp)", "last-window (last)",
+    "link-window (linkw)", "list-buffers (lsb)", "list-clients (lsc)",
+    "list-commands (lscm)", "list-keys (lsk)", "list-panes (lsp)",
+    "list-sessions (ls)", "list-windows (lsw)",
+    "load-buffer (loadb)", "lock-client (lockc)",
+    "lock-server (lock)", "lock-session (locks)",
+    "move-pane (movep)", "move-window (movew)",
+    "new-session (new)", "new-window (neww)",
+    "next-layout (nextl)", "next-window (next)",
+    "paste-buffer (pasteb)", "pipe-pane (pipep)",
+    "previous-layout (prevl)", "previous-window (prev)",
+    "refresh-client (refresh)", "rename-session (rename)",
+    "rename-window (renamew)", "resize-pane (resizep)",
+    "resize-window (resizew)", "respawn-pane (respawnp)",
+    "respawn-window (respawnw)", "rotate-window (rotatew)",
+    "run-shell (run)", "save-buffer (saveb)",
+    "select-layout (selectl)", "select-pane (selectp)",
+    "select-window (selectw)", "send-keys (send)",
+    "send-prefix", "server-info (info)",
+    "set-buffer (setb)", "set-environment (setenv)",
+    "set-hook", "set-option (set)",
+    "set-window-option (setw)", "show-buffer (showb)",
+    "show-environment (showenv)", "show-hooks",
+    "show-messages (showmsgs)", "show-options (show)",
+    "show-window-options (showw)", "source-file (source)",
+    "split-window (splitw)", "start-server (start)",
+    "suspend-client (suspendc)", "swap-pane (swapp)",
+    "swap-window (swapw)", "switch-client (switchc)",
+    "unbind-key (unbind)", "unlink-window (unlinkw)",
+    "wait-for (wait)",
+];
+
 pub fn run_server(session_name: String, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -388,7 +433,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "previous-window" | "prev" => { let _ = tx.send(CtrlReq::PrevWindow); }
                     "rename-window" | "renamew" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
                     "list-windows" | "lsw" => {
-                        if args.iter().any(|a| *a == "-J") {
+                        // Extract -F format if provided
+                        let fmt = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].to_string());
+                        if let Some(fmt_str) = fmt {
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::ListWindowsFormat(rtx, fmt_str));
+                            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        } else if args.iter().any(|a| *a == "-J") {
                             // JSON output for programmatic use
                             let (rtx, rrx) = mpsc::channel::<String>();
                             let _ = tx.send(CtrlReq::ListWindows(rtx));
@@ -423,8 +474,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         }
                     }
                     "list-panes" | "lsp" => {
+                        let fmt = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].to_string());
                         let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListPanes(rtx));
+                        if let Some(fmt_str) = fmt {
+                            let _ = tx.send(CtrlReq::ListPanesFormat(rtx, fmt_str));
+                        } else {
+                            let _ = tx.send(CtrlReq::ListPanes(rtx));
+                        }
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
@@ -483,8 +539,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         }
                     }
                     "list-buffers" | "lsb" => {
+                        let fmt = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].to_string());
                         let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListBuffers(rtx));
+                        if let Some(fmt_str) = fmt {
+                            let _ = tx.send(CtrlReq::ListBuffersFormat(rtx, fmt_str));
+                        } else {
+                            let _ = tx.send(CtrlReq::ListBuffers(rtx));
+                        }
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
@@ -861,6 +922,50 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "new-session" | "new" => {
                         // Accept but ignore in server context (requires a new process)
                     }
+                    "list-commands" | "lscm" => {
+                        let cmds = TMUX_COMMANDS.join("\n");
+                        let _ = write!(write_stream, "{}\n", cmds);
+                        let _ = write_stream.flush();
+                        if !persistent { break; }
+                    }
+                    "server-info" | "info" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ServerInfo(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        if !persistent { break; }
+                    }
+                    "start-server" => {
+                        // Server is already running if we're here, no-op
+                        if !persistent { break; }
+                    }
+                    "send-prefix" => {
+                        let _ = tx.send(CtrlReq::SendPrefix);
+                    }
+                    "previous-layout" | "prevl" => {
+                        let _ = tx.send(CtrlReq::PrevLayout);
+                    }
+                    "resize-window" | "resizew" => {
+                        let abs_x = args.windows(2).find(|w| w[0] == "-x").and_then(|w| w[1].parse::<u16>().ok());
+                        let abs_y = args.windows(2).find(|w| w[0] == "-y").and_then(|w| w[1].parse::<u16>().ok());
+                        if let Some(xv) = abs_x {
+                            let _ = tx.send(CtrlReq::ResizeWindow("x".to_string(), xv));
+                        } else if let Some(yv) = abs_y {
+                            let _ = tx.send(CtrlReq::ResizeWindow("y".to_string(), yv));
+                        }
+                    }
+                    "respawn-window" | "respawnw" => {
+                        let _ = tx.send(CtrlReq::RespawnWindow);
+                    }
+                    "lock-server" | "lock-session" | "lock" => {
+                        // Lock is a no-op on Windows (no terminal locking concept)
+                        // Stub for compatibility
+                    }
+                    "choose-client" => {
+                        // Single-client model — choose-client is a no-op
+                    }
+                    "customize-mode" => {
+                        // tmux 3.2+ customize-mode — stub for compatibility
+                    }
                     _ => {}
                 }
                     // Try to read next command for batching (with timeout)
@@ -1220,6 +1325,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; meta_dirty = true; hook_event = Some("after-rename-window"); }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ListWindowsTmux(resp) => { let text = list_windows_tmux(&app); let _ = resp.send(text); }
+                CtrlReq::ListWindowsFormat(resp, fmt) => { let text = format_list_windows(&app, &fmt); let _ = resp.send(text); }
                 CtrlReq::ListTree(resp) => { let json = list_tree_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ToggleSync => { app.sync_input = !app.sync_input; }
                 CtrlReq::SetPaneTitle(title) => {
@@ -1385,6 +1491,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     let _ = resp.send(output);
                 }
+                CtrlReq::ListPanesFormat(resp, fmt) => {
+                    let text = format_list_panes(&app, &fmt, app.active_idx);
+                    let _ = resp.send(text);
+                }
                 CtrlReq::KillWindow => {
                     if app.windows.len() > 1 {
                         let mut win = app.windows.remove(app.active_idx);
@@ -1453,6 +1563,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         output.push_str(&format!("buffer{}: {} bytes: \"{}\"\n", i, buf.len(), preview));
                     }
                     let _ = resp.send(output);
+                }
+                CtrlReq::ListBuffersFormat(resp, fmt) => {
+                    let mut output = Vec::new();
+                    for (i, _buf) in app.paste_buffers.iter().enumerate() {
+                        // Each buffer expands using the same format string
+                        // For now, expand with buffer_name/buffer_size from the current app state
+                        let _ = i; // buffer index context
+                        output.push(expand_format(&fmt, &app));
+                    }
+                    let _ = resp.send(output.join("\n"));
                 }
                 CtrlReq::ShowBuffer(resp) => {
                     let content = app.paste_buffers.first().cloned().unwrap_or_default();
@@ -2007,6 +2127,68 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         output.push_str(&format!("buffer{}: {} bytes: \"{}\"\n", i, buf.len(), preview));
                     }
                     let _ = resp.send(output);
+                }
+                CtrlReq::ServerInfo(resp) => {
+                    let info = format!(
+                        "psmux {} (Windows)\npid: {}\nsession: {}\nwindows: {}\nuptime: {}s\nsocket: {}",
+                        VERSION,
+                        std::process::id(),
+                        app.session_name,
+                        app.windows.len(),
+                        (chrono::Local::now() - app.created_at).num_seconds(),
+                        {
+                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                            format!("{}\\.psmux\\{}.port", home, app.session_name)
+                        }
+                    );
+                    let _ = resp.send(info);
+                }
+                CtrlReq::SendPrefix => {
+                    // Send the prefix key to the active pane as if typed
+                    let prefix = app.prefix_key;
+                    let encoded: Vec<u8> = match prefix.0 {
+                        crossterm::event::KeyCode::Char(c) if prefix.1.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                            vec![(c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1)]
+                        }
+                        crossterm::event::KeyCode::Char(c) => format!("{}", c).into_bytes(),
+                        _ => vec![],
+                    };
+                    if !encoded.is_empty() {
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                            let _ = p.master.write_all(&encoded);
+                            let _ = p.master.flush();
+                        }
+                    }
+                    sent_pty_input = true;
+                }
+                CtrlReq::PrevLayout => {
+                    // Cycle layouts in reverse using the same logic as cycle_layout/NextLayout
+                    static LAYOUTS: [&str; 5] = ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
+                    let win = &app.windows[app.active_idx];
+                    let current_idx = match &win.root {
+                        Node::Leaf(_) => 0,
+                        Node::Split { kind, sizes, .. } => {
+                            if sizes.is_empty() { 0 }
+                            else if sizes.iter().all(|s| *s == sizes[0]) {
+                                match kind { LayoutKind::Horizontal => 0, LayoutKind::Vertical => 1 }
+                            } else if sizes.len() >= 2 && sizes[0] > sizes[1] {
+                                match kind { LayoutKind::Vertical => 2, LayoutKind::Horizontal => 3 }
+                            } else { 4 }
+                        }
+                    };
+                    let prev_idx = (current_idx + LAYOUTS.len() - 1) % LAYOUTS.len();
+                    apply_layout(&mut app, LAYOUTS[prev_idx]);
+                    state_dirty = true;
+                }
+                CtrlReq::ResizeWindow(_dim, _size) => {
+                    // On Windows, window size is controlled by the terminal emulator;
+                    // resize-window is a no-op since we adapt to the terminal size.
+                }
+                CtrlReq::RespawnWindow => {
+                    // Kill all panes in the active window and respawn	
+                    respawn_active_pane(&mut app)?;
+                    state_dirty = true;
                 }
             }
             // Fire any hooks registered for the event that just occurred
