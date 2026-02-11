@@ -129,7 +129,7 @@ Write-Host ("=" * 60)
 Write-Test "setup: create second window for join-pane"
 Psmux new-window -t feat4 2>$null | Out-Null
 Start-Sleep -Milliseconds 2000
-$wins = Psmux list-windows -t feat4
+$wins = Psmux list-windows -t feat4 -J
 $winsStr = "$wins"
 # Count JSON entries by counting '"id":' occurrences
 $wcount = ([regex]::Matches($winsStr, '"id":')).Count
