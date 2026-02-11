@@ -404,3 +404,232 @@ pub mod process_kill {
         let _ = child.kill();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process info queries — get CWD and process name from PID (for format vars)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub mod process_info {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const MAX_PATH: usize = 260;
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const INVALID_HANDLE: isize = -1;
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct PROCESS_BASIC_INFORMATION {
+        Reserved1: isize,
+        PebBaseAddress: isize, // pointer to PEB
+        Reserved2: [isize; 2],
+        UniqueProcessId: isize,
+        Reserved3: isize,
+    }
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct UNICODE_STRING {
+        Length: u16,
+        MaximumLength: u16,
+        Buffer: isize, // pointer to wide string
+    }
+
+    #[repr(C)]
+    struct PROCESSENTRY32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn QueryFullProcessImageNameW(h: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+        fn ReadProcessMemory(
+            h_process: isize,
+            base_address: isize,
+            buffer: *mut u8,
+            size: usize,
+            bytes_read: *mut usize,
+        ) -> i32;
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+        fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: isize,
+            process_information_class: u32,
+            process_information: *mut u8,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    /// Get the executable name of a process by PID (e.g. "pwsh" or "vim").
+    pub fn get_process_name(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 || h == -1 { return None; }
+            let mut buf = [0u16; 1024];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+            CloseHandle(h);
+            if ok == 0 { return None; }
+            let full_path = OsString::from_wide(&buf[..size as usize])
+                .to_string_lossy()
+                .into_owned();
+            let name = std::path::Path::new(&full_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())?;
+            Some(name)
+        }
+    }
+
+    /// Get the current working directory of a process by PID.
+    /// Reads the PEB → ProcessParameters → CurrentDirectory from the target process.
+    pub fn get_process_cwd(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+            if h == 0 || h == -1 { return None; }
+            let result = read_process_cwd(h);
+            CloseHandle(h);
+            result
+        }
+    }
+
+    /// Read CWD from a process handle via NtQueryInformationProcess + ReadProcessMemory.
+    unsafe fn read_process_cwd(h: isize) -> Option<String> {
+        // Step 1: Get PEB address
+        let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
+        let mut ret_len: u32 = 0;
+        let status = NtQueryInformationProcess(
+            h,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut u8,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut ret_len,
+        );
+        if status != 0 { return None; }
+        let peb_addr = pbi.PebBaseAddress;
+        if peb_addr == 0 { return None; }
+
+        // Step 2: Read ProcessParameters pointer from PEB.
+        // PEB layout (x64): offset 0x20 = ProcessParameters pointer
+        // PEB layout (x86): offset 0x10 = ProcessParameters pointer
+        let params_ptr_offset = if std::mem::size_of::<usize>() == 8 { 0x20 } else { 0x10 };
+        let mut process_params_ptr: isize = 0;
+        let mut bytes_read: usize = 0;
+        let ok = ReadProcessMemory(
+            h,
+            peb_addr + params_ptr_offset,
+            &mut process_params_ptr as *mut isize as *mut u8,
+            std::mem::size_of::<isize>(),
+            &mut bytes_read,
+        );
+        if ok == 0 || process_params_ptr == 0 { return None; }
+
+        // Step 3: Read CurrentDirectory.DosPath (UNICODE_STRING) from RTL_USER_PROCESS_PARAMETERS.
+        // x64 offset: 0x38 = CurrentDirectory.DosPath
+        // x86 offset: 0x24 = CurrentDirectory.DosPath
+        let cwd_offset = if std::mem::size_of::<usize>() == 8 { 0x38 } else { 0x24 };
+        let mut cwd_ustr: UNICODE_STRING = std::mem::zeroed();
+        let ok = ReadProcessMemory(
+            h,
+            process_params_ptr + cwd_offset,
+            &mut cwd_ustr as *mut UNICODE_STRING as *mut u8,
+            std::mem::size_of::<UNICODE_STRING>(),
+            &mut bytes_read,
+        );
+        if ok == 0 || cwd_ustr.Length == 0 || cwd_ustr.Buffer == 0 { return None; }
+
+        // Step 4: Read the actual CWD wide string
+        let char_count = (cwd_ustr.Length / 2) as usize;
+        let mut wchars: Vec<u16> = vec![0u16; char_count];
+        let ok = ReadProcessMemory(
+            h,
+            cwd_ustr.Buffer,
+            wchars.as_mut_ptr() as *mut u8,
+            cwd_ustr.Length as usize,
+            &mut bytes_read,
+        );
+        if ok == 0 { return None; }
+
+        let path = OsString::from_wide(&wchars)
+            .to_string_lossy()
+            .into_owned();
+        // Remove trailing backslash (tmux convention)
+        Some(path.trim_end_matches('\\').to_string())
+    }
+
+    /// Get the name of the deepest child process (the actual running command in the pane).
+    pub fn get_foreground_process_name(pid: u32) -> Option<String> {
+        let deepest = find_deepest_child_pid(pid);
+        let target = deepest.unwrap_or(pid);
+        get_process_name(target)
+    }
+
+    /// Get the CWD of the deepest child process.
+    pub fn get_foreground_cwd(pid: u32) -> Option<String> {
+        let deepest = find_deepest_child_pid(pid);
+        let target = deepest.unwrap_or(pid);
+        get_process_cwd(target)
+    }
+
+    /// Walk the process tree from `root_pid` to find the deepest descendant.
+    fn find_deepest_child_pid(root_pid: u32) -> Option<u32> {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE || snap == 0 { return None; }
+
+            let mut entries: Vec<(u32, u32)> = Vec::new();
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snap, &mut pe) != 0 {
+                entries.push((pe.th32_process_id, pe.th32_parent_process_id));
+                while Process32NextW(snap, &mut pe) != 0 {
+                    entries.push((pe.th32_process_id, pe.th32_parent_process_id));
+                }
+            }
+            CloseHandle(snap);
+
+            // Walk down: from root, find child, then child's child, etc.
+            let mut current = root_pid;
+            loop {
+                let children: Vec<u32> = entries.iter()
+                    .filter(|(_, ppid)| *ppid == current)
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                if children.is_empty() {
+                    break;
+                }
+                current = children[0];
+            }
+            if current != root_pid { Some(current) } else { None }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub mod process_info {
+    pub fn get_process_name(_pid: u32) -> Option<String> { None }
+    pub fn get_process_cwd(_pid: u32) -> Option<String> { None }
+    pub fn get_foreground_process_name(_pid: u32) -> Option<String> { None }
+    pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
+}

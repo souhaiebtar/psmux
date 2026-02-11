@@ -242,6 +242,35 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
     }
 }
 
+/// Split a bind-key command string on `\;` or bare `;` to produce sub-commands.
+/// Handles: `split-window \; select-pane -D` → ["split-window", "select-pane -D"]
+pub fn split_chained_commands_pub(command: &str) -> Vec<String> {
+    split_chained_commands(command)
+}
+fn split_chained_commands(command: &str) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    
+    for token in &tokens {
+        if *token == "\\;" || *token == ";" {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                commands.push(trimmed);
+            }
+            current.clear();
+        } else {
+            if !current.is_empty() { current.push(' '); }
+            current.push_str(token);
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        commands.push(trimmed);
+    }
+    commands
+}
+
 pub fn parse_bind_key(app: &mut AppState, line: &str) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 { return; }
@@ -272,12 +301,21 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
     if i >= parts.len() { return; }
     let command = parts[i..].join(" ");
     
+    // Split on `\;` or `;` to support command chaining (like tmux `bind x split-window \; select-pane -D`)
+    let sub_commands: Vec<String> = split_chained_commands(&command);
+    
     if let Some(key) = parse_key_name(key_str) {
-        if let Some(action) = parse_command_to_action(&command) {
-            let table = app.key_tables.entry(_key_table).or_default();
-            table.retain(|b| b.key != key);
-            table.push(Bind { key, action });
-        }
+        let action = if sub_commands.len() > 1 {
+            // Multiple chained commands
+            Action::CommandChain(sub_commands)
+        } else if let Some(a) = parse_command_to_action(&command) {
+            a
+        } else {
+            return;
+        };
+        let table = app.key_tables.entry(_key_table).or_default();
+        table.retain(|b| b.key != key);
+        table.push(Bind { key, action, repeat: _repeatable });
     }
 }
 

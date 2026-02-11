@@ -110,6 +110,7 @@ pub fn format_action(action: &Action) -> String {
             format!("select-pane {}", flag)
         }
         Action::Command(cmd) => cmd.clone(),
+        Action::CommandChain(cmds) => cmds.join(" \\; "),
     }
 }
 
@@ -283,6 +284,11 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
         Action::Command(cmd) => {
             execute_command_string(app, cmd)?;
         }
+        Action::CommandChain(cmds) => {
+            for cmd in cmds {
+                execute_command_string(app, cmd)?;
+            }
+        }
     }
     Ok(false)
 }
@@ -389,6 +395,16 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
         }
         "select-pane" | "selectp" => {
+            if parts.iter().any(|p| *p == "-l") {
+                // select-pane -l: switch to last pane
+                let win = &mut app.windows[app.active_idx];
+                if !app.last_pane_path.is_empty() {
+                    let tmp = win.active_path.clone();
+                    win.active_path = app.last_pane_path.clone();
+                    app.last_pane_path = tmp;
+                }
+                return Ok(());
+            }
             let dir = if parts.iter().any(|p| *p == "-U") { FocusDir::Up }
                 else if parts.iter().any(|p| *p == "-D") { FocusDir::Down }
                 else if parts.iter().any(|p| *p == "-L") { FocusDir::Left }

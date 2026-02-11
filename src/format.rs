@@ -13,6 +13,60 @@ use crate::types::*;
 use crate::tree::*;
 use crate::config::format_key_binding;
 
+// ─────────────────── tmux window_layout generation ────────────────────
+
+/// Generate a tmux-compatible window_layout string from the pane tree.
+/// Format: `<checksum>,<layout_body>`
+/// Body examples:
+///   Single pane:  `80x24,0,0,0`
+///   Horiz split:  `80x24,0,0{40x24,0,0,0,39x24,41,0,1}`
+///   Vert split:   `80x24,0,0[80x12,0,0,0,80x11,0,13,1]`
+pub fn generate_window_layout(node: &Node, area: ratatui::prelude::Rect) -> String {
+    let body = layout_node(node, area);
+    let checksum = tmux_layout_checksum(&body);
+    format!("{:04x},{}", checksum, body)
+}
+
+fn layout_node(node: &Node, area: ratatui::prelude::Rect) -> String {
+    match node {
+        Node::Leaf(pane) => {
+            // WxH,X,Y,pane_id
+            format!("{}x{},{},{},{}", area.width, area.height, area.x, area.y, pane.id)
+        }
+        Node::Split { kind, sizes, children } => {
+            let is_horizontal = matches!(*kind, LayoutKind::Horizontal);
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            
+            let (open, close) = if is_horizontal { ('{', '}') } else { ('[', ']') };
+            
+            let mut inner = String::new();
+            for (i, child) in children.iter().enumerate() {
+                if i > 0 { inner.push(','); }
+                if i < rects.len() {
+                    inner.push_str(&layout_node(child, rects[i]));
+                }
+            }
+            
+            format!("{}x{},{},{}{}{}{}", area.width, area.height, area.x, area.y, open, inner, close)
+        }
+    }
+}
+
+/// Compute tmux layout checksum (16-bit CSUM as used by tmux src/layout-custom.c).
+fn tmux_layout_checksum(layout: &str) -> u16 {
+    let mut csum: u16 = 0;
+    for &b in layout.as_bytes() {
+        csum = (csum >> 1) | ((csum & 1) << 15); // rotate right 1 bit
+        csum = csum.wrapping_add(b as u16);
+    }
+    csum
+}
+
 // ─────────────────────────── public API ───────────────────────────
 
 /// Expand tmux format strings for the active window.
@@ -737,7 +791,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_id" => format!("@{}", win.id),
         "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
         "window_zoomed_flag" => if app.zoom_saved.is_some() && win_idx == app.active_idx { "1".into() } else { "0".into() },
-        "window_layout" | "window_visible_layout" => format!("{}panes", count_panes(&win.root)),
+        "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, app.last_window_area),
         "window_width" => {
             if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_cols.to_string() } else { "80".into() }
         }
@@ -777,12 +831,29 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_active" => "1".into(),
         "pane_current_command" => {
             if let Some(p) = active_pane(&win.root, &win.active_path) {
-                if !p.title.is_empty() { p.title.clone() } else { "shell".into() }
+                // Query real foreground process name from PID
+                if let Some(pid) = p.child_pid {
+                    crate::platform::process_info::get_foreground_process_name(pid)
+                        .unwrap_or_else(|| "shell".into())
+                } else if !p.title.is_empty() {
+                    p.title.clone()
+                } else {
+                    "shell".into()
+                }
             } else { String::new() }
         }
         "pane_current_path" | "pane_path" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.title.clone() }
-            else { String::new() }
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                // Query real CWD from the deepest child process
+                if let Some(pid) = p.child_pid {
+                    crate::platform::process_info::get_foreground_cwd(pid)
+                        .unwrap_or_default()
+                } else {
+                    std::env::current_dir()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                }
+            } else { String::new() }
         }
         "pane_pid" => {
             if let Some(p) = active_pane(&win.root, &win.active_path) {

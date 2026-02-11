@@ -64,7 +64,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             
             let key_tuple = (key.code, key.modifiers);
             if let Some(bind) = app.key_tables.get("prefix").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
-                app.mode = Mode::Passthrough;
+                if bind.repeat {
+                    // Stay in prefix mode for repeat-time window
+                    app.mode = Mode::Prefix { armed_at: Instant::now() };
+                } else {
+                    app.mode = Mode::Passthrough;
+                }
                 return execute_action(app, &bind.action);
             }
             

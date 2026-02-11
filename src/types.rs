@@ -136,6 +136,7 @@ pub struct AppState {
     pub active_idx: usize,
     pub mode: Mode,
     pub escape_time_ms: u64,
+    pub repeat_time_ms: u64,
     pub prefix_key: (KeyCode, KeyModifiers),
     pub prediction_dimming: bool,
     pub drag: Option<DragState>,
@@ -244,6 +245,7 @@ impl AppState {
             active_idx: 0,
             mode: Mode::Passthrough,
             escape_time_ms: 500,
+            repeat_time_ms: 500,
             prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
             prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
@@ -328,6 +330,8 @@ pub enum Action {
     MoveFocus(FocusDir),
     /// Execute an arbitrary tmux-style command string
     Command(String),
+    /// Execute multiple tmux-style commands in sequence (`;` chaining)
+    CommandChain(Vec<String>),
     /// Common actions with direct handling
     NewWindow,
     SplitHorizontal,
@@ -344,7 +348,7 @@ pub enum Action {
 }
 
 #[derive(Clone)]
-pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action }
+pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
 
 pub enum CtrlReq {
     NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
@@ -417,10 +421,11 @@ pub enum CtrlReq {
     BreakPane,
     JoinPane(usize),
     RespawnPane,
-    BindKey(String, String, String),
+    BindKey(String, String, String, bool),  // table, key, command, repeat
     UnbindKey(String),
     ListKeys(mpsc::Sender<String>),
     SetOption(String, String),
+    SetOptionQuiet(String, String, bool),  // set-option with quiet flag
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
     ShowOptions(mpsc::Sender<String>),

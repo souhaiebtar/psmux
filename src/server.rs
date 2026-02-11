@@ -467,13 +467,32 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "send-keys" => {
                         let literal = args.iter().any(|a| *a == "-l");
                         let has_x = args.iter().any(|a| *a == "-X");
+                        // Parse -N <count> for repeat
+                        let mut repeat_count: usize = 1;
+                        if let Some(n_pos) = args.iter().position(|a| *a == "-N") {
+                            if let Some(count_str) = args.get(n_pos + 1) {
+                                repeat_count = count_str.parse::<usize>().unwrap_or(1).max(1);
+                            }
+                        }
                         if has_x {
                             // send-keys -X copy-mode-command
                             let cmd_parts: Vec<&str> = args.iter().filter(|a| **a != "-X" && !a.starts_with('-')).copied().collect();
-                            let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
+                            for _ in 0..repeat_count {
+                                let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
+                            }
                         } else {
-                            let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
-                            let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                            let keys: Vec<&str> = args.iter()
+                                .enumerate()
+                                .filter(|(i, a)| {
+                                    !a.starts_with('-') && **a != "-l" && **a != "-t"
+                                    // Skip the argument to -N
+                                    && !(i > &0 && args.get(i - 1).map_or(false, |prev| *prev == "-N"))
+                                })
+                                .map(|(_, a)| *a)
+                                .collect();
+                            for _ in 0..repeat_count {
+                                let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                            }
                         }
                     }
                     "select-pane" | "selectp" => {
@@ -481,6 +500,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             else if args.iter().any(|a| *a == "-D") { "D" }
                             else if args.iter().any(|a| *a == "-L") { "L" }
                             else if args.iter().any(|a| *a == "-R") { "R" }
+                            else if args.iter().any(|a| *a == "-l") { "last" }
                             else { "" };
                         let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
                     }
@@ -609,6 +629,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); if !persistent { let _ = write!(write_stream, "ok\n"); } }
                     "bind-key" | "bind" => {
                         let mut table = "prefix".to_string();
+                        let mut repeatable = false;
                         let mut i = 0;
                         while i < args.len() {
                             if args[i] == "-T" && i + 1 < args.len() {
@@ -616,6 +637,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 i += 2; continue;
                             } else if args[i] == "-n" {
                                 table = "root".to_string();
+                            } else if args[i] == "-r" {
+                                repeatable = true;
                             }
                             i += 1;
                         }
@@ -633,7 +656,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if non_flag_args.len() >= 2 {
                             let key = non_flag_args[0].to_string();
                             let command = non_flag_args[1..].join(" ");
-                            let _ = tx.send(CtrlReq::BindKey(table, key, command));
+                            let _ = tx.send(CtrlReq::BindKey(table, key, command, repeatable));
                         }
                     }
                     "unbind-key" | "unbind" => {
@@ -651,6 +674,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "set-option" | "set" | "set-window-option" | "setw" => {
                         let has_u = args.iter().any(|a| *a == "-u");
                         let has_a = args.iter().any(|a| *a == "-a");
+                        let has_q = args.iter().any(|a| *a == "-q");
                         let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
                         if has_u {
                             if let Some(option) = non_flag_args.first() {
@@ -662,8 +686,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             if has_a {
                                 let _ = tx.send(CtrlReq::SetOptionAppend(option, value));
                             } else {
-                                let _ = tx.send(CtrlReq::SetOption(option, value));
+                                let _ = tx.send(CtrlReq::SetOptionQuiet(option, value, has_q));
                             }
+                        } else if non_flag_args.len() == 1 && has_q {
+                            // set -q <option> with no value — silently ignore
                         }
                     }
                     "show-options" | "show" | "show-window-options" | "showw" => {
@@ -1652,6 +1678,15 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         "D" => { move_focus(&mut app, FocusDir::Down); }
                         "L" => { move_focus(&mut app, FocusDir::Left); }
                         "R" => { move_focus(&mut app, FocusDir::Right); }
+                        "last" => {
+                            // select-pane -l: switch to last active pane
+                            let win = &mut app.windows[app.active_idx];
+                            if !app.last_pane_path.is_empty() {
+                                let tmp = win.active_path.clone();
+                                win.active_path = app.last_pane_path.clone();
+                                app.last_pane_path = tmp;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1858,13 +1893,19 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::RespawnPane => {
                     respawn_active_pane(&mut app)?;
                 }
-                CtrlReq::BindKey(table_name, key, command) => {
+                CtrlReq::BindKey(table_name, key, command, repeat) => {
                     if let Some(kc) = parse_key_string(&key) {
-                        let action = parse_command_to_action(&command);
+                        // Support `\;` chaining in server-side bind-key
+                        let sub_cmds = crate::config::split_chained_commands_pub(&command);
+                        let action = if sub_cmds.len() > 1 {
+                            Some(Action::CommandChain(sub_cmds))
+                        } else {
+                            parse_command_to_action(&command)
+                        };
                         if let Some(act) = action {
                             let table = app.key_tables.entry(table_name).or_default();
                             table.retain(|b| b.key != kc);
-                            table.push(Bind { key: kc, action: act });
+                            table.push(Bind { key: kc, action: act, repeat });
                         }
                     }
                 }
@@ -1918,78 +1959,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::SetOption(option, value) => {
-                    match option.as_str() {
-                        "status-left" => { app.status_left = value; }
-                        "status-right" => { app.status_right = value; }
-                        "base-index" => {
-                            if let Ok(idx) = value.parse::<usize>() {
-                                app.window_base_index = idx;
-                            }
-                        }
-                        "pane-base-index" => {
-                            if let Ok(idx) = value.parse::<usize>() {
-                                app.pane_base_index = idx;
-                            }
-                        }
-                        "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
-                        "prefix" => {
-                            if let Some(kc) = parse_key_string(&value) {
-                                app.prefix_key = kc;
-                            }
-                        }
-                        "escape-time" => {
-                            if let Ok(ms) = value.parse::<u64>() {
-                                app.escape_time_ms = ms;
-                            }
-                        }
-                        "history-limit" => {
-                            if let Ok(limit) = value.parse::<usize>() {
-                                app.history_limit = limit;
-                            }
-                        }
-                        "display-time" => {
-                            if let Ok(ms) = value.parse::<u64>() {
-                                app.display_time_ms = ms;
-                            }
-                        }
-                        "display-panes-time" => {
-                            if let Ok(ms) = value.parse::<u64>() {
-                                app.display_panes_time_ms = ms;
-                            }
-                        }
-                        "mode-keys" => { app.mode_keys = value; }
-                        "status" => { app.status_visible = matches!(value.as_str(), "on" | "true" | "1" | "2"); }
-                        "status-position" => { app.status_position = value; }
-                        "status-style" => { app.status_style = value; }
-                        "focus-events" => { app.focus_events = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "renumber-windows" => { app.renumber_windows = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "remain-on-exit" => { app.remain_on_exit = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "set-titles" => { app.set_titles = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "set-titles-string" => { app.set_titles_string = value; }
-                        "default-command" | "default-shell" => { app.default_shell = value; }
-                        "word-separators" => { app.word_separators = value; }
-                        "aggressive-resize" => { app.aggressive_resize = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "monitor-activity" => { app.monitor_activity = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "visual-activity" => { app.visual_activity = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "synchronize-panes" => { app.sync_input = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "automatic-rename" => { app.automatic_rename = matches!(value.as_str(), "on" | "true" | "1"); }
-                        "prediction-dimming" | "dim-predictions" => {
-                            app.prediction_dimming = !matches!(value.as_str(), "off" | "false" | "0");
-                        }
-                        "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", &value); }
-                        "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", if matches!(value.as_str(), "on"|"true"|"1") { "1" } else { "0" }); }
-                        "pane-border-style" => { app.pane_border_style = value; }
-                        "pane-active-border-style" => { app.pane_active_border_style = value; }
-                        "window-status-format" => { app.window_status_format = value; }
-                        "window-status-current-format" => { app.window_status_current_format = value; }
-                        "window-status-separator" => { app.window_status_separator = value; }
-                        _ => {
-                            // Store @user-options (used by plugins like tmux-resurrect, tmux-continuum)
-                            if option.starts_with('@') {
-                                app.environment.insert(option, value);
-                            }
-                        }
-                    }
+                    apply_set_option(&mut app, &option, &value, false);
+                }
+                CtrlReq::SetOptionQuiet(option, value, quiet) => {
+                    apply_set_option(&mut app, &option, &value, quiet);
                 }
                 CtrlReq::SetOptionUnset(option) => {
                     // Reset option to default or remove @user-option
@@ -2484,4 +2457,122 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         // recv_timeout already handles the wait; no additional sleep needed.
     }
     Ok(())
+}
+
+/// Apply a set-option command. If `quiet` is true, unknown options are silently ignored.
+fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) {
+    match option {
+        "status-left" => { app.status_left = value.to_string(); }
+        "status-right" => { app.status_right = value.to_string(); }
+        "status-left-length" | "status-right-length" => {
+            // Store for format truncation (tmux-compatible)
+            app.environment.insert(format!("@{}", option), value.to_string());
+        }
+        "base-index" => {
+            if let Ok(idx) = value.parse::<usize>() {
+                app.window_base_index = idx;
+            }
+        }
+        "pane-base-index" => {
+            if let Ok(idx) = value.parse::<usize>() {
+                app.pane_base_index = idx;
+            }
+        }
+        "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
+        "prefix" => {
+            if let Some(kc) = crate::config::parse_key_string(value) {
+                app.prefix_key = kc;
+            }
+        }
+        "escape-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.escape_time_ms = ms;
+            }
+        }
+        "history-limit" => {
+            if let Ok(limit) = value.parse::<usize>() {
+                app.history_limit = limit;
+            }
+        }
+        "display-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_time_ms = ms;
+            }
+        }
+        "display-panes-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_panes_time_ms = ms;
+            }
+        }
+        "repeat-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.repeat_time_ms = ms;
+            }
+        }
+        "mode-keys" => { app.mode_keys = value.to_string(); }
+        "status" => { app.status_visible = matches!(value, "on" | "true" | "1" | "2"); }
+        "status-position" => { app.status_position = value.to_string(); }
+        "status-style" => { app.status_style = value.to_string(); }
+        // Deprecated but ubiquitous: map status-bg/status-fg to status-style
+        "status-bg" => {
+            let current = &app.status_style;
+            let filtered: String = current.split(',')
+                .filter(|s| !s.trim().starts_with("bg="))
+                .collect::<Vec<_>>().join(",");
+            app.status_style = if filtered.is_empty() {
+                format!("bg={}", value)
+            } else {
+                format!("{},bg={}", filtered, value)
+            };
+        }
+        "status-fg" => {
+            let current = &app.status_style;
+            let filtered: String = current.split(',')
+                .filter(|s| !s.trim().starts_with("fg="))
+                .collect::<Vec<_>>().join(",");
+            app.status_style = if filtered.is_empty() {
+                format!("fg={}", value)
+            } else {
+                format!("{},fg={}", filtered, value)
+            };
+        }
+        "focus-events" => { app.focus_events = matches!(value, "on" | "true" | "1"); }
+        "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1"); }
+        "remain-on-exit" => { app.remain_on_exit = matches!(value, "on" | "true" | "1"); }
+        "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1"); }
+        "set-titles-string" => { app.set_titles_string = value.to_string(); }
+        "default-command" | "default-shell" => { app.default_shell = value.to_string(); }
+        "word-separators" => { app.word_separators = value.to_string(); }
+        "aggressive-resize" => { app.aggressive_resize = matches!(value, "on" | "true" | "1"); }
+        "monitor-activity" => { app.monitor_activity = matches!(value, "on" | "true" | "1"); }
+        "visual-activity" => { app.visual_activity = matches!(value, "on" | "true" | "1"); }
+        "synchronize-panes" => { app.sync_input = matches!(value, "on" | "true" | "1"); }
+        "automatic-rename" => { app.automatic_rename = matches!(value, "on" | "true" | "1"); }
+        "prediction-dimming" | "dim-predictions" => {
+            app.prediction_dimming = !matches!(value, "off" | "false" | "0");
+        }
+        "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", value); }
+        "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", if matches!(value, "on"|"true"|"1") { "1" } else { "0" }); }
+        "pane-border-style" => { app.pane_border_style = value.to_string(); }
+        "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }
+        "window-status-format" => { app.window_status_format = value.to_string(); }
+        "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
+        "window-status-separator" => { app.window_status_separator = value.to_string(); }
+        "window-status-style" | "window-status-current-style" | "window-status-activity-style"
+        | "window-status-bell-style" | "window-status-last-style"
+        | "mode-style" | "message-style" | "message-command-style"
+        | "main-pane-width" | "main-pane-height" => {
+            // Store as environment for format access
+            app.environment.insert(format!("@{}", option), value.to_string());
+        }
+        _ => {
+            // Store @user-options (used by plugins like tmux-resurrect, tmux-continuum)
+            if option.starts_with('@') {
+                app.environment.insert(option.to_string(), value.to_string());
+            } else if !quiet {
+                // Unknown option — only emit warning if not -q mode
+                eprintln!("set-option: unknown option '{}'", option);
+            }
+        }
+    }
 }

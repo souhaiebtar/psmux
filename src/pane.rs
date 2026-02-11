@@ -14,7 +14,8 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
-    let shell_cmd = build_command(command);
+    let mut shell_cmd = build_command(command);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -64,7 +65,8 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
-    let shell_cmd = build_raw_command(raw_args);
+    let mut shell_cmd = build_raw_command(raw_args);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -107,7 +109,8 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
     let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
-    let shell_cmd = build_command(command);
+    let mut shell_cmd = build_command(command);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
@@ -148,6 +151,17 @@ pub fn kill_active_pane(app: &mut AppState) -> io::Result<()> {
 
 pub fn detect_shell() -> CommandBuilder {
     build_command(None)
+}
+
+/// Set TMUX and TMUX_PANE environment variables on a CommandBuilder.
+/// TMUX format: /tmp/psmux-{server_pid}/default,{server_pid},0
+/// TMUX_PANE format: %{pane_id}
+pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>) {
+    let server_pid = std::process::id();
+    let port = control_port.unwrap_or(0);
+    // Format compatible with tmux: <socket_path>,<pid>,<session_idx>
+    builder.env("TMUX", format!("/tmp/psmux-{}/default,{},0", server_pid, port));
+    builder.env("TMUX_PANE", format!("%{}", pane_id));
 }
 
 pub fn build_command(command: Option<&str>) -> CommandBuilder {
