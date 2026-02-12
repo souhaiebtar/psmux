@@ -18,6 +18,19 @@ pub struct Pane {
     pub last_cols: u16,
     pub id: usize,
     pub title: String,
+    /// Cached child process PID for Windows console mouse injection.
+    /// Lazily extracted on first mouse event.
+    pub child_pid: Option<u32>,
+    /// Monotonic counter incremented by the PTY reader thread each time new
+    /// output is processed.  Checked by the server to know when the screen
+    /// has actually changed (avoids serialising stale frames).
+    pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Timestamp of the last auto-rename foreground-process check (throttled to ~1/s).
+    pub last_title_check: Instant,
+    /// Timestamp of the last infer_title_from_prompt call in layout serialisation (throttled to ~2/s).
+    pub last_infer_title: Instant,
+    /// True when the child process has exited but remain-on-exit keeps the pane visible.
+    pub dead: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -33,6 +46,19 @@ pub struct Window {
     pub active_path: Vec<usize>,
     pub name: String,
     pub id: usize,
+    /// Activity flag: set when pane output is received while window is not active
+    pub activity_flag: bool,
+    /// Bell flag: set when a bell (\x07) is detected in a pane
+    pub bell_flag: bool,
+    /// Silence flag: set when no output for monitor-silence seconds
+    pub silence_flag: bool,
+    /// Last output timestamp for silence detection
+    pub last_output_time: std::time::Instant,
+    /// Last observed combined data_version for activity detection
+    pub last_seen_version: u64,
+    /// True when the user has manually renamed this window (auto-rename won't override).
+    /// Cleared when `set automatic-rename on` is explicitly set.
+    pub manual_rename: bool,
 }
 
 /// A menu item for display-menu
@@ -61,6 +87,13 @@ pub struct Hook {
     pub command: String,
 }
 
+/// Interactive PTY for popup window (supports fzf, etc.)
+pub struct PopupPty {
+    pub master: Box<dyn portable_pty::MasterPty>,
+    pub child: Box<dyn portable_pty::Child>,
+    pub term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+}
+
 /// Pipe pane state - process piping pane output
 pub struct PipePaneState {
     pub pane_id: usize,
@@ -78,14 +111,15 @@ pub struct WaitChannel {
 pub enum Mode {
     Passthrough,
     Prefix { armed_at: Instant },
-    CommandPrompt { input: String },
-    WindowChooser { selected: usize },
+    CommandPrompt { input: String, cursor: usize },
+    WindowChooser { selected: usize, tree: Vec<crate::session::TreeEntry> },
     RenamePrompt { input: String },
+    RenameSessionPrompt { input: String },
     CopyMode,
     PaneChooser { opened_at: Instant },
     /// Interactive menu mode
     MenuMode { menu: Menu },
-    /// Popup window running a command
+    /// Popup window running a command (with optional PTY for interactive programs)
     PopupMode { 
         command: String, 
         output: String, 
@@ -93,6 +127,8 @@ pub enum Mode {
         width: u16,
         height: u16,
         close_on_exit: bool,
+        /// Optional: interactive PTY for the popup (fzf, etc.)  
+        popup_pty: Option<PopupPty>,
     },
     /// Confirmation prompt before command
     ConfirmMode { 
@@ -100,7 +136,19 @@ pub enum Mode {
         command: String,
         input: String,
     },
+    /// Copy-mode search input
+    CopySearch {
+        input: String,
+        forward: bool,
+    },
+    /// Big clock display (tmux clock-mode)
+    ClockMode,
+    /// Interactive buffer chooser (prefix =)
+    BufferChooser { selected: usize },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SelectionMode { Char, Line, Rect }
 
 #[derive(Debug, Clone, Copy)]
 pub enum FocusDir { Left, Right, Up, Down }
@@ -110,8 +158,7 @@ pub struct AppState {
     pub active_idx: usize,
     pub mode: Mode,
     pub escape_time_ms: u64,
-    pub refresh_interval_ms: u64,
-    pub scrollback_lines: usize,
+    pub repeat_time_ms: u64,
     pub prefix_key: (KeyCode, KeyModifiers),
     pub prediction_dimming: bool,
     pub drag: Option<DragState>,
@@ -124,8 +171,21 @@ pub struct AppState {
     pub copy_anchor: Option<(u16,u16)>,
     pub copy_pos: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,
+    /// Selection mode: Char (default), Line (V), Rect (C-v)
+    pub copy_selection_mode: SelectionMode,
+    /// Copy-mode search query
+    pub copy_search_query: String,
+    /// Copy-mode search matches: (row, col_start, col_end) in screen coords
+    pub copy_search_matches: Vec<(u16, u16, u16)>,
+    /// Current match index in copy_search_matches
+    pub copy_search_idx: usize,
+    /// Search direction: true = forward (/), false = backward (?)
+    pub copy_search_forward: bool,
+    /// Pending find-char operation: (f=0,F=1,t=2,T=3) for next char input
+    pub copy_find_char_pending: Option<u8>,
     pub display_map: Vec<(usize, Vec<usize>)>,
-    pub binds: Vec<Bind>,
+    /// Key tables: "prefix" (default), "root", "copy-mode-vi", "copy-mode-emacs", etc.
+    pub key_tables: std::collections::HashMap<String, Vec<Bind>>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_name: String,
@@ -145,22 +205,187 @@ pub struct AppState {
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
-    /// Cached compute_rects results for the active window
-    pub scratch_rects: Vec<(Vec<usize>, ratatui::prelude::Rect)>,
-    /// Cached compute_split_borders results for the active window
-    pub scratch_borders: Vec<(Vec<usize>, LayoutKind, usize, u16)>,
-    /// Cached rects area used for scratch_rects
-    pub rects_cache_area: Rect,
-    /// Cached rects window id used for scratch_rects
-    pub rects_cache_window_id: Option<usize>,
-    /// Whether scratch_rects must be rebuilt
-    pub rects_cache_dirty: bool,
-    /// Cached borders area used for scratch_borders
-    pub borders_cache_area: Rect,
-    /// Cached borders window id used for scratch_borders
-    pub borders_cache_window_id: Option<usize>,
-    /// Whether scratch_borders must be rebuilt
-    pub borders_cache_dirty: bool,
+    /// Tab positions on status bar: (window_index, x_start, x_end)
+    pub tab_positions: Vec<(usize, u16, u16)>,
+    /// history-limit: scrollback buffer size (default 2000)
+    pub history_limit: usize,
+    /// display-time: how long messages are shown (ms, default 750)
+    pub display_time_ms: u64,
+    /// display-panes-time: how long pane overlay is shown (ms, default 1000)
+    pub display_panes_time_ms: u64,
+    /// pane-base-index: first pane id (default 0)
+    pub pane_base_index: usize,
+    /// focus-events: pass focus events to apps
+    pub focus_events: bool,
+    /// mode-keys: vi or emacs (stored for compat, default emacs)
+    pub mode_keys: String,
+    /// status: whether status bar is shown
+    pub status_visible: bool,
+    /// status-position: "top" or "bottom" (default "bottom")
+    pub status_position: String,
+    /// status-style: stored for compat
+    pub status_style: String,
+    /// default-command / default-shell: shell to launch for new panes
+    pub default_shell: String,
+    /// word-separators: characters that delimit words in copy mode
+    pub word_separators: String,
+    /// renumber-windows: auto-renumber on close
+    pub renumber_windows: bool,
+    /// automatic-rename: update window name from active pane's running command
+    pub automatic_rename: bool,
+    /// monitor-activity / visual-activity: stored for compat
+    pub monitor_activity: bool,
+    pub visual_activity: bool,
+    /// remain-on-exit: keep panes open after process exits
+    pub remain_on_exit: bool,
+    /// aggressive-resize: resize window to smallest attached client
+    pub aggressive_resize: bool,
+    /// set-titles: update terminal title
+    pub set_titles: bool,
+    /// set-titles-string: format for terminal title
+    pub set_titles_string: String,
+    /// Environment variables set via set-environment
+    pub environment: std::collections::HashMap<String, String>,
+    /// pane-border-style: style for inactive pane borders
+    pub pane_border_style: String,
+    /// pane-active-border-style: style for active pane borders
+    pub pane_active_border_style: String,
+    /// window-status-format: format for inactive window tabs
+    pub window_status_format: String,
+    /// window-status-current-format: format for active window tab
+    pub window_status_current_format: String,
+    /// window-status-separator: between window status entries
+    pub window_status_separator: String,
+    /// window-status-style: style for inactive window status
+    pub window_status_style: String,
+    /// window-status-current-style: style for active window status
+    pub window_status_current_style: String,
+    /// window-status-activity-style: style for windows with activity
+    pub window_status_activity_style: String,
+    /// window-status-bell-style: style for windows with bell
+    pub window_status_bell_style: String,
+    /// window-status-last-style: style for last active window
+    pub window_status_last_style: String,
+    /// message-style: style for status-line messages
+    pub message_style: String,
+    /// message-command-style: style for command prompt
+    pub message_command_style: String,
+    /// mode-style: style for copy-mode highlighting
+    pub mode_style: String,
+    /// status-left-style: style for status-left area
+    pub status_left_style: String,
+    /// status-right-style: style for status-right area
+    pub status_right_style: String,
+    /// Marked pane: (window_index, pane_id) — set by select-pane -m
+    pub marked_pane: Option<(usize, usize)>,
+    /// monitor-silence: seconds of silence before flagging (0 = off)
+    pub monitor_silence: u64,
+    /// bell-action: "any", "none", "current", "other"
+    pub bell_action: String,
+    /// visual-bell: show visual indicator on bell
+    pub visual_bell: bool,
+    /// Command prompt history
+    pub command_history: Vec<String>,
+    /// Command prompt history index (for up/down navigation)
+    pub command_history_idx: usize,
+    /// status-interval: seconds between status-line refreshes (default 15)
+    pub status_interval: u64,
+    /// status-justify: left, centre, right, absolute-centre
+    pub status_justify: String,
+}
+
+impl AppState {
+    /// Create a new AppState with sensible defaults.
+    /// Caller should set `session_name` and call `load_config()` after construction.
+    pub fn new(session_name: String) -> Self {
+        Self {
+            windows: Vec::new(),
+            active_idx: 0,
+            mode: Mode::Passthrough,
+            escape_time_ms: 500,
+            repeat_time_ms: 500,
+            prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+            prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            drag: None,
+            last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
+            mouse_enabled: true,
+            paste_buffers: Vec::new(),
+            status_left: "[#S] ".to_string(),
+            status_right: "\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
+            window_base_index: 1,
+            copy_anchor: None,
+            copy_pos: None,
+            copy_scroll_offset: 0,
+            copy_selection_mode: SelectionMode::Char,
+            copy_search_query: String::new(),
+            copy_search_matches: Vec::new(),
+            copy_search_idx: 0,
+            copy_search_forward: true,
+            copy_find_char_pending: None,
+            display_map: Vec::new(),
+            key_tables: std::collections::HashMap::new(),
+            control_rx: None,
+            control_port: None,
+            session_name,
+            attached_clients: 0,
+            created_at: Local::now(),
+            next_win_id: 1,
+            next_pane_id: 1,
+            zoom_saved: None,
+            sync_input: false,
+            hooks: std::collections::HashMap::new(),
+            wait_channels: std::collections::HashMap::new(),
+            pipe_panes: Vec::new(),
+            last_window_idx: 0,
+            last_pane_path: Vec::new(),
+            tab_positions: Vec::new(),
+            history_limit: 2000,
+            display_time_ms: 750,
+            display_panes_time_ms: 1000,
+            pane_base_index: 0,
+            focus_events: false,
+            mode_keys: "emacs".to_string(),
+            status_visible: true,
+            status_position: "bottom".to_string(),
+            status_style: "bg=green,fg=black".to_string(),
+            default_shell: String::new(),
+            word_separators: " -_@".to_string(),
+            renumber_windows: false,
+            automatic_rename: true,
+            monitor_activity: false,
+            visual_activity: false,
+            remain_on_exit: false,
+            aggressive_resize: false,
+            set_titles: false,
+            set_titles_string: String::new(),
+            environment: std::collections::HashMap::new(),
+            pane_border_style: String::new(),
+            pane_active_border_style: "fg=green".to_string(),
+            window_status_format: "#I:#W#{?window_flags,#{window_flags}, }".to_string(),
+            window_status_current_format: "#I:#W#{?window_flags,#{window_flags}, }".to_string(),
+            window_status_separator: " ".to_string(),
+            window_status_style: String::new(),
+            window_status_current_style: String::new(),
+            window_status_activity_style: "reverse".to_string(),
+            window_status_bell_style: "reverse".to_string(),
+            window_status_last_style: String::new(),
+            message_style: "bg=yellow,fg=black".to_string(),
+            message_command_style: "bg=black,fg=yellow".to_string(),
+            mode_style: "bg=yellow,fg=black".to_string(),
+            status_left_style: String::new(),
+            status_right_style: String::new(),
+            marked_pane: None,
+            monitor_silence: 0,
+            bell_action: "any".to_string(),
+            visual_bell: false,
+            command_history: Vec::new(),
+            command_history_idx: 0,
+            status_interval: 15,
+            status_justify: "left".to_string(),
+        }
+    }
 }
 
 pub struct DragState {
@@ -171,6 +396,8 @@ pub struct DragState {
     pub start_y: u16,
     pub left_initial: u16,
     pub _right_initial: u16,
+    /// Total pixel dimension of the parent split area along the split axis.
+    pub total_pixels: u16,
 }
 
 #[derive(Clone)]
@@ -179,6 +406,8 @@ pub enum Action {
     MoveFocus(FocusDir),
     /// Execute an arbitrary tmux-style command string
     Command(String),
+    /// Execute multiple tmux-style commands in sequence (`;` chaining)
+    CommandChain(Vec<String>),
     /// Common actions with direct handling
     NewWindow,
     SplitHorizontal,
@@ -195,13 +424,14 @@ pub enum Action {
 }
 
 #[derive(Clone)]
-pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action }
+pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>),
-    SplitWindow(LayoutKind, Option<String>),
+    NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
     KillPane,
     CapturePane(mpsc::Sender<String>),
+    CapturePaneStyled(mpsc::Sender<String>),
     FocusWindow(usize),
     FocusPane(usize),
     FocusPaneByIndex(usize),
@@ -216,6 +446,7 @@ pub enum CtrlReq {
     SendPaste(String),
     ZoomPane,
     CopyEnter,
+    CopyEnterPageUp,
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
@@ -223,21 +454,32 @@ pub enum CtrlReq {
     FocusPaneCmd(usize),
     FocusWindowCmd(usize),
     MouseDown(u16,u16),
+    MouseDownRight(u16,u16),
+    MouseDownMiddle(u16,u16),
     MouseDrag(u16,u16),
     MouseUp(u16,u16),
+    MouseUpRight(u16,u16),
+    MouseUpMiddle(u16,u16),
+    MouseMove(u16,u16),
     ScrollUp(u16, u16),
     ScrollDown(u16, u16),
     NextWindow,
     PrevWindow,
     RenameWindow(String),
     ListWindows(mpsc::Sender<String>),
+    ListWindowsTmux(mpsc::Sender<String>),
+    ListWindowsFormat(mpsc::Sender<String>, String),
     ListTree(mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
     SendKeys(String, bool),
+    SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String),
     SelectWindow(usize),
     ListPanes(mpsc::Sender<String>),
+    ListPanesFormat(mpsc::Sender<String>, String),
+    ListAllPanes(mpsc::Sender<String>),
+    ListAllPanesFormat(mpsc::Sender<String>, String),
     KillWindow,
     KillSession,
     HasSession(mpsc::Sender<bool>),
@@ -246,7 +488,9 @@ pub enum CtrlReq {
     ResizePane(String, u16),
     SetBuffer(String),
     ListBuffers(mpsc::Sender<String>),
+    ListBuffersFormat(mpsc::Sender<String>, String),
     ShowBuffer(mpsc::Sender<String>),
+    ShowBufferAt(mpsc::Sender<String>, usize),
     DeleteBuffer,
     DisplayMessage(mpsc::Sender<String>, String),
     LastWindow,
@@ -256,10 +500,13 @@ pub enum CtrlReq {
     BreakPane,
     JoinPane(usize),
     RespawnPane,
-    BindKey(String, String),
+    BindKey(String, String, String, bool),  // table, key, command, repeat
     UnbindKey(String),
     ListKeys(mpsc::Sender<String>),
     SetOption(String, String),
+    SetOptionQuiet(String, String, bool),  // set-option with quiet flag
+    SetOptionUnset(String),  // set-option -u
+    SetOptionAppend(String, String),  // set-option -a
     ShowOptions(mpsc::Sender<String>),
     SourceFile(String),
     MoveWindow(Option<usize>),
@@ -290,6 +537,17 @@ pub enum CtrlReq {
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayPopup(String, u16, u16, bool),
     ConfirmBefore(String, String),
+    ClockMode,
+    ResizePaneAbsolute(String, u16),
+    ShowOptionValue(mpsc::Sender<String>, String),
+    ChooseBuffer(mpsc::Sender<String>),
+    ServerInfo(mpsc::Sender<String>),
+    SendPrefix,
+    PrevLayout,
+    ResizeWindow(String, u16),
+    RespawnWindow,
+    FocusIn,
+    FocusOut,
 }
 
 /// Wait-for operation types

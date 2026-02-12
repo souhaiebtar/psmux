@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::env;
 
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -13,6 +14,215 @@ use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
 use crate::config::parse_key_string;
+use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::layout::RowRunsJson;
+use crate::tree::split_with_gaps;
+
+/// Parse a tmux-style color name to a ratatui Color.
+/// Supports: "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+/// "default", "colour0"-"colour255", "#rrggbb", and "brightX" variants.
+fn parse_tmux_color(s: &str) -> Option<Color> {
+    match s.trim().to_lowercase().as_str() {
+        "default" | "" => None,
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "brightblack" => Some(Color::DarkGray),
+        "brightred" => Some(Color::LightRed),
+        "brightgreen" => Some(Color::LightGreen),
+        "brightyellow" => Some(Color::LightYellow),
+        "brightblue" => Some(Color::LightBlue),
+        "brightmagenta" => Some(Color::LightMagenta),
+        "brightcyan" => Some(Color::LightCyan),
+        "brightwhite" => Some(Color::Gray),
+        s if s.starts_with("colour") || s.starts_with("color") => {
+            let num_part = if s.starts_with("colour") { &s[6..] } else { &s[5..] };
+            num_part.parse::<u8>().ok().map(Color::Indexed)
+        }
+        s if s.starts_with('#') && s.len() == 7 => {
+            let r = u8::from_str_radix(&s[1..3], 16).ok()?;
+            let g = u8::from_str_radix(&s[3..5], 16).ok()?;
+            let b = u8::from_str_radix(&s[5..7], 16).ok()?;
+            Some(Color::Rgb(r, g, b))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a tmux status-style string like "fg=white,bg=blue,bold" into (fg, bg, bold).
+fn parse_tmux_style(style: &str) -> (Option<Color>, Option<Color>, bool) {
+    let mut fg = None;
+    let mut bg = None;
+    let mut bold = false;
+    for part in style.split(',') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("fg=") {
+            fg = parse_tmux_color(val);
+        } else if let Some(val) = part.strip_prefix("bg=") {
+            bg = parse_tmux_color(val);
+        } else if part == "bold" {
+            bold = true;
+        } else if part == "nobold" {
+            bold = false;
+        }
+    }
+    (fg, bg, bold)
+}
+
+/// Extract selected text from the layout tree given absolute terminal coordinates.
+/// Computes pane areas via the same Layout splitting render_json uses, then reads
+/// characters from the run-length-encoded rows_v2 data.
+fn extract_selection_text(
+    layout: &LayoutJson,
+    term_width: u16,
+    content_height: u16, // excluding status bar
+    start: (u16, u16),   // (col, row)
+    end: (u16, u16),
+) -> String {
+    // Normalise so (r0,c0) <= (r1,c1) in reading order
+    let (r0, c0, r1, c1) = if (start.1, start.0) <= (end.1, end.0) {
+        (start.1, start.0, end.1, end.0)
+    } else {
+        (end.1, end.0, start.1, start.0)
+    };
+
+    // Collect leaf panes with their inner areas and content
+    struct PaneLeaf<'a> {
+        inner: Rect,
+        rows_v2: &'a [RowRunsJson],
+    }
+
+    fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
+        match node {
+            LayoutJson::Leaf { rows_v2, .. } => {
+                // No borders — content fills entire area (tmux-style)
+                out.push(PaneLeaf { inner: area, rows_v2 });
+            }
+            LayoutJson::Split { kind, sizes, children } => {
+                let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                    sizes.clone()
+                } else {
+                    vec![(100 / children.len().max(1)) as u16; children.len()]
+                };
+                let is_horizontal = kind == "Horizontal";
+                let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() {
+                        collect_leaves(child, rects[i], out);
+                    }
+                }
+            }
+        }
+    }
+
+    let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
+    let mut leaves: Vec<PaneLeaf> = Vec::new();
+    collect_leaves(layout, content_area, &mut leaves);
+
+    // Helper: get character at a local column position within a row's runs
+    fn char_at_col(runs: &[crate::layout::CellRunJson], local_col: usize) -> char {
+        let mut cursor = 0usize;
+        for run in runs {
+            let run_width = run.width.max(1) as usize;
+            if local_col >= cursor && local_col < cursor + run_width {
+                let offset = local_col - cursor;
+                // Run text may be shorter than run_width (e.g. single char repeated)
+                // or multi-char for wide chars. Pick the nth char if available.
+                return run.text.chars().nth(offset).unwrap_or(' ');
+            }
+            cursor += run_width;
+        }
+        ' '
+    }
+
+    let mut result = String::new();
+    for row in r0..=r1 {
+        let col_start = if row == r0 { c0 } else { 0 };
+        let col_end = if row == r1 { c1 } else { term_width.saturating_sub(1) };
+
+        let mut line = String::new();
+        for col in col_start..=col_end {
+            let mut ch = ' ';
+            for leaf in &leaves {
+                let inner = &leaf.inner;
+                if col >= inner.x && col < inner.x + inner.width
+                    && row >= inner.y && row < inner.y + inner.height
+                {
+                    let local_row = (row - inner.y) as usize;
+                    let local_col = (col - inner.x) as usize;
+                    if local_row < leaf.rows_v2.len() {
+                        ch = char_at_col(&leaf.rows_v2[local_row].runs, local_col);
+                    }
+                    break;
+                }
+            }
+            line.push(ch);
+        }
+        // Trim trailing whitespace per line
+        let trimmed = line.trim_end();
+        result.push_str(trimmed);
+        if row < r1 {
+            result.push('\n');
+        }
+    }
+
+    result
+}
+
+/// Check if screen coordinates (x, y) fall on a separator line in the layout.
+/// Used to distinguish border-drag (resize) from text selection on left-click.
+fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
+    match layout {
+        LayoutJson::Leaf { .. } => false,
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+
+            // Check if (x, y) is on any separator between children
+            for i in 0..children.len().saturating_sub(1) {
+                if i >= rects.len() { break; }
+                if is_horizontal {
+                    let sep_x = rects[i].x + rects[i].width;
+                    if x == sep_x && y >= area.y && y < area.y + area.height {
+                        return true;
+                    }
+                } else {
+                    let sep_y = rects[i].y + rects[i].height;
+                    if y == sep_y && x >= area.x && x < area.x + area.width {
+                        return true;
+                    }
+                }
+            }
+
+            // Recurse into children
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() && is_on_separator(child, rects[i], x, y) {
+                    return true;
+                }
+            }
+
+            false
+        }
+    }
+}
+
+/// Check if any leaf in a LayoutJson subtree is the active pane.
+fn has_active_leaf(node: &LayoutJson) -> bool {
+    match node {
+        LayoutJson::Leaf { active, .. } => *active,
+        LayoutJson::Split { children, .. } => children.iter().any(|c| has_active_leaf(c)),
+    }
+}
 
 pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
@@ -46,35 +256,46 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let _ = writer.write_all(b"client-attach\n");
     let _ = writer.flush();
 
-    // Set read timeout for dump-state responses (generous but bounded)
-    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_millis(2000)));
-    let mut use_framed_dump = false;
-    let mut proto_line = String::new();
-    if writer.write_all(b"protocol framed\n").is_ok()
-        && writer.flush().is_ok()
-        && reader.read_line(&mut proto_line).is_ok()
-        && proto_line.trim().eq_ignore_ascii_case("ok")
-    {
-        use_framed_dump = true;
-    }
+    // Spawn a dedicated reader thread so the event loop never blocks on I/O.
+    // The reader thread reads lines from the server and sends them via channel.
+    let _ = reader.get_ref().set_read_timeout(None); // blocking reads in reader thread
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = String::with_capacity(64 * 1024);
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = std::mem::take(&mut buf);
+                    buf = String::with_capacity(64 * 1024);
+                    if frame_tx.send(line).is_err() { break; }
+                }
+            }
+        }
+    });
 
     let mut quit = false;
     let mut prefix_armed = false;
     let mut renaming = false;
+    let mut session_renaming = false;
     let mut rename_buf = String::new();
     let mut pane_renaming = false;
     let mut pane_title_buf = String::new();
+    let mut command_input = false;
+    let mut command_buf = String::new();
     let mut chooser = false;
     let mut choices: Vec<(usize, usize)> = Vec::new();
     let mut tree_chooser = false;
-    let mut tree_entries: Vec<(bool, usize, usize, String)> = Vec::new();
+    let mut tree_entries: Vec<(bool, usize, usize, String, String)> = Vec::new();  // (is_win, id, sub_id, label, session_name)
     let mut tree_selected: usize = 0;
     let mut session_chooser = false;
     let mut session_entries: Vec<(String, String)> = Vec::new();
     let mut session_selected: usize = 0;
+    let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
     let current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
-    let mut last_event_time = Instant::now();
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
     let mut force_dump = true;
     let mut last_tree: Vec<WinTree> = Vec::new();
@@ -82,10 +303,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
     // Precompute the raw control character for the default prefix
     let mut prefix_raw_char: Option<char> = Some('\x02');
-    let mut target_idle_refresh_ms: u64 = 40;
+    // Status bar style from server (parsed from tmux status-style format)
+    let mut status_fg: Color = Color::Black;
+    let mut status_bg: Color = Color::Green;
+    let mut status_bold: bool = false;
+    let mut custom_status_left: Option<String> = None;
+    let mut custom_status_right: Option<String> = None;
+    let mut pane_border_fg: Color = Color::DarkGray;
+    let mut pane_active_border_fg: Color = Color::Green;
+    let mut win_status_fmt: String = "#I:#W#F".to_string();
+    let mut win_status_current_fmt: String = "#I:#W#F".to_string();
+    let mut win_status_sep: String = " ".to_string();
 
     #[derive(serde::Deserialize, Default)]
-    struct WinStatus { id: usize, name: String, active: bool }
+    struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool, #[serde(default)] tab_text: String }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
@@ -103,129 +334,76 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         base_index: usize,
         #[serde(default = "default_prediction_dimming")]
         prediction_dimming: bool,
-        #[serde(default = "default_refresh_ms")]
-        refresh_ms: u64,
+        #[serde(default)]
+        status_style: Option<String>,
+        #[serde(default)]
+        status_left: Option<String>,
+        #[serde(default)]
+        status_right: Option<String>,
+        #[serde(default)]
+        pane_border_style: Option<String>,
+        #[serde(default)]
+        pane_active_border_style: Option<String>,
+        /// window-status-format (short key to save bandwidth)
+        #[serde(default)]
+        wsf: Option<String>,
+        /// window-status-current-format
+        #[serde(default)]
+        wscf: Option<String>,
+        /// window-status-separator
+        #[serde(default)]
+        wss: Option<String>,
+        /// clock-mode active
+        #[serde(default)]
+        clock_mode: bool,
     }
 
-    #[derive(serde::Deserialize)]
-    struct DumpDeltaPayload {
-        panes: Vec<PaneDeltaJson>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct DumpDelta {
-        delta: DumpDeltaPayload,
-    }
-
-    fn trim_dump_line(buf: &mut Vec<u8>) {
-        while matches!(buf.last(), Some(b'\n' | b'\r')) {
-            buf.pop();
-        }
-    }
-
-    fn trim_reusable_buf(buf: &mut Vec<u8>, max_cap: usize) {
-        if buf.capacity() > max_cap {
-            buf.shrink_to(max_cap);
-        }
-    }
-
-    #[cfg(feature = "simd-json")]
-    fn parse_dump_state(buf: &mut Vec<u8>) -> Option<DumpState> {
-        simd_json::serde::from_slice::<DumpState>(buf.as_mut_slice()).ok()
-    }
-
-    #[cfg(not(feature = "simd-json"))]
-    fn parse_dump_state(buf: &mut Vec<u8>) -> Option<DumpState> {
-        serde_json::from_slice::<DumpState>(buf.as_slice()).ok()
-    }
-
-    #[cfg(feature = "simd-json")]
-    fn parse_dump_delta(buf: &mut Vec<u8>) -> Option<DumpDelta> {
-        simd_json::serde::from_slice::<DumpDelta>(buf.as_mut_slice()).ok()
-    }
-
-    #[cfg(not(feature = "simd-json"))]
-    fn parse_dump_delta(buf: &mut Vec<u8>) -> Option<DumpDelta> {
-        serde_json::from_slice::<DumpDelta>(buf.as_slice()).ok()
-    }
-
-    fn parse_frame_header_len(line: &[u8]) -> Option<usize> {
-        let s = std::str::from_utf8(line).ok()?;
-        let raw = s.trim();
-        let len = raw.strip_prefix("FRAME ")?;
-        len.parse::<usize>().ok()
-    }
-
-    fn apply_pane_deltas(root: &mut LayoutJson, deltas: Vec<PaneDeltaJson>) -> usize {
-        fn rec(node: &mut LayoutJson, by_id: &mut HashMap<usize, PaneDeltaJson>, applied: &mut usize) {
-            match node {
-                LayoutJson::Leaf {
-                    id,
-                    cursor_row,
-                    cursor_col,
-                    alternate_screen,
-                    rows_v2,
-                    ..
-                } => {
-                    if let Some(mut delta) = by_id.remove(id) {
-                        *cursor_row = delta.cursor_row;
-                        *cursor_col = delta.cursor_col;
-                        *alternate_screen = delta.alternate_screen;
-                        *rows_v2 = std::mem::take(&mut delta.rows_v2);
-                        *applied += 1;
-                    }
-                }
-                LayoutJson::Split { children, .. } => {
-                    for child in children.iter_mut() {
-                        rec(child, by_id, applied);
-                        if by_id.is_empty() {
-                            break;
-                        }
-                    }
-                }
+    let mut cmd_batch: Vec<String> = Vec::new();
+    let mut dump_buf = String::new();
+    let mut prev_dump_buf = String::new();
+    let mut last_key_send_time: Option<Instant> = None;
+    let mut dump_in_flight = false;
+    // Text selection state (client-side only, left-click drag like pwsh)
+    let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
+    let mut rsel_end: Option<(u16, u16)> = None;
+    let mut rsel_dragged = false;
+    let mut selection_changed = false; // forces redraw for selection overlay
+    let mut border_drag = false; // true when dragging a pane separator (resize)
+    loop {
+        // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
+        // Drain channel, keeping only the most recent frame.
+        let mut got_frame = false;
+        loop {
+            match frame_rx.try_recv() {
+                Ok(line) => { dump_buf = line; got_frame = true; dump_in_flight = false; }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { quit = true; break; }
             }
         }
+        if quit && !got_frame { break; }
 
-        let mut by_id: HashMap<usize, PaneDeltaJson> = HashMap::with_capacity(deltas.len());
-        for delta in deltas {
-            by_id.insert(delta.id, delta);
-        }
-        let mut applied = 0usize;
-        rec(root, &mut by_id, &mut applied);
-        applied
-    }
-
-    const MAX_STATE_BUF_CAP: usize = 2 * 1024 * 1024;
-    let mut state_buf: Vec<u8> = Vec::with_capacity(262_144);
-    let mut last_state_buf: Vec<u8> = Vec::with_capacity(262_144);
-    let mut cached_root: Option<LayoutJson> = None;
-    let mut cached_windows: Vec<WinStatus> = Vec::new();
-    let mut cached_base_index: usize = default_base_index();
-    let mut cached_dim_preds: bool = default_prediction_dimming();
-    let mut cmd_batch: Vec<String> = Vec::with_capacity(64);
-
-    loop {
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
-        // Fast polling when typing (1ms), relaxed when idle (16ms ≈ 60fps)
-        let since_last = last_event_time.elapsed().as_millis();
-        let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
-        let idle_refresh_ms = if overlays_active { 33 } else { target_idle_refresh_ms.clamp(16, 250) };
-        let elapsed_since_dump = last_dump_time.elapsed().as_millis() as u64;
-        let until_dump_deadline = idle_refresh_ms.saturating_sub(elapsed_since_dump);
-        let poll_ms: u64 = if since_last < 50 {
-            1
-        } else if since_last < 200 {
-            5
-        } else {
-            until_dump_deadline.max(1)
-        };
+        let since_dump = last_dump_time.elapsed().as_millis() as u64;
+        // Expire typing timer after 100ms of no new keys
+        if let Some(kt) = last_key_send_time {
+            if kt.elapsed().as_millis() > 100 { last_key_send_time = None; }
+        }
+        let typing_active = last_key_send_time.is_some();
+        // When typing: dump ASAP, round-trip is the natural rate limiter.
+        // When idle: 50ms refresh (20fps) saves CPU.
+        let poll_ms = if got_frame { 0 }
+            else if dump_in_flight { 1 }
+            else if force_dump { 0 }
+            else if typing_active { 0 }             // dump immediately — no artificial wait
+            else {
+                let idle_frame: u64 = 50;
+                let remaining = idle_frame.saturating_sub(since_dump);
+                if remaining == 0 { 0 } else { remaining.min(50) }
+            };
 
         cmd_batch.clear();
-        let mut had_input_event = false;
         if event::poll(Duration::from_millis(poll_ms))? {
-            last_event_time = Instant::now();
             loop {
-                had_input_event = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -235,39 +413,177 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
 
                         if is_ctrl_q { quit = true; }
+                        // Overlay Esc must be checked BEFORE selection-Esc so that
+                        // pressing Esc always closes the active overlay first.
+                        else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
+                            command_input = false;
+                            renaming = false;
+                            pane_renaming = false;
+                            chooser = false;
+                            tree_chooser = false;
+                            session_chooser = false;
+                            confirm_cmd = None;
+                            // Also clear any lingering selection
+                            rsel_start = None;
+                            rsel_end = None;
+                            selection_changed = true;
+                        }
+                        else if rsel_start.is_some() && matches!(key.code, KeyCode::Esc) {
+                            // Escape clears any active text selection
+                            rsel_start = None;
+                            rsel_end = None;
+                            selection_changed = true;
+                        }
                         else if is_prefix { prefix_armed = true; }
                         else if prefix_armed {
                             match key.code {
                                 KeyCode::Char('c') => { cmd_batch.push("new-window\n".into()); }
                                 KeyCode::Char('%') => { cmd_batch.push("split-window -h\n".into()); }
                                 KeyCode::Char('"') => { cmd_batch.push("split-window -v\n".into()); }
-                                KeyCode::Char('x') => { cmd_batch.push("kill-pane\n".into()); }
-                                KeyCode::Char('&') => { cmd_batch.push("kill-window\n".into()); }
+                                KeyCode::Char('x') => { confirm_cmd = Some("kill-pane".into()); }
+                                KeyCode::Char('&') => { confirm_cmd = Some("kill-window".into()); }
                                 KeyCode::Char('z') => { cmd_batch.push("zoom-pane\n".into()); }
-                                KeyCode::Char('[') | KeyCode::Char('{') => { cmd_batch.push("copy-enter\n".into()); }
+                                KeyCode::Char('[') => { cmd_batch.push("copy-enter\n".into()); }
+                                KeyCode::Char(']') => { cmd_batch.push("paste-buffer\n".into()); }
+                                KeyCode::Char('{') => { cmd_batch.push("swap-pane -U\n".into()); }
+                                KeyCode::Char('}') => { cmd_batch.push("swap-pane -D\n".into()); }
                                 KeyCode::Char('n') => { cmd_batch.push("next-window\n".into()); }
                                 KeyCode::Char('p') => { cmd_batch.push("previous-window\n".into()); }
+                                KeyCode::Char('l') => { cmd_batch.push("last-window\n".into()); }
+                                KeyCode::Char(';') => { cmd_batch.push("last-pane\n".into()); }
+                                KeyCode::Char(' ') => { cmd_batch.push("next-layout\n".into()); }
+                                KeyCode::Char('!') => { cmd_batch.push("break-pane\n".into()); }
                                 KeyCode::Char(d) if d.is_ascii_digit() => {
                                     let idx = d.to_digit(10).unwrap() as usize;
                                     cmd_batch.push(format!("select-window {}\n", idx));
                                 }
                                 KeyCode::Char('o') => { cmd_batch.push("select-pane -t :.+\n".into()); }
+                                // Alt+Arrow: resize pane by 5 (must be before plain Arrow)
+                                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("resize-pane -U 5\n".into()); }
+                                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("resize-pane -D 5\n".into()); }
+                                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("resize-pane -L 5\n".into()); }
+                                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("resize-pane -R 5\n".into()); }
+                                // Ctrl+Arrow: resize pane by 1
+                                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => { cmd_batch.push("resize-pane -U 1\n".into()); }
+                                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => { cmd_batch.push("resize-pane -D 1\n".into()); }
+                                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => { cmd_batch.push("resize-pane -L 1\n".into()); }
+                                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => { cmd_batch.push("resize-pane -R 1\n".into()); }
+                                // Plain Arrow: select pane
                                 KeyCode::Up => { cmd_batch.push("select-pane -U\n".into()); }
                                 KeyCode::Down => { cmd_batch.push("select-pane -D\n".into()); }
                                 KeyCode::Left => { cmd_batch.push("select-pane -L\n".into()); }
                                 KeyCode::Right => { cmd_batch.push("select-pane -R\n".into()); }
                                 KeyCode::Char('d') => { quit = true; }
                                 KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
-                                KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
+                                KeyCode::Char('$') => {
+                                    // Rename session — reuse rename overlay
+                                    renaming = true;
+                                    rename_buf.clear();
+                                    // Mark that we're renaming the session, not a window
+                                    // We'll detect this by checking if pane_renaming is used as a flag
+                                    session_renaming = true;
+                                }
+                                KeyCode::Char('?') => {
+                                    // List keys — send to server and display result
+                                    cmd_batch.push("list-keys\n".into());
+                                }
+                                KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
+                                KeyCode::Char('=') => { cmd_batch.push("choose-buffer\n".into()); }
+                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); }
                                 KeyCode::Char('w') => {
                                     tree_chooser = true;
                                     tree_entries.clear();
                                     tree_selected = 0;
-                                    // Build tree entries from the last dump-state (no separate TCP needed)
-                                    for wi in &last_tree {
-                                        tree_entries.push((true, wi.id, 0, wi.name.clone()));
-                                        for pi in &wi.panes {
-                                            tree_entries.push((false, wi.id, pi.id, pi.title.clone()));
+                                    // Query ALL sessions (like tmux choose-tree)
+                                    let dir = format!("{}\\.psmux", home);
+                                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                                        let mut sessions: Vec<(String, Vec<(usize, String, Vec<(usize, String)>)>)> = Vec::new();
+                                        for e in entries.flatten() {
+                                            if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
+                                                if let Some((base, ext)) = fname.rsplit_once('.') {
+                                                    if ext == "port" {
+                                                        if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
+                                                                let sess_addr = format!("127.0.0.1:{}", p);
+                                                                let sess_key = read_session_key(base).unwrap_or_default();
+                                                                if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
+                                                                    &sess_addr.parse().unwrap(), Duration::from_millis(50)
+                                                                ) {
+                                                                    let _ = ss.set_read_timeout(Some(Duration::from_millis(100)));
+                                                                    let _ = write!(ss, "AUTH {}\n", sess_key);
+                                                                    let _ = ss.write_all(b"list-tree\n");
+                                                                    let _ = ss.flush();
+                                                                    let mut br = BufReader::new(ss);
+                                                                    let mut al = String::new();
+                                                                    let _ = br.read_line(&mut al); // AUTH OK
+                                                                    let mut tree_line = String::new();
+                                                                    if br.read_line(&mut tree_line).is_ok() {
+                                                                        // Parse JSON array of WinTree
+                                                                        if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(&tree_line.trim()) {
+                                                                            let mut win_data = Vec::new();
+                                                                            for w in &wins {
+                                                                                let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
+                                                                                win_data.push((w.id, w.name.clone(), panes));
+                                                                            }
+                                                                            sessions.push((base.to_string(), win_data));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Sort sessions: current session first, then alphabetical
+                                        sessions.sort_by(|a, b| {
+                                            if a.0 == current_session { std::cmp::Ordering::Less }
+                                            else if b.0 == current_session { std::cmp::Ordering::Greater }
+                                            else { a.0.cmp(&b.0) }
+                                        });
+                                        // Build tree entries: session > window > pane
+                                        // tree_entries format: (is_win, id, sub_id, label, session_name)
+                                        // For session headers: is_win=true with id=usize::MAX as sentinel
+                                        // For windows: is_win=true
+                                        // For panes: is_win=false
+                                        for (sess_name, wins) in &sessions {
+                                            let is_current = sess_name == &current_session;
+                                            let attached = if is_current { " (attached)" } else { "" };
+                                            let nw = wins.len();
+                                            // Session header line
+                                            tree_entries.push((true, usize::MAX, 0,
+                                                format!("{}: {} windows{}", sess_name, nw, attached),
+                                                sess_name.clone()));
+                                            if is_current {
+                                                // Show windows and panes for current session
+                                                for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
+                                                    let flag = if panes.len() > 0 { "" } else { "" };
+                                                    tree_entries.push((true, *wid, 0,
+                                                        format!("  {}: {}{} ({} panes)", wi, wname, flag, panes.len()),
+                                                        sess_name.clone()));
+                                                    for (pid, ptitle) in panes {
+                                                        tree_entries.push((false, *wid, *pid,
+                                                            format!("    {}", ptitle),
+                                                            sess_name.clone()));
+                                                    }
+                                                }
+                                            } else {
+                                                // Show windows for other sessions (collapsed)
+                                                for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
+                                                    tree_entries.push((true, *wid, 0,
+                                                        format!("  {}: {} ({} panes)", wi, wname, panes.len()),
+                                                        sess_name.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Fallback: if no sessions found, use current session data
+                                    if tree_entries.is_empty() {
+                                        for wi in &last_tree {
+                                            tree_entries.push((true, wi.id, 0, wi.name.clone(), current_session.clone()));
+                                            for pi in &wi.panes {
+                                                tree_entries.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
+                                            }
                                         }
                                     }
                                 }
@@ -321,6 +637,55 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Char('q') => { chooser = true; }
                                 KeyCode::Char('v') => { cmd_batch.push("copy-anchor\n".into()); }
                                 KeyCode::Char('y') => { cmd_batch.push("copy-yank\n".into()); }
+                                // Session navigation (like tmux prefix+( and prefix+))
+                                KeyCode::Char('(') | KeyCode::Char(')') => {
+                                    let dir_next = key.code == KeyCode::Char(')');
+                                    // Enumerate sessions
+                                    let dir = format!("{}\\.psmux", home);
+                                    let mut names: Vec<String> = Vec::new();
+                                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                                        for e in entries.flatten() {
+                                            if let Some(fname) = e.file_name().to_str() {
+                                                if let Some((base, ext)) = fname.rsplit_once('.') {
+                                                    if ext == "port" {
+                                                        if let Ok(ps) = std::fs::read_to_string(e.path()) {
+                                                            if let Ok(p) = ps.trim().parse::<u16>() {
+                                                                let a = format!("127.0.0.1:{}", p);
+                                                                if std::net::TcpStream::connect_timeout(
+                                                                    &a.parse().unwrap(), Duration::from_millis(25)
+                                                                ).is_ok() {
+                                                                    names.push(base.to_string());
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    names.sort();
+                                    if names.len() > 1 {
+                                        if let Some(cur_pos) = names.iter().position(|n| *n == current_session) {
+                                            let next_pos = if dir_next {
+                                                (cur_pos + 1) % names.len()
+                                            } else {
+                                                (cur_pos + names.len() - 1) % names.len()
+                                            };
+                                            let next_name = names[next_pos].clone();
+                                            cmd_batch.push("client-detach\n".into());
+                                            env::set_var("PSMUX_SWITCH_TO", &next_name);
+                                            quit = true;
+                                        }
+                                    }
+                                }
+                                // Meta+1..5 preset layouts (like tmux)
+                                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout even-horizontal\n".into()); }
+                                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout even-vertical\n".into()); }
+                                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout main-horizontal\n".into()); }
+                                KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout main-vertical\n".into()); }
+                                KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout tiled\n".into()); }
+                                // Display pane info
+                                KeyCode::Char('i') => { cmd_batch.push("display-message\n".into()); }
                                 _ => {}
                             }
                             prefix_armed = false;
@@ -339,24 +704,106 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     }
                                 }
                                 KeyCode::Esc if session_chooser => { session_chooser = false; }
+                                KeyCode::Char('x') if session_chooser => {
+                                    // Kill the selected session (like tmux session chooser)
+                                    if let Some((sname, _)) = session_entries.get(session_selected) {
+                                        let sname = sname.clone();
+                                        if sname == current_session {
+                                            // Killing current session — exit after kill
+                                            cmd_batch.push("kill-session\n".into());
+                                            session_chooser = false;
+                                            quit = true;
+                                        } else {
+                                            // Kill another session by connecting to it
+                                            let h = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                                            let port_path = format!("{}\\.psmux\\{}.port", h, sname);
+                                            let key_path = format!("{}\\.psmux\\{}.key", h, sname);
+                                            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+                                                if let Ok(port) = port_str.trim().parse::<u16>() {
+                                                    let addr = format!("127.0.0.1:{}", port);
+                                                    let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
+                                                    if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
+                                                        &addr.parse().unwrap(), Duration::from_millis(100)
+                                                    ) {
+                                                        let _ = write!(ss, "AUTH {}\n", sess_key.trim());
+                                                        let _ = ss.write_all(b"kill-session\n");
+                                                    }
+                                                }
+                                            }
+                                            // Remove the killed session from the list
+                                            session_entries.remove(session_selected);
+                                            if session_selected >= session_entries.len() && session_selected > 0 {
+                                                session_selected -= 1;
+                                            }
+                                            if session_entries.is_empty() {
+                                                session_chooser = false;
+                                            }
+                                        }
+                                    }
+                                }
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Enter if tree_chooser => {
-                                    if let Some((is_win, wid, pid, _)) = tree_entries.get(tree_selected) {
-                                        if *is_win { cmd_batch.push(format!("focus-window {}\n", wid)); }
-                                        else { cmd_batch.push(format!("focus-pane {}\n", pid)); }
-                                        tree_chooser = false;
+                                    if let Some((is_win, wid, pid, _label, sess_name)) = tree_entries.get(tree_selected) {
+                                        if *wid == usize::MAX {
+                                            // Session header — switch to that session
+                                            if *sess_name != current_session {
+                                                cmd_batch.push("client-detach\n".into());
+                                                env::set_var("PSMUX_SWITCH_TO", sess_name);
+                                                quit = true;
+                                            }
+                                            tree_chooser = false;
+                                        } else if *sess_name != current_session {
+                                            // Window/pane in another session — switch to that session
+                                            cmd_batch.push("client-detach\n".into());
+                                            env::set_var("PSMUX_SWITCH_TO", sess_name);
+                                            quit = true;
+                                            tree_chooser = false;
+                                        } else if *is_win {
+                                            cmd_batch.push(format!("focus-window {}\n", wid));
+                                            tree_chooser = false;
+                                        } else {
+                                            cmd_batch.push(format!("focus-pane {}\n", pid));
+                                            tree_chooser = false;
+                                        }
                                     }
                                 }
                                 KeyCode::Esc if tree_chooser => { tree_chooser = false; }
+                                // --- kill confirmation: y/Y/Enter confirms, n/N/Esc cancels ---
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if confirm_cmd.is_some() => {
+                                    if let Some(cmd) = confirm_cmd.take() {
+                                        cmd_batch.push(format!("{}\n", cmd));
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if confirm_cmd.is_some() => {
+                                    confirm_cmd = None;
+                                }
                                 KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { rename_buf.push(c); }
                                 KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { pane_title_buf.push(c); }
+                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) => { command_buf.push(c); }
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
-                                KeyCode::Enter if renaming => { cmd_batch.push(format!("rename-window {}\n", rename_buf)); renaming = false; }
+                                KeyCode::Backspace if command_input => { let _ = command_buf.pop(); }
+                                KeyCode::Enter if renaming => {
+                                    if session_renaming {
+                                        cmd_batch.push(format!("rename-session {}\n", rename_buf));
+                                        session_renaming = false;
+                                    } else {
+                                        cmd_batch.push(format!("rename-window {}\n", rename_buf));
+                                    }
+                                    renaming = false;
+                                }
                                 KeyCode::Enter if pane_renaming => { cmd_batch.push(format!("set-pane-title {}\n", pane_title_buf)); pane_renaming = false; }
-                                KeyCode::Esc if renaming => { renaming = false; }
+                                KeyCode::Enter if command_input => {
+                                    let trimmed = command_buf.trim().to_string();
+                                    if !trimmed.is_empty() {
+                                        cmd_batch.push(format!("{}\n", trimmed));
+                                    }
+                                    command_input = false;
+                                }
+                                KeyCode::Esc if renaming => { renaming = false; session_renaming = false; }
                                 KeyCode::Esc if pane_renaming => { pane_renaming = false; }
+                                KeyCode::Esc if command_input => { command_input = false; }
                                 KeyCode::Char(d) if chooser && d.is_ascii_digit() => {
                                     let raw = d.to_digit(10).unwrap() as usize;
                                     let choice = if raw == 0 { 10 } else { raw };
@@ -401,6 +848,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::PageDown => { cmd_batch.push("send-key pagedown\n".into()); }
                                 KeyCode::Home => { cmd_batch.push("send-key home\n".into()); }
                                 KeyCode::End => { cmd_batch.push("send-key end\n".into()); }
+                                KeyCode::Insert => { cmd_batch.push("send-key insert\n".into()); }
+                                KeyCode::F(n) => { cmd_batch.push(format!("send-key f{}\n", n)); }
                                 _ => {}
                             }
                         }
@@ -412,13 +861,128 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
                         match me.kind {
-                            MouseEventKind::Down(MouseButton::Left) => { cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Drag(MouseButton::Left) => { cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row)); }
-                            MouseEventKind::Up(MouseButton::Left) => { cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                // Detect if click is on a separator line (for border resize)
+                                let on_sep = if !prev_dump_buf.is_empty() {
+                                    if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                        let content_area = Rect { x: 0, y: 0, width: last_sent_size.0, height: last_sent_size.1 };
+                                        is_on_separator(&state.layout, content_area, me.column, me.row)
+                                    } else { false }
+                                } else { false };
+
+                                // Always forward to server for pane focus, tab clicks, border resize
+                                cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
+
+                                if on_sep {
+                                    // Border resize mode — server handles drag
+                                    border_drag = true;
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                } else {
+                                    // Text selection mode
+                                    border_drag = false;
+                                    rsel_start = Some((me.column, me.row));
+                                    rsel_end = Some((me.column, me.row));
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                // pwsh-style: right-click with active selection → copy + clear
+                                // right-click without selection → paste from clipboard
+                                if rsel_start.is_some() && rsel_dragged {
+                                    // Copy selection to clipboard and clear it
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                            let text = extract_selection_text(
+                                                &state.layout,
+                                                last_sent_size.0,
+                                                last_sent_size.1,
+                                                s, e,
+                                            );
+                                            if !text.is_empty() {
+                                                copy_to_system_clipboard(&text);
+                                            }
+                                        }
+                                    }
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                } else {
+                                    // No selection — paste from clipboard
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                    if let Some(text) = read_from_system_clipboard() {
+                                        if !text.is_empty() {
+                                            let encoded = base64_encode(&text);
+                                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Middle) => { cmd_batch.push(format!("mouse-down-middle {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if border_drag {
+                                    // Forward drag to server for border resize
+                                    cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
+                                } else {
+                                    // Left-drag: extend text selection (pwsh behavior)
+                                    if rsel_start.is_some() {
+                                        rsel_end = Some((me.column, me.row));
+                                        rsel_dragged = true;
+                                        selection_changed = true;
+                                    }
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Right) => {}
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if border_drag {
+                                    // Forward mouse-up to server to finalize border resize
+                                    cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
+                                    border_drag = false;
+                                } else if rsel_dragged {
+                                    // Left-drag completed — copy selected text to clipboard
+                                    rsel_end = Some((me.column, me.row));
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                            let text = extract_selection_text(
+                                                &state.layout,
+                                                last_sent_size.0,
+                                                last_sent_size.1,
+                                                s, e,
+                                            );
+                                            if !text.is_empty() {
+                                                copy_to_system_clipboard(&text);
+                                            }
+                                        }
+                                    }
+                                    // Keep selection visible (clears on next click or Escape)
+                                } else {
+                                    // Plain left-click (no drag) — clear any old selection, forward mouse-up
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                    cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Right) => {}
+                            MouseEventKind::Up(MouseButton::Middle) => {}
+                            MouseEventKind::Moved => {
+                                // Don't send bare mouse-move to server - wasteful and server ignores it
+                            }
                             MouseEventKind::ScrollUp => { cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row)); }
                             MouseEventKind::ScrollDown => { cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row)); }
                             _ => {}
                         }
+                    }
+                    Event::FocusGained => {
+                        cmd_batch.push("focus-in\n".into());
+                    }
+                    Event::FocusLost => {
+                        cmd_batch.push("focus-out\n".into());
                     }
                     _ => {}
                 }
@@ -427,7 +991,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
         if quit { break; }
 
-        // ── STEP 2: Send commands + dump-state on persistent connection ──
+        // ── STEP 2: Send commands immediately, refresh screen at capped rate ──
         // Send client-size if changed
         let mut size_changed = false;
         {
@@ -442,102 +1006,70 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
         }
 
-        // Send all batched commands (fire-and-forget)
-        for cmd in &cmd_batch {
-            if writer.write_all(cmd.as_bytes()).is_err() {
-                break; // Connection lost
+        // Send all batched commands immediately — keys reach the server
+        // without waiting for a dump-state round-trip
+        let sent_keys_this_iter = !cmd_batch.is_empty();
+        if sent_keys_this_iter {
+            for cmd in &cmd_batch {
+                if writer.write_all(cmd.as_bytes()).is_err() {
+                    break; // Connection lost
+                }
             }
+            let _ = writer.flush(); // push keys to server NOW
+            last_key_send_time = Some(Instant::now());
         }
 
-        // Avoid full-state roundtrips every loop when idle.
-        let overlays_active = renaming || pane_renaming || chooser || tree_chooser || session_chooser;
-        let idle_refresh_ms = if overlays_active { 33 } else { target_idle_refresh_ms.clamp(16, 250) };
-        let should_dump = force_dump
-            || had_input_event
-            || size_changed
-            || !cmd_batch.is_empty()
-            || last_dump_time.elapsed() >= Duration::from_millis(idle_refresh_ms);
-        if !should_dump {
+        // ── STEP 2b: Request screen update (non-blocking) ────────────────
+        // Send dump-state ASAP when typing. The dump_in_flight flag naturally
+        // rate-limits to 1 outstanding request (round-trip = ~5-10ms).
+        // No artificial echo wait — the server processes keys before dumps
+        // in each batch, so ConPTY gets the input before serialization.
+        let overlays_active = command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some();
+        let should_dump = if force_dump || size_changed {
+            true
+        } else if typing_active {
+            true  // always request — dump_in_flight prevents flooding
+        } else {
+            let idle_frame: u64 = if overlays_active { 33 } else { 50 };
+            since_dump >= idle_frame
+        };
+        if should_dump && !dump_in_flight {
+            if writer.write_all(b"dump-state\n").is_err() { break; }
+            if writer.flush().is_err() { break; }
+            dump_in_flight = true;
+        }
+
+        // ── STEP 3: Render if we have a frame ────────────────────────────
+        // Also render if selection changed (for highlight overlay) even without new frame
+        // Always render when overlays are active (command prompt, rename, choosers)
+        if !got_frame && !selection_changed && !overlays_active { continue; }
+
+        // Skip parse + render when the raw JSON is identical to the previous
+        // frame AND selection hasn't changed AND no overlays are active.
+        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active {
+            last_dump_time = Instant::now();
             continue;
         }
 
-        // Send dump-state and flush (server responds with JSON line or framed JSON payload)
-        if writer.write_all(b"dump-state\n").is_err() { break; }
-        if writer.flush().is_err() { break; }
-
-        // Read one response frame into a reusable byte buffer.
-        // JSON mode returns one line; framed mode returns:
-        //   FRAME <len>\n<raw JSON bytes>
-        trim_reusable_buf(&mut state_buf, MAX_STATE_BUF_CAP);
-        trim_reusable_buf(&mut last_state_buf, MAX_STATE_BUF_CAP);
-        state_buf.clear();
-        match reader.read_until(b'\n', &mut state_buf) {
-            Ok(0) => break, // EOF - server disconnected
-            Err(_) => break, // Error
-            Ok(_) => {}
-        }
-        if use_framed_dump {
-            if let Some(payload_len) = parse_frame_header_len(&state_buf) {
-                if payload_len > MAX_STATE_BUF_CAP {
-                    force_dump = true;
-                    continue;
-                }
-                state_buf.clear();
-                state_buf.resize(payload_len, 0);
-                if reader.read_exact(&mut state_buf).is_err() {
-                    break;
-                }
-            } else {
-                // Graceful fallback if server switched back to JSON for this frame.
-                trim_dump_line(&mut state_buf);
+        // Parse the frame (use prev_dump_buf for selection-only redraws)
+        let frame_to_parse = if got_frame && dump_buf != prev_dump_buf { &dump_buf } else { &prev_dump_buf };
+        let state: DumpState = match serde_json::from_str(frame_to_parse) {
+            Ok(s) => s,
+            Err(_) => {
+                force_dump = true;
+                selection_changed = false;
+                continue;
             }
         } else {
             trim_dump_line(&mut state_buf);
         }
 
-        let is_delta_frame = state_buf.starts_with(b"{\"delta\":");
-        let can_skip_same_frame = !force_dump
-            && !had_input_event
-            && !size_changed
-            && cmd_batch.is_empty()
-            && !overlays_active;
-        if can_skip_same_frame && !is_delta_frame && state_buf == last_state_buf {
-            last_dump_time = Instant::now();
-            continue;
-        }
-        if !is_delta_frame {
-            last_state_buf.clear();
-            last_state_buf.extend_from_slice(&state_buf);
-        }
-        if is_delta_frame {
-            let delta_state: DumpDelta = match parse_dump_delta(&mut state_buf) {
-                Some(s) => s,
-                None => {
-                    force_dump = true;
-                    continue;
-                }
-            };
-            match cached_root.as_mut() {
-                Some(root) => {
-                    let applied = apply_pane_deltas(root, delta_state.delta.panes);
-                    if applied == 0 && can_skip_same_frame {
-                        last_dump_time = Instant::now();
-                        continue;
-                    }
-                }
-                None => {
-                    force_dump = true;
-                    continue;
-                }
-            }
-        } else {
-            let state: DumpState = match parse_dump_state(&mut state_buf) {
-                Some(s) => s,
-                None => {
-                    force_dump = true;
-                    continue; // Skip frame on parse error
-                }
-            };
+        let root = state.layout;
+        let windows = state.windows;
+        last_tree = state.tree;
+        let base_index = state.base_index;
+        let dim_preds = state.prediction_dimming;
+        let clock_active = state.clock_mode;
 
             cached_root = Some(state.layout);
             cached_windows = state.windows;
@@ -562,24 +1094,95 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
         }
 
-        let root = match cached_root.as_ref() {
-            Some(r) => r,
-            None => {
-                force_dump = true;
-                continue;
+        // Update status-style from server config (if provided)
+        if let Some(ref ss) = state.status_style {
+            if !ss.is_empty() {
+                let (fg, bg, bold) = parse_tmux_style(ss);
+                status_fg = fg.unwrap_or(Color::Black);
+                status_bg = bg.unwrap_or(Color::Green);
+                status_bold = bold;
             }
-        };
-        let windows = &cached_windows;
-        let base_index = cached_base_index;
-        let dim_preds = cached_dim_preds;
+        }
+        // Update status-left / status-right from server (already format-expanded)
+        if let Some(sl) = state.status_left {
+            if !sl.is_empty() { custom_status_left = Some(sl); }
+        }
+        if let Some(sr) = state.status_right {
+            if !sr.is_empty() { custom_status_right = Some(sr); }
+        }
+        // Update pane border styles
+        if let Some(ref pbs) = state.pane_border_style {
+            if !pbs.is_empty() {
+                let (fg, _bg, _bold) = parse_tmux_style(pbs);
+                if let Some(c) = fg { pane_border_fg = c; }
+            }
+        }
+        if let Some(ref pabs) = state.pane_active_border_style {
+            if !pabs.is_empty() {
+                let (fg, _bg, _bold) = parse_tmux_style(pabs);
+                if let Some(c) = fg { pane_active_border_fg = c; }
+            }
+        }
+        // Update window-status-format strings
+        if let Some(ref f) = state.wsf { if !f.is_empty() { win_status_fmt = f.clone(); } }
+        if let Some(ref f) = state.wscf { if !f.is_empty() { win_status_current_fmt = f.clone(); } }
+        if let Some(ref s) = state.wss { win_status_sep = s.clone(); }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
+        let sel_s = rsel_start;
+        let sel_e = rsel_end;
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default().direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref()).split(area);
 
-            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool) {
+            /// Render a large ASCII clock overlay (tmux clock-mode)
+            fn render_clock_overlay(f: &mut Frame, area: Rect) {
+                // Big digit font (5 rows high, 3 cols wide per digit + colon)
+                const DIGITS: [&[&str; 5]; 10] = [
+                    &["###", "# #", "# #", "# #", "###"],  // 0
+                    &["  #", "  #", "  #", "  #", "  #"],  // 1
+                    &["###", "  #", "###", "#  ", "###"],  // 2
+                    &["###", "  #", "###", "  #", "###"],  // 3
+                    &["# #", "# #", "###", "  #", "  #"],  // 4
+                    &["###", "#  ", "###", "  #", "###"],  // 5
+                    &["###", "#  ", "###", "# #", "###"],  // 6
+                    &["###", "  #", "  #", "  #", "  #"],  // 7
+                    &["###", "# #", "###", "# #", "###"],  // 8
+                    &["###", "# #", "###", "  #", "###"],  // 9
+                ];
+                const COLON: [&str; 5] = [" ", "#", " ", "#", " "];
+                let now = Local::now();
+                let time_str = now.format("%H:%M:%S").to_string();
+                // Each char is 3 wide + 1 gap, colon is 1 wide + 1 gap
+                let total_w: u16 = time_str.chars().map(|c| if c == ':' { 2 } else { 4 }).sum::<u16>() - 1;
+                let total_h: u16 = 5;
+                if area.width < total_w || area.height < total_h { return; }
+                let start_x = area.x + (area.width.saturating_sub(total_w)) / 2;
+                let start_y = area.y + (area.height.saturating_sub(total_h)) / 2;
+                // Clear the area
+                let clock_area = Rect::new(start_x.saturating_sub(1), start_y, total_w + 2, total_h);
+                f.render_widget(Clear, clock_area);
+                for row in 0..5u16 {
+                    let mut x = start_x;
+                    for ch in time_str.chars() {
+                        if ch == ':' {
+                            let cell_area = Rect::new(x, start_y + row, 1, 1);
+                            let s = Span::styled(COLON[row as usize], Style::default().fg(Color::Cyan));
+                            f.render_widget(Paragraph::new(Line::from(s)), cell_area);
+                            x += 2;
+                        } else if let Some(d) = ch.to_digit(10) {
+                            let pattern = DIGITS[d as usize][row as usize];
+                            let cell_area = Rect::new(x, start_y + row, 3, 1);
+                            let s = Span::styled(pattern, Style::default().fg(Color::Cyan));
+                            f.render_widget(Paragraph::new(Line::from(s)), cell_area);
+                            x += 4;
+                        }
+                    }
+                }
+            }
+
+            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool) {
                 match node {
                     LayoutJson::Leaf {
                         id: _,
@@ -598,14 +1201,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         content,
                         rows_v2,
                     } => {
-                        let pane_block = if *copy_mode && *active {
-                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("[copy mode]")
-                        } else if *active {
-                            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green))
-                        } else {
-                            Block::default().borders(Borders::ALL)
-                        };
-                        let inner = pane_block.inner(area);
+                        // No borders — content fills entire area (tmux-style)
+                        let inner = area;
+                        let mut lines: Vec<Line> = Vec::new();
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
                         f.render_widget(pane_block, area);
                         f.render_widget(Clear, inner);
@@ -635,19 +1233,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if in_selection {
                                         style = style.fg(Color::Black).bg(Color::LightYellow);
                                     }
-                                    if cell.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
-                                    if cell.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
-                                    if cell.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                                    if cell.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                                    let text: Cow<'_, str> = if cell.text.is_empty() {
-                                        Cow::Borrowed(" ")
-                                    } else {
-                                        Cow::Borrowed(cell.text.as_str())
-                                    };
-                                    let char_width = unicode_width::UnicodeWidthStr::width(text.as_ref()) as u16;
+                                    if cell.dim { style = style.add_modifier(Modifier::DIM); }
+                                    if cell.bold { style = style.add_modifier(Modifier::BOLD); }
+                                    if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
+                                    if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    let text: &str = if cell.text.is_empty() { " " } else { &cell.text };
+                                    let char_width = unicode_width::UnicodeWidthStr::width(text) as u16;
                                     spans.push(Span::styled(text, style));
                                     if char_width >= 2 {
-                                        c += 2; // skip continuation cell after wide character
+                                        c += 2;
                                     } else {
                                         c += 1;
                                     }
@@ -680,27 +1274,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                         fg = dim_color(fg);
                                     }
                                     let mut style = Style::default().fg(fg).bg(bg);
-                                    if run.flags & 1 != 0 {
-                                        style = style.add_modifier(Modifier::DIM);
-                                    }
-                                    if run.flags & 2 != 0 {
-                                        style = style.add_modifier(Modifier::BOLD);
-                                    }
-                                    if run.flags & 4 != 0 {
-                                        style = style.add_modifier(Modifier::ITALIC);
-                                    }
-                                    if run.flags & 8 != 0 {
-                                        style = style.add_modifier(Modifier::UNDERLINED);
-                                    }
-                                    let text = if run.text.is_empty() { " " } else { run.text.as_str() };
-                                    let rem = inner.width.saturating_sub(c) as usize;
-                                    let (nx, _) = buf.set_stringn(x, y, text, rem, style);
-                                    if nx <= x {
-                                        break;
-                                    }
-                                    x = nx;
+                                    if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
+                                    if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
+                                    if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
+                                    if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    let text: &str = if run.text.is_empty() { " " } else { &run.text };
+                                    spans.push(Span::styled(text, style));
                                     c = c.saturating_add(run.width.max(1));
                                 }
+                            }
+                        }
+                        f.render_widget(Clear, inner);
+                        let para = Paragraph::new(Text::from(lines));
+                        f.render_widget(para, inner);
+
+                        // Copy mode indicator (replaces the old block title "[copy mode]")
+                        if *copy_mode && *active {
+                            let label = "[copy mode]";
+                            let lw = label.len() as u16;
+                            if area.width >= lw {
+                                let lx = area.x + area.width.saturating_sub(lw);
+                                let la = Rect::new(lx, area.y, lw, 1);
+                                let ls = Span::styled(label, Style::default().fg(Color::Black).bg(Color::Yellow));
+                                f.render_widget(Paragraph::new(Line::from(ls)), la);
                             }
                         }
 
@@ -709,38 +1305,105 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             let indicator_width = indicator.len() as u16;
                             if area.width > indicator_width + 2 {
                                 let indicator_x = area.x + area.width - indicator_width - 1;
-                                let indicator_area = Rect::new(indicator_x, area.y, indicator_width, 1);
+                                let indicator_y = if *copy_mode { area.y + 1 } else { area.y };
+                                let indicator_area = Rect::new(indicator_x, indicator_y, indicator_width, 1);
                                 let indicator_span = Span::styled(indicator, Style::default().fg(Color::Black).bg(Color::Yellow));
                                 f.render_widget(Paragraph::new(Line::from(indicator_span)), indicator_area);
                             }
                         }
 
                         if *active && !*copy_mode {
+                            // Clock mode overlay
+                            if clock_mode {
+                                render_clock_overlay(f, inner);
+                            }
                             let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
                             let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
                             f.set_cursor(cx, cy);
                         }
                     }
                     LayoutJson::Split { kind, sizes, children } => {
-                        let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                            sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
+                        let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                            sizes.clone()
                         } else {
-                            vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()]
+                            vec![(100 / children.len().max(1)) as u16; children.len()]
                         };
-                        let rects = if kind == "Horizontal" {
-                            Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area)
-                        } else {
-                            Layout::default().direction(Direction::Vertical).constraints(constraints).split(area)
-                        };
-                        for (i, child) in children.iter().enumerate() { render_json(f, child, rects[i], dim_preds); }
+                        let is_horizontal = kind == "Horizontal";
+                        let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+
+                        // Render children first
+                        for (i, child) in children.iter().enumerate() {
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode); }
+                        }
+
+                        // Draw separator lines between children using direct buffer access
+                        let buf = f.buffer_mut();
+                        for i in 0..children.len().saturating_sub(1) {
+                            if i >= rects.len() { break; }
+                            let left_active = has_active_leaf(&children[i]);
+                            let right_active = children.get(i + 1).map_or(false, |c| has_active_leaf(c));
+                            let sep_fg = if left_active || right_active { active_border_fg } else { border_fg };
+                            let sep_style = Style::default().fg(sep_fg);
+
+                            if is_horizontal {
+                                let sep_x = rects[i].x + rects[i].width;
+                                if sep_x < buf.area.x + buf.area.width {
+                                    for y in area.y..area.y + area.height {
+                                        let idx = (y - buf.area.y) as usize * buf.area.width as usize
+                                            + (sep_x - buf.area.x) as usize;
+                                        if idx < buf.content.len() {
+                                            buf.content[idx].set_char('│');
+                                            buf.content[idx].set_style(sep_style);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let sep_y = rects[i].y + rects[i].height;
+                                if sep_y < buf.area.y + buf.area.height {
+                                    for x in area.x..area.x + area.width {
+                                        let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
+                                            + (x - buf.area.x) as usize;
+                                        if idx < buf.content.len() {
+                                            buf.content[idx].set_char('─');
+                                            buf.content[idx].set_style(sep_style);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            render_json(f, root, chunks[0], dim_preds);
+            render_json(f, &root, chunks[0], dim_preds, pane_border_fg, pane_active_border_fg, clock_active);
+
+            // ── Left-click drag text selection overlay ────────────────
+            if let (Some(s), Some(e)) = (sel_s, sel_e) {
+                // Normalise so (r0,c0) <= (r1,c1) in reading order
+                let (r0, c0, r1, c1) = if (s.1, s.0) <= (e.1, e.0) {
+                    (s.1, s.0, e.1, e.0)
+                } else {
+                    (e.1, e.0, s.1, s.0)
+                };
+                let buf = f.buffer_mut();
+                let buf_area = buf.area;
+                for row in r0..=r1 {
+                    let col_start = if row == r0 { c0 } else { 0 };
+                    let col_end = if row == r1 { c1 } else { area.width.saturating_sub(1) };
+                    for col in col_start..=col_end {
+                        if row < buf_area.height && col < buf_area.width {
+                            let idx = (row - buf_area.y) as usize * buf_area.width as usize
+                                + (col - buf_area.x) as usize;
+                            if idx < buf.content.len() {
+                                buf.content[idx].set_style(Style::default().fg(Color::Black).bg(Color::LightCyan));
+                            }
+                        }
+                    }
+                }
+            }
 
             if session_chooser {
-                let overlay = Block::default().borders(Borders::ALL).title("choose-session");
+                let overlay = Block::default().borders(Borders::ALL).title("choose-session (enter=switch, x=kill, esc=close)");
                 let oa = centered_rect(70, 20, chunks[0]);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
@@ -763,13 +1426,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (is_win, wid, pid, name)) in tree_entries.iter().enumerate() {
-                    let marker = if *is_win { format!("@{}", wid) } else { format!("%{}", pid) };
-                    let prefix = if *is_win { "".to_string() } else { "  ".to_string() };
+                for (i, (is_win, wid, _pid, label, _sess)) in tree_entries.iter().enumerate() {
                     let line = if i == tree_selected {
-                        Line::from(Span::styled(format!("{}{} {}", prefix, marker, name), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                        Line::from(Span::styled(label.clone(), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                    } else if *is_win && *wid == usize::MAX {
+                        // Session header — bold
+                        Line::from(Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)))
                     } else {
-                        Line::from(format!("{}{} {}", prefix, marker, name))
+                        Line::from(label.clone())
                     };
                     lines.push(line);
                 }
@@ -782,17 +1446,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     match node {
                         LayoutJson::Leaf { id, .. } => { out.push((*id, area)); }
                         LayoutJson::Split { kind, sizes, children } => {
-                            let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                                sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
+                            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                                sizes.clone()
                             } else {
-                                vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()]
+                                vec![(100 / children.len().max(1)) as u16; children.len()]
                             };
-                            let rects = if kind == "Horizontal" {
-                                Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area)
-                            } else {
-                                Layout::default().direction(Direction::Vertical).constraints(constraints).split(area)
-                            };
-                            for (i, child) in children.iter().enumerate() { rec(child, rects[i], out); }
+                            let is_horizontal = kind == "Horizontal";
+                            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                            for (i, child) in children.iter().enumerate() {
+                                if i < rects.len() { rec(child, rects[i], out); }
+                            }
                         }
                     }
                 }
@@ -818,27 +1481,69 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     }
                 }
             }
+            let sb_fg = status_fg;
+            let sb_bg = status_bg;
+            let sb_base = if status_bold {
+                Style::default().fg(sb_fg).bg(sb_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(sb_fg).bg(sb_bg)
+            };
+            // Left portion: custom status_left or default [session] prefix
+            let left_prefix = match custom_status_left {
+                Some(ref sl) => format!("{} ", sl),
+                None => format!("[{}] ", name),
+            };
             let mut status_spans: Vec<Span> = vec![
-                Span::styled(format!("[{}] ", name), Style::default().fg(Color::Black).bg(Color::Green)),
+                Span::styled(left_prefix, sb_base),
             ];
             for (i, w) in windows.iter().enumerate() {
-                let display_idx = i + base_index;
+                // Use pre-expanded tab_text from server (full format expansion)
+                let tab_text = if !w.tab_text.is_empty() {
+                    w.tab_text.clone()
+                } else {
+                    // Fallback for old server: naive expansion
+                    let display_idx = i + base_index;
+                    let fmt = if w.active { &win_status_current_fmt } else { &win_status_fmt };
+                    fmt.replace("#I", &display_idx.to_string())
+                       .replace("#W", &w.name)
+                       .replace("#F", if w.active { "*" } else { "" })
+                };
+                if i > 0 {
+                    status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
+                }
                 if w.active {
                     status_spans.push(Span::styled(
-                        format!("{}: {} ", display_idx, w.name),
+                        tab_text,
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ));
-                } else {
+                } else if w.activity {
+                    // Activity visual notification: reverse video for windows with activity
                     status_spans.push(Span::styled(
-                        format!("{}: {} ", display_idx, w.name),
-                        Style::default().fg(Color::Black).bg(Color::Green),
+                        tab_text,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ));
+                } else {
+                    status_spans.push(Span::styled(tab_text, sb_base));
                 }
             }
-            let status_bar = Paragraph::new(Line::from(status_spans)).style(Style::default().bg(Color::Green).fg(Color::Black));
+            // Right portion: custom status_right (already expanded by server)
+            let right_text = custom_status_right.as_deref().unwrap_or("").to_string();
+            // Compute how many columns are used by left + window tabs
+            let left_used: usize = status_spans.iter().map(|s| s.content.len()).sum();
+            let right_len = right_text.len();
+            let total_width = chunks[1].width as usize;
+            if left_used + right_len < total_width {
+                let pad = total_width - left_used - right_len;
+                status_spans.push(Span::styled(" ".repeat(pad), sb_base));
+                status_spans.push(Span::styled(right_text, sb_base));
+            }
+            let status_bar = Paragraph::new(Line::from(status_spans)).style(sb_base);
             f.render_widget(Clear, chunks[1]);
             f.render_widget(status_bar, chunks[1]);
             if renaming {
@@ -857,8 +1562,33 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 let para = Paragraph::new(format!("title: {}", pane_title_buf));
                 f.render_widget(para, overlay.inner(oa));
             }
+            if command_input {
+                let overlay = Block::default().borders(Borders::ALL).title("command");
+                let oa = centered_rect(60, 3, chunks[0]);
+                f.render_widget(Clear, oa);
+                f.render_widget(&overlay, oa);
+                let para = Paragraph::new(format!(": {}", command_buf));
+                f.render_widget(para, overlay.inner(oa));
+            }
+            if let Some(ref cmd) = confirm_cmd {
+                let overlay = Block::default().borders(Borders::ALL).title("confirm");
+                let oa = centered_rect(50, 3, chunks[0]);
+                f.render_widget(Clear, oa);
+                f.render_widget(&overlay, oa);
+                let para = Paragraph::new(format!("{}? (y/n)", cmd));
+                f.render_widget(para, overlay.inner(oa));
+            }
         })?;
         last_dump_time = Instant::now();
+        selection_changed = false;
+        // Cache this frame so we can skip identical re-renders.
+        // Only update cache when we got a genuinely new frame (not selection-only redraw)
+        if got_frame && dump_buf != prev_dump_buf {
+            std::mem::swap(&mut prev_dump_buf, &mut dump_buf);
+        }
+        // DON'T clear last_key_send_time — keep fast-dumping for 100ms
+        // after last keystroke so we catch the ConPTY echo promptly.
+        // The timer expires naturally in the poll_ms calculation above.
         force_dump = false;
     }
 

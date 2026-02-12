@@ -5,15 +5,31 @@ use serde::{Serialize, Deserialize};
 use crate::types::*;
 
 pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> Option<String> {
-    let mut last: Option<String> = None;
-    for r in (0..rows).rev() {
+    // Scan from cursor row (most likely prompt location) then fall back to last non-empty row
+    let cursor_row = screen.cursor_position().0;
+    let mut candidate_row: Option<u16> = None;
+    // Try cursor row first, then scan downward, then scan upward
+    for &r in [cursor_row].iter().chain((cursor_row + 1..rows).collect::<Vec<_>>().iter()).chain((0..cursor_row).rev().collect::<Vec<_>>().iter()) {
         let mut s = String::new();
-        for c in 0..cols { if let Some(cell) = screen.cell(r, c) { s.push_str(&cell.contents().to_string()); } else { s.push(' '); } }
-        let t = s.trim_end().to_string();
-        if !t.trim().is_empty() { last = Some(t); break; }
+        for c in 0..cols { if let Some(cell) = screen.cell(r, c) { s.push_str(cell.contents()); } else { s.push(' '); } }
+        let t = s.trim_end();
+        if !t.is_empty() && (t.contains('>') || t.contains('$') || t.contains('#') || t.contains(':')) {
+            candidate_row = Some(r);
+            break;
+        }
     }
-    let Some(line) = last else { return None };
-    let trimmed = line.trim().to_string();
+    // Fall back: use the row the cursor is on even if no prompt marker
+    let row = candidate_row.unwrap_or(cursor_row);
+    let mut s = String::new();
+    for c in 0..cols { if let Some(cell) = screen.cell(row, c) { s.push_str(cell.contents()); } else { s.push(' '); } }
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() { return None; }
+    // Only infer title from lines that look like prompts (contain a prompt marker)
+    let has_prompt_marker = trimmed.contains('>') || trimmed.ends_with('$') || trimmed.ends_with('#');
+    if !has_prompt_marker {
+        // If no prompt marker, don't change the title — this is likely command output
+        return None;
+    }
     if let Some(pos) = trimmed.rfind('>') {
         let before = trimmed[..pos].trim().to_string();
         if before.contains("\\") || before.contains("/") {
@@ -30,7 +46,7 @@ pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> 
 // resolve_last_session_name and resolve_default_session_name are in session.rs
 
 #[derive(Serialize, Deserialize)]
-pub struct WinInfo { pub id: usize, pub name: String, pub active: bool }
+pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool, #[serde(default)] pub tab_text: String }
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneInfo { pub id: usize, pub title: String }
@@ -40,9 +56,31 @@ pub struct WinTree { pub id: usize, pub name: String, pub active: bool, pub pane
 
 pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     let mut v: Vec<WinInfo> = Vec::new();
-    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx }); }
+    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, tab_text: String::new() }); }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
+}
+
+/// tmux-compatible list-windows output: one line per window
+/// Format: `<index>: <name><flag> (<pane_count> panes) [<width>x<height>]`
+pub fn list_windows_tmux(app: &AppState) -> String {
+    use crate::tree::*;
+    fn count_panes(node: &Node) -> usize {
+        match node {
+            Node::Leaf(_) => 1,
+            Node::Split { children, .. } => children.iter().map(|c| count_panes(c)).sum(),
+        }
+    }
+    let mut lines = Vec::new();
+    for (i, w) in app.windows.iter().enumerate() {
+        let flag = if i == app.active_idx { "*" } else if w.activity_flag { "#" } else { "-" };
+        let pane_count = count_panes(&w.root);
+        let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
+            (p.last_cols, p.last_rows)
+        } else { (120, 30) };
+        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", i, w.name, flag, pane_count, width, height));
+    }
+    lines.join("\n")
 }
 
 pub fn list_tree_json(app: &AppState) -> io::Result<String> {
@@ -124,10 +162,19 @@ pub fn base64_decode(encoded: &str) -> Option<String> {
     String::from_utf8(result).ok()
 }
 
-pub fn color_to_name(c: vt100::Color) -> String {
+/// Return color name as a string. Uses static strings for Default and
+/// the 256 indexed colors to avoid heap allocations on every cell.
+pub fn color_to_name(c: vt100::Color) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match c {
-        vt100::Color::Default => "default".to_string(),
-        vt100::Color::Idx(i) => format!("idx:{}", i),
-        vt100::Color::Rgb(r,g,b) => format!("rgb:{},{},{}", r,g,b),
+        vt100::Color::Default => Cow::Borrowed("default"),
+        vt100::Color::Idx(i) => {
+            // Static lookup table for all 256 indexed colors
+            static IDX_STRINGS: std::sync::LazyLock<[String; 256]> = std::sync::LazyLock::new(|| {
+                std::array::from_fn(|i| format!("idx:{}", i))
+            });
+            Cow::Borrowed(&IDX_STRINGS[i as usize])
+        }
+        vt100::Color::Rgb(r,g,b) => Cow::Owned(format!("rgb:{},{},{}", r,g,b)),
     }
 }

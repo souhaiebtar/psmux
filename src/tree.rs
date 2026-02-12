@@ -4,6 +4,47 @@ use std::sync::atomic::Ordering;
 use ratatui::prelude::*;
 
 use crate::types::*;
+use crate::platform::process_kill;
+
+/// Split an area into sub-rects with 1px gaps between them for separator lines.
+/// Matches tmux-style gapless panes with single-character separators.
+pub fn split_with_gaps(is_horizontal: bool, sizes: &[u16], area: Rect) -> Vec<Rect> {
+    let n = sizes.len();
+    if n == 0 { return vec![]; }
+    if n == 1 { return vec![area]; }
+
+    let gaps = (n - 1) as u16;
+    let total_available = if is_horizontal {
+        area.width.saturating_sub(gaps)
+    } else {
+        area.height.saturating_sub(gaps)
+    };
+
+    let total_pct: u32 = sizes.iter().map(|&s| s as u32).sum();
+    if total_pct == 0 { return vec![area; n]; }
+
+    let mut rects = Vec::with_capacity(n);
+    let mut offset: u16 = 0;
+
+    for (i, &pct) in sizes.iter().enumerate() {
+        let size = if i == n - 1 {
+            total_available.saturating_sub(offset) // last child gets remainder
+        } else {
+            ((total_available as u32 * pct as u32) / total_pct) as u16
+        };
+
+        let child_rect = if is_horizontal {
+            Rect::new(area.x + offset + i as u16, area.y, size, area.height)
+        } else {
+            Rect::new(area.x, area.y + offset + i as u16, area.width, size)
+        };
+
+        rects.push(child_rect);
+        offset += size;
+    }
+
+    rects
+}
 
 pub fn active_pane_mut<'a>(node: &'a mut Node, path: &Vec<usize>) -> Option<&'a mut Pane> {
     let mut cur = node;
@@ -41,10 +82,12 @@ pub fn kill_leaf(node: &mut Node, path: &Vec<usize>) {
     *node = remove_node(std::mem::replace(node, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] }), path);
 }
 
-/// Kill a node and all its child processes before dropping it
+/// Kill a node and all its child processes before dropping it.
+/// Uses platform-specific process tree killing to ensure all descendant
+/// processes (shells, sub-processes, servers, etc.) are terminated.
 pub fn kill_node(mut n: Node) {
     match &mut n {
-        Node::Leaf(p) => { let _ = p.child.kill(); }
+        Node::Leaf(p) => { process_kill::kill_process_tree(&mut p.child); }
         Node::Split { children, .. } => {
             for child in children.iter_mut() {
                 kill_all_children(child);
@@ -81,19 +124,81 @@ pub fn remove_node(n: Node, path: &Vec<usize>) -> Node {
     }
 }
 
+/// Extract (detach) a node from the tree at the given path WITHOUT killing it.
+/// Returns (remaining_tree, extracted_node).
+/// If the path points to the root, returns (None, root).
+pub fn extract_node(root: Node, path: &[usize]) -> (Option<Node>, Option<Node>) {
+    if path.is_empty() {
+        return (None, Some(root));
+    }
+    match root {
+        Node::Leaf(p) => (Some(Node::Leaf(p)), None), // path doesn't exist
+        Node::Split { kind, sizes, children } => {
+            let idx = path[0];
+            if idx >= children.len() {
+                return (Some(Node::Split { kind, sizes, children }), None);
+            }
+            if path.len() == 1 {
+                // Extract child at idx
+                let mut remaining: Vec<Node> = Vec::new();
+                let mut extracted: Option<Node> = None;
+                for (i, child) in children.into_iter().enumerate() {
+                    if i == idx { extracted = Some(child); }
+                    else { remaining.push(child); }
+                }
+                let tree = if remaining.is_empty() {
+                    None
+                } else if remaining.len() == 1 {
+                    Some(remaining.into_iter().next().unwrap())
+                } else {
+                    let mut eq = vec![100 / remaining.len() as u16; remaining.len()];
+                    let rem = 100 - eq.iter().sum::<u16>();
+                    if let Some(last) = eq.last_mut() { *last += rem; }
+                    Some(Node::Split { kind, sizes: eq, children: remaining })
+                };
+                (tree, extracted)
+            } else {
+                // Recurse into the child at idx
+                let mut new_children: Vec<Node> = Vec::new();
+                let mut extracted: Option<Node> = None;
+                for (i, child) in children.into_iter().enumerate() {
+                    if i == idx {
+                        let (rem, ext) = extract_node(child, &path[1..]);
+                        extracted = ext;
+                        if let Some(r) = rem { new_children.push(r); }
+                    } else {
+                        new_children.push(child);
+                    }
+                }
+                let tree = if new_children.is_empty() {
+                    None
+                } else if new_children.len() == 1 {
+                    Some(new_children.into_iter().next().unwrap())
+                } else {
+                    let mut eq = vec![100 / new_children.len() as u16; new_children.len()];
+                    let rem = 100 - eq.iter().sum::<u16>();
+                    if let Some(last) = eq.last_mut() { *last += rem; }
+                    Some(Node::Split { kind, sizes: eq, children: new_children })
+                };
+                (tree, extracted)
+            }
+        }
+    }
+}
+
 pub fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>) {
     fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, Rect)>) {
         match node {
             Node::Leaf(_) => { out.push((path.clone(), area)); }
             Node::Split { kind, sizes, children } => {
-                let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                    sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
-                } else { vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()] };
-                let rects = match *kind {
-                    LayoutKind::Horizontal => Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area),
-                    LayoutKind::Vertical => Layout::default().direction(Direction::Vertical).constraints(constraints).split(area),
-                };
-                for (i, child) in children.iter().enumerate() { path.push(i); rec(child, rects[i], path, out); path.pop(); }
+                let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                    sizes.clone()
+                } else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+                let is_horizontal = matches!(*kind, LayoutKind::Horizontal);
+                let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() { path.push(i); rec(child, rects[i], path, out); path.pop(); }
+                }
             }
         }
     }
@@ -156,8 +261,8 @@ pub fn resize_all_panes(app: &mut AppState) {
         match node {
             Node::Leaf(pane) => {
                 if let Some((_, rect)) = rects.iter().find(|(p, _)| p == path) {
-                    let inner_height = rect.height.saturating_sub(2).max(1);
-                    let inner_width = rect.width.saturating_sub(2).max(1);
+                    let inner_height = rect.height.max(1);
+                    let inner_width = rect.width.max(1);
                     
                     if pane.last_rows != inner_height || pane.last_cols != inner_width {
                         let _ = pane.master.resize(portable_pty::PtySize { 
@@ -195,31 +300,36 @@ pub fn resize_all_panes(app: &mut AppState) {
 
 pub fn kill_all_children(node: &mut Node) {
     match node {
-        Node::Leaf(p) => { let _ = p.child.kill(); }
+        Node::Leaf(p) => { process_kill::kill_process_tree(&mut p.child); }
         Node::Split { children, .. } => { for child in children.iter_mut() { kill_all_children(child); } }
     }
 }
 
-pub fn compute_split_borders(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16)>) {
-    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16)>) {
+/// Returns borders as (path, kind, idx, pixel_pos, total_pixels_along_axis).
+pub fn compute_split_borders(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16, u16)>) {
+    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16, u16)>) {
         match node {
             Node::Leaf(_) => {}
             Node::Split { kind, sizes, children } => {
-                let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                    sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
-                } else { vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()] };
-                let rects = match *kind {
-                    LayoutKind::Horizontal => Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area),
-                    LayoutKind::Vertical => Layout::default().direction(Direction::Vertical).constraints(constraints).split(area),
-                };
-                for i in 0..children.len()-1 {
-                    let pos = match *kind {
-                        LayoutKind::Horizontal => rects[i].x + rects[i].width,
-                        LayoutKind::Vertical => rects[i].y + rects[i].height,
-                    };
-                    out.push((path.clone(), *kind, i, pos));
+                let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                    sizes.clone()
+                } else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+                let is_horizontal = matches!(*kind, LayoutKind::Horizontal);
+                let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+                let total_px = if is_horizontal { area.width } else { area.height };
+                for i in 0..children.len().saturating_sub(1) {
+                    if i < rects.len() {
+                        let pos = if is_horizontal {
+                            rects[i].x + rects[i].width
+                        } else {
+                            rects[i].y + rects[i].height
+                        };
+                        out.push((path.clone(), *kind, i, pos, total_px));
+                    }
                 }
-                for (i, child) in children.iter().enumerate() { path.push(i); rec(child, rects[i], path, out); path.pop(); }
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() { path.push(i); rec(child, rects[i], path, out); path.pop(); }
+                }
             }
         }
     }
@@ -239,14 +349,17 @@ pub fn split_sizes_at<'a>(node: &'a Node, path: Vec<usize>, idx: usize) -> Optio
 
 pub fn adjust_split_sizes(root: &mut Node, d: &DragState, x: u16, y: u16) {
     if let Some(Node::Split { sizes, .. }) = get_split_mut(root, &d.split_path) {
-        let total = sizes[d.index] + sizes[d.index+1];
+        let total_pct = sizes[d.index] + sizes[d.index+1];
         let min_pct = 5u16;
-        let delta: i16 = match d.kind {
-            LayoutKind::Horizontal => (x as i32 - d.start_x as i32).clamp(-100, 100) as i16,
-            LayoutKind::Vertical => (y as i32 - d.start_y as i32).clamp(-100, 100) as i16,
+        // Convert pixel delta to percentage delta
+        let pixel_delta: i32 = match d.kind {
+            LayoutKind::Horizontal => x as i32 - d.start_x as i32,
+            LayoutKind::Vertical => y as i32 - d.start_y as i32,
         };
-        let left = (d.left_initial as i16 + delta).clamp(min_pct as i16, (total - min_pct) as i16) as u16;
-        let right = total - left;
+        let total_px = d.total_pixels.max(1) as i32;
+        let pct_delta = (pixel_delta * total_pct as i32) / total_px;
+        let left = (d.left_initial as i32 + pct_delta).clamp(min_pct as i32, (total_pct - min_pct) as i32) as u16;
+        let right = total_pct - left;
         sizes[d.index] = left;
         sizes[d.index+1] = right;
     }
@@ -260,24 +373,51 @@ pub fn get_split_mut<'a>(node: &'a mut Node, path: &Vec<usize>) -> Option<&'a mu
     Some(cur)
 }
 
-pub fn prune_exited(n: Node) -> Option<Node> {
+pub fn prune_exited(n: Node, remain_on_exit: bool) -> Option<Node> {
     match n {
         Node::Leaf(mut p) => {
+            if p.dead { return Some(Node::Leaf(p)); }
             match p.child.try_wait() {
-                Ok(Some(_)) => None,
+                Ok(Some(_)) => {
+                    if remain_on_exit {
+                        p.dead = true;
+                        Some(Node::Leaf(p))
+                    } else {
+                        None
+                    }
+                }
                 _ => Some(Node::Leaf(p)),
             }
         }
-        Node::Split { kind, sizes: _sizes, children } => {
+        Node::Split { kind, sizes, children } => {
             let mut new_children: Vec<Node> = Vec::new();
-            for child in children { if let Some(c) = prune_exited(child) { new_children.push(c); } }
+            let mut new_sizes: Vec<u16> = Vec::new();
+            for (i, child) in children.into_iter().enumerate() {
+                if let Some(c) = prune_exited(child, remain_on_exit) {
+                    new_children.push(c);
+                    new_sizes.push(sizes.get(i).copied().unwrap_or(0));
+                }
+            }
             if new_children.is_empty() { None }
             else if new_children.len() == 1 { Some(new_children.remove(0)) }
             else {
-                let mut eq = vec![100 / new_children.len() as u16; new_children.len()];
-                let rem = 100 - eq.iter().sum::<u16>();
-                if let Some(last) = eq.last_mut() { *last += rem; }
-                Some(Node::Split { kind, sizes: eq, children: new_children })
+                // Redistribute removed pane's percentage proportionally among survivors
+                let total: u16 = new_sizes.iter().sum();
+                if total == 0 || total == 100 {
+                    // Already fine or all zero — just normalize
+                    if total == 0 {
+                        new_sizes = vec![100 / new_children.len() as u16; new_children.len()];
+                        let rem = 100 - new_sizes.iter().sum::<u16>();
+                        if let Some(last) = new_sizes.last_mut() { *last += rem; }
+                    }
+                } else {
+                    // Scale proportionally to sum to 100
+                    let mut scaled: Vec<u16> = new_sizes.iter().map(|&s| (s as u32 * 100 / total as u32) as u16).collect();
+                    let rem = 100u16.saturating_sub(scaled.iter().sum::<u16>());
+                    if let Some(last) = scaled.last_mut() { *last += rem; }
+                    new_sizes = scaled;
+                }
+                Some(Node::Split { kind, sizes: new_sizes, children: new_children })
             }
         }
     }
@@ -328,6 +468,11 @@ pub fn get_active_pane_id(node: &Node, path: &[usize]) -> Option<usize> {
     }
 }
 
+/// Get the pane ID at a specific path (used by format vars for pane position lookup).
+pub fn get_active_pane_id_at_path(node: &Node, path: &[usize]) -> Option<usize> {
+    get_active_pane_id(node, path)
+}
+
 pub fn find_window_index_by_id(app: &AppState, wid: usize) -> Option<usize> {
     app.windows.iter().position(|w| w.id == wid)
 }
@@ -371,39 +516,36 @@ pub fn focus_pane_by_index(app: &mut AppState, idx: usize) {
     }
 }
 
-/// Consume and collect pane ids that had fresh output since the last check.
-pub fn consume_output_dirty_set(node: &Node, out: &mut HashSet<usize>) {
+/// Count the number of leaf (pane) nodes in a tree.
+pub fn count_panes(node: &Node) -> usize {
     match node {
-        Node::Leaf(p) => {
-            if p.output_dirty.swap(false, Ordering::Relaxed) {
-                out.insert(p.id);
-            }
-        }
-        Node::Split { children, .. } => {
-            for child in children {
-                consume_output_dirty_set(child, out);
-            }
-        }
+        Node::Leaf(_) => 1,
+        Node::Split { children, .. } => children.iter().map(count_panes).sum(),
     }
 }
 
-/// Count the number of leaf nodes in a tree
-fn count_leaves(node: &Node) -> usize {
+/// Immutable reference to the active pane (follows path through splits).
+pub fn active_pane<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Pane> {
     match node {
-        Node::Leaf(_) => 1,
-        Node::Split { children, .. } => children.iter().map(count_leaves).sum(),
+        Node::Leaf(p) => Some(p),
+        Node::Split { children, .. } => {
+            if path.is_empty() { return None; }
+            let idx = path[0].min(children.len().saturating_sub(1));
+            active_pane(&children[idx], &path[1..])
+        }
     }
 }
 
 /// Reap exited children from the app. Returns (all_empty, any_pruned).
 pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
+    let remain = app.remain_on_exit;
     let mut any_pruned = false;
     for i in (0..app.windows.len()).rev() {
-        let leaves_before = count_leaves(&app.windows[i].root);
+        let leaves_before = count_panes(&app.windows[i].root);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
-        match prune_exited(root) {
+        match prune_exited(root, remain) {
             Some(new_root) => {
-                let leaves_after = count_leaves(&new_root);
+                let leaves_after = count_panes(&new_root);
                 if leaves_after < leaves_before {
                     any_pruned = true;
                 }
@@ -412,7 +554,18 @@ pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
                     app.windows[i].active_path = first_leaf_path(&app.windows[i].root);
                 }
             }
-            None => { app.windows.remove(i); any_pruned = true; }
+            None => {
+                app.windows.remove(i);
+                any_pruned = true;
+                // Adjust active_idx after removing a window
+                if !app.windows.is_empty() {
+                    if i < app.active_idx {
+                        app.active_idx -= 1;
+                    } else if app.active_idx >= app.windows.len() {
+                        app.active_idx = app.windows.len() - 1;
+                    }
+                }
+            }
         }
     }
     Ok((app.windows.is_empty(), any_pruned))

@@ -43,6 +43,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         let rest = &l[7..];
         parse_option_value(app, rest, true);
     }
+    else if l.starts_with("setw ") || l.starts_with("set-window-option ") {
+        // setw maps to the same option parser (tmux window options overlap)
+        parse_set_option(app, l);
+    }
     else if l.starts_with("bind-key ") || l.starts_with("bind ") {
         parse_bind_key(app, l);
     }
@@ -53,6 +57,31 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         let parts: Vec<&str> = l.splitn(2, ' ').collect();
         if parts.len() > 1 {
             source_file(app, parts[1].trim());
+        }
+    }
+    else if l.starts_with("run-shell ") || l.starts_with("run ") {
+        parse_run_shell(app, l);
+    }
+    else if l.starts_with("if-shell ") || l.starts_with("if ") {
+        parse_if_shell(app, l);
+    }
+    else if l.starts_with("set-hook ") {
+        // Parse set-hook: set-hook [-g] hook-name command
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        let mut i = 1;
+        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
+        if i + 1 < parts.len() {
+            let hook = parts[i].to_string();
+            let cmd = parts[i+1..].join(" ");
+            app.hooks.entry(hook).or_insert_with(Vec::new).push(cmd);
+        }
+    }
+    else if l.starts_with("set-environment ") || l.starts_with("setenv ") {
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        let mut i = 1;
+        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
+        if i + 1 < parts.len() {
+            app.environment.insert(parts[i].to_string(), parts[i+1..].join(" "));
         }
     }
 }
@@ -101,7 +130,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 app.prefix_key = key;
             }
         }
-        "prefix2" => {}
+        "prefix2" => { app.environment.insert(key.to_string(), value.to_string()); }
         "escape-time" => {
             if let Ok(ms) = value.parse::<u64>() {
                 app.escape_time_ms = ms;
@@ -117,36 +146,150 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         }
         "cursor-style" => env::set_var("PSMUX_CURSOR_STYLE", value),
         "cursor-blink" => env::set_var("PSMUX_CURSOR_BLINK", if matches!(value, "on"|"true"|"1") { "1" } else { "0" }),
-        "status" => {}
-        "status-style" => {}
-        "status-position" => {}
-        "status-interval" => {}
-        "status-justify" => {}
+        "status" => {
+            app.status_visible = matches!(value, "on" | "true" | "1" | "2");
+        }
+        "status-style" => {
+            app.status_style = value.to_string();
+        }
+        "status-position" => {
+            app.status_position = value.to_string();
+        }
+        "status-interval" => {
+            if let Ok(n) = value.parse::<u64>() { app.status_interval = n; }
+        }
+        "status-justify" => { app.status_justify = value.to_string(); }
         "base-index" => {
             if let Ok(idx) = value.parse::<usize>() {
                 app.window_base_index = idx;
             }
         }
-        "renumber-windows" => {}
-        "mode-keys" => {}
-        "status-keys" => {}
-        "history-limit" => {
-            if let Ok(lines) = value.parse::<usize>() {
-                app.scrollback_lines = lines.clamp(100, 100_000);
+        "pane-base-index" => {
+            if let Ok(idx) = value.parse::<usize>() {
+                app.pane_base_index = idx;
             }
         }
-        "pane-border-style" => {}
-        "pane-active-border-style" => {}
-        "window-status-format" => {}
-        "window-status-current-format" => {}
-        "window-status-separator" => {}
-        "remain-on-exit" => {}
-        "set-titles" => {}
-        "set-titles-string" => {}
-        "automatic-rename" => {}
-        "allow-rename" => {}
-        _ => {}
+        "history-limit" => {
+            if let Ok(limit) = value.parse::<usize>() {
+                app.history_limit = limit;
+            }
+        }
+        "display-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_time_ms = ms;
+            }
+        }
+        "display-panes-time" => {
+            if let Ok(ms) = value.parse::<u64>() {
+                app.display_panes_time_ms = ms;
+            }
+        }
+        "default-command" | "default-shell" => {
+            app.default_shell = value.to_string();
+        }
+        "word-separators" => {
+            app.word_separators = value.to_string();
+        }
+        "renumber-windows" => {
+            app.renumber_windows = matches!(value, "on" | "true" | "1");
+        }
+        "mode-keys" => {
+            app.mode_keys = value.to_string();
+        }
+        "focus-events" => {
+            app.focus_events = matches!(value, "on" | "true" | "1");
+        }
+        "monitor-activity" => {
+            app.monitor_activity = matches!(value, "on" | "true" | "1");
+        }
+        "visual-activity" => {
+            app.visual_activity = matches!(value, "on" | "true" | "1");
+        }
+        "remain-on-exit" => {
+            app.remain_on_exit = matches!(value, "on" | "true" | "1");
+        }
+        "aggressive-resize" => {
+            app.aggressive_resize = matches!(value, "on" | "true" | "1");
+        }
+        "set-titles" => {
+            app.set_titles = matches!(value, "on" | "true" | "1");
+        }
+        "set-titles-string" => {
+            app.set_titles_string = value.to_string();
+        }
+        "status-keys" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "pane-border-style" => { app.pane_border_style = value.to_string(); }
+        "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }
+        "window-status-format" => { app.window_status_format = value.to_string(); }
+        "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
+        "window-status-separator" => { app.window_status_separator = value.to_string(); }
+        "automatic-rename" => {
+            app.automatic_rename = matches!(value, "on" | "true" | "1");
+        }
+        "synchronize-panes" => {
+            app.sync_input = matches!(value, "on" | "true" | "1");
+        }
+        "allow-rename" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "terminal-overrides" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "default-terminal" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "update-environment" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "bell-action" => { app.bell_action = value.to_string(); }
+        "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1"); }
+        "activity-action" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "silence-action" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "monitor-silence" => {
+            if let Ok(n) = value.parse::<u64>() { app.monitor_silence = n; }
+        }
+        "message-style" => { app.message_style = value.to_string(); }
+        "message-command-style" => { app.message_command_style = value.to_string(); }
+        "mode-style" => { app.mode_style = value.to_string(); }
+        "window-status-style" => { app.window_status_style = value.to_string(); }
+        "window-status-current-style" => { app.window_status_current_style = value.to_string(); }
+        "window-status-activity-style" => { app.window_status_activity_style = value.to_string(); }
+        "window-status-bell-style" => { app.window_status_bell_style = value.to_string(); }
+        "window-status-last-style" => { app.window_status_last_style = value.to_string(); }
+        "status-left-style" => { app.status_left_style = value.to_string(); }
+        "status-right-style" => { app.status_right_style = value.to_string(); }
+        "clock-mode-colour" | "clock-mode-style" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "pane-border-format" | "pane-border-status" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "popup-style" | "popup-border-style" | "popup-border-lines" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "window-style" | "window-active-style" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "wrap-search" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "lock-after-time" | "lock-command" => { app.environment.insert(key.to_string(), value.to_string()); }
+        _ => {
+            // Store any unknown option in the environment map for plugin compat
+            app.environment.insert(key.to_string(), value.to_string());
+        }
     }
+}
+
+/// Split a bind-key command string on `\;` or bare `;` to produce sub-commands.
+/// Handles: `split-window \; select-pane -D` → ["split-window", "select-pane -D"]
+pub fn split_chained_commands_pub(command: &str) -> Vec<String> {
+    split_chained_commands(command)
+}
+fn split_chained_commands(command: &str) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    
+    for token in &tokens {
+        if *token == "\\;" || *token == ";" {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                commands.push(trimmed);
+            }
+            current.clear();
+        } else {
+            if !current.is_empty() { current.push(' '); }
+            current.push_str(token);
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        commands.push(trimmed);
+    }
+    commands
 }
 
 pub fn parse_bind_key(app: &mut AppState, line: &str) {
@@ -179,11 +322,21 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
     if i >= parts.len() { return; }
     let command = parts[i..].join(" ");
     
+    // Split on `\;` or `;` to support command chaining (like tmux `bind x split-window \; select-pane -D`)
+    let sub_commands: Vec<String> = split_chained_commands(&command);
+    
     if let Some(key) = parse_key_name(key_str) {
-        if let Some(action) = parse_command_to_action(&command) {
-            app.binds.retain(|b| b.key != key);
-            app.binds.push(Bind { key, action });
-        }
+        let action = if sub_commands.len() > 1 {
+            // Multiple chained commands
+            Action::CommandChain(sub_commands)
+        } else if let Some(a) = parse_command_to_action(&command) {
+            a
+        } else {
+            return;
+        };
+        let table = app.key_tables.entry(_key_table).or_default();
+        table.retain(|b| b.key != key);
+        table.push(Bind { key, action, repeat: _repeatable });
     }
 }
 
@@ -206,13 +359,16 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
     }
     
     if unbind_all {
-        app.binds.clear();
+        app.key_tables.clear();
         return;
     }
     
     if i < parts.len() {
         if let Some(key) = parse_key_name(parts[i]) {
-            app.binds.retain(|b| b.key != key);
+            // Remove from all tables
+            for table in app.key_tables.values_mut() {
+                table.retain(|b| b.key != key);
+            }
         }
     }
 }
@@ -442,4 +598,102 @@ pub fn format_key_binding(key: &(KeyCode, KeyModifiers)) -> String {
     
     result.push_str(&key_str);
     result
+}
+
+/// Execute a run-shell / run command from config.
+/// Syntax: run-shell [-b] <command>
+/// Without -b, output is silently discarded (we're in config parsing).
+/// With -b, the command runs in the background.
+fn parse_run_shell(_app: &mut AppState, line: &str) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 { return; }
+    let mut background = false;
+    let mut cmd_parts: Vec<&str> = Vec::new();
+    for p in &parts[1..] {
+        if *p == "-b" { background = true; }
+        else { cmd_parts.push(p); }
+    }
+    let shell_cmd = cmd_parts.join(" ");
+    // Strip surrounding quotes if present
+    let shell_cmd = shell_cmd.trim_matches(|c| c == '\'' || c == '"');
+    if shell_cmd.is_empty() { return; }
+
+    if background {
+        #[cfg(windows)]
+        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).spawn(); }
+        #[cfg(not(windows))]
+        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).spawn(); }
+    } else {
+        #[cfg(windows)]
+        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).output(); }
+        #[cfg(not(windows))]
+        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).output(); }
+    }
+}
+
+/// Execute an if-shell / if command from config.
+/// Syntax: if-shell [-bF] <condition> <true-cmd> [<false-cmd>]
+/// Runs the condition command (or evaluates format with -F), then executes the
+/// appropriate branch command as a config line.
+fn parse_if_shell(app: &mut AppState, line: &str) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 { return; }
+
+    let mut format_mode = false;
+    let mut _background = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < parts.len() {
+        match parts[i] {
+            "-b" => { _background = true; }
+            "-F" => { format_mode = true; }
+            "-bF" | "-Fb" => { _background = true; format_mode = true; }
+            "-t" => { i += 1; } // skip target
+            s => {
+                // Handle quoted strings that might span multiple parts
+                if s.starts_with('"') || s.starts_with('\'') {
+                    let quote = s.chars().next().unwrap();
+                    if s.ends_with(quote) && s.len() > 1 {
+                        positional.push(s[1..s.len()-1].to_string());
+                    } else {
+                        let mut buf = s[1..].to_string();
+                        i += 1;
+                        while i < parts.len() {
+                            buf.push(' ');
+                            buf.push_str(parts[i]);
+                            if parts[i].ends_with(quote) {
+                                buf.truncate(buf.len() - 1);
+                                break;
+                            }
+                            i += 1;
+                        }
+                        positional.push(buf);
+                    }
+                } else {
+                    positional.push(s.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if positional.len() < 2 { return; }
+    let condition = &positional[0];
+    let true_cmd = &positional[1];
+    let false_cmd = positional.get(2);
+
+    let success = if format_mode {
+        !condition.is_empty() && condition != "0"
+    } else {
+        #[cfg(windows)]
+        { std::process::Command::new("cmd").args(["/C", condition]).status().map(|s| s.success()).unwrap_or(false) }
+        #[cfg(not(windows))]
+        { std::process::Command::new("sh").args(["-c", condition]).status().map(|s| s.success()).unwrap_or(false) }
+    };
+
+    let cmd_to_run = if success { Some(true_cmd) } else { false_cmd };
+    if let Some(cmd) = cmd_to_run {
+        // Execute the branch as a config line (recursive — supports set, bind, source, etc.)
+        parse_config_line(app, cmd);
+    }
 }

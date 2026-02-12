@@ -151,20 +151,28 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                 };
                 let screen = parser.screen();
                 let (cr, cc) = screen.cursor_position();
-                let alternate_screen = screen.alternate_screen();
-                let now = Instant::now();
-                let is_active_pane = *cur_path == active_path;
-                if is_active_pane
-                    && !alternate_screen
-                    && now.duration_since(p.last_title_infer_at) >= TITLE_INFER_INTERVAL
-                {
-                    if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
-                        if t != p.title {
-                            p.title = t;
-                            *title_changed = true;
+                // ConPTY never passes through ESC[?1049h, so alternate_screen()
+                // is always false.  Use a heuristic instead: if the last row of
+                // the screen has non-blank content, this is a fullscreen TUI app.
+                let alternate_screen = screen.alternate_screen() || {
+                    let last_row = p.last_rows.saturating_sub(1);
+                    let mut has_content = false;
+                    for col in 0..p.last_cols {
+                        if let Some(cell) = screen.cell(last_row, col) {
+                            let t = cell.contents();
+                            if !t.is_empty() && t != " " {
+                                has_content = true;
+                                break;
+                            }
                         }
                     }
-                    p.last_title_infer_at = now;
+                    has_content
+                };
+                // Throttle infer_title_from_prompt — expensive scan, only needed for display
+                let now = std::time::Instant::now();
+                if now.duration_since(p.last_infer_title).as_millis() >= 500 {
+                    if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) { p.title = t; }
+                    p.last_infer_title = now;
                 }
                 let need_full_content = include_full_content && *cur_path == active_path;
                 let mut lines: Vec<Vec<CellJson>> = if need_full_content {
@@ -181,81 +189,85 @@ pub fn dump_layout_json_with_title_changes(app: &mut AppState) -> io::Result<(St
                     };
                     let mut runs: Vec<CellRunJson> = Vec::new();
                     let mut c = 0;
+                    // Track previous cell's raw color enums for run-merging
+                    // without allocating strings on every cell.
+                    let mut prev_fg_raw: Option<vt100::Color> = None;
+                    let mut prev_bg_raw: Option<vt100::Color> = None;
+                    let mut prev_flags: u8 = 0;
                     while c < p.last_cols {
-                        let mut text = String::new();
-                        let mut fg_code = encode_color(vt100::Color::Default);
-                        let mut bg_code = encode_color(vt100::Color::Default);
-                        let mut bold = false;
-                        let mut italic = false;
-                        let mut underline = false;
-                        let mut inverse = false;
-                        let mut dim = false;
-                        if let Some(cell) = screen.cell(r, c) {
-                            let fg = cell.fgcolor();
-                            let bg = cell.bgcolor();
-                            fg_code = encode_color(fg);
-                            bg_code = encode_color(bg);
-                            text = cell.contents().to_string();
-                            if text.is_empty() {
-                                text.push(' ');
+                        // Process each cell inline to avoid per-cell String allocation.
+                        // The &str from cell.contents() can only be used inside the
+                        // if-let block (borrows from parser), so run-merging happens
+                        // here too — push_str(&str) avoids allocation for merged cells.
+                        let (width, cell_fg_raw, cell_bg_raw, flags) = if let Some(cell) = screen.cell(r, c) {
+                            let t = cell.contents();
+                            let t = if t.is_empty() { " " } else { t };
+                            let cell_fg = cell.fgcolor();
+                            let cell_bg = cell.bgcolor();
+                            let mut w = UnicodeWidthStr::width(t) as u16;
+                            if w == 0 { w = 1; }
+                            let mut fl = 0u8;
+                            if cell.dim() { fl |= FLAG_DIM; }
+                            if cell.bold() { fl |= FLAG_BOLD; }
+                            if cell.italic() { fl |= FLAG_ITALIC; }
+                            if cell.underline() { fl |= FLAG_UNDERLINE; }
+                            if cell.inverse() { fl |= FLAG_INVERSE; }
+
+                            // Run merging — push &str directly, no String allocation
+                            let merged = if let Some(last) = runs.last_mut() {
+                                if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg) && prev_flags == fl {
+                                    last.text.push_str(t);
+                                    last.width = last.width.saturating_add(w);
+                                    true
+                                } else { false }
+                            } else { false };
+                            if !merged {
+                                let fg = crate::util::color_to_name(cell_fg);
+                                let bg = crate::util::color_to_name(cell_bg);
+                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w });
                             }
-                            bold = cell.bold();
-                            italic = cell.italic();
-                            underline = cell.underline();
-                            inverse = cell.inverse();
-                            dim = cell.dim();
-                        } else {
-                            text.push(' ');
-                        }
 
-                        let mut width = UnicodeWidthStr::width(text.as_str()) as u16;
-                        if width == 0 {
-                            width = 1;
-                        }
-
-                        let mut flags = 0u8;
-                        if dim { flags |= FLAG_DIM; }
-                        if bold { flags |= FLAG_BOLD; }
-                        if italic { flags |= FLAG_ITALIC; }
-                        if underline { flags |= FLAG_UNDERLINE; }
-                        if inverse { flags |= FLAG_INVERSE; }
-
-                        if need_full_content {
-                            if let Some(last) = runs.last_mut() {
-                                if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
-                                    last.text.push_str(text.as_str());
-                                    last.width = last.width.saturating_add(width);
-                                } else {
-                                    runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
-                                }
-                            } else {
-                                runs.push(CellRunJson { text: text.clone(), fg: fg_code, bg: bg_code, flags, width });
-                            }
-                            row.push(CellJson {
-                                text,
-                                fg: fg_code,
-                                bg: bg_code,
-                                flags,
-                            });
-                            for _ in 1..width {
+                            if need_full_content {
+                                let fg_str = crate::util::color_to_name(cell_fg).into_owned();
+                                let bg_str = crate::util::color_to_name(cell_bg).into_owned();
                                 row.push(CellJson {
-                                    text: String::new(),
-                                    fg: fg_code,
-                                    bg: bg_code,
-                                    flags,
+                                    text: t.to_string(), fg: fg_str.clone(), bg: bg_str.clone(),
+                                    bold: cell.bold(), italic: cell.italic(),
+                                    underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
+                                });
+                                for _ in 1..w {
+                                    row.push(CellJson {
+                                        text: String::new(), fg: fg_str.clone(), bg: bg_str.clone(),
+                                        bold: cell.bold(), italic: cell.italic(),
+                                        underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
+                                    });
+                                }
+                            }
+
+                            (w, cell_fg, cell_bg, fl)
+                        } else {
+                            // No cell — default space
+                            let merged = if let Some(last) = runs.last_mut() {
+                                if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default) && prev_flags == 0 {
+                                    last.text.push(' ');
+                                    last.width = last.width.saturating_add(1);
+                                    true
+                                } else { false }
+                            } else { false };
+                            if !merged {
+                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1 });
+                            }
+                            if need_full_content {
+                                row.push(CellJson {
+                                    text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(),
+                                    bold: false, italic: false, underline: false, inverse: false, dim: false,
                                 });
                             }
-                        } else if let Some(last) = runs.last_mut() {
-                            if last.fg == fg_code && last.bg == bg_code && last.flags == flags {
-                                last.text.push_str(text.as_str());
-                                last.width = last.width.saturating_add(width);
-                            } else {
-                                runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
-                            }
-                        } else {
-                            runs.push(CellRunJson { text, fg: fg_code, bg: bg_code, flags, width });
-                        }
-
+                            (1u16, vt100::Color::Default, vt100::Color::Default, 0u8)
+                        };
+                        prev_fg_raw = Some(cell_fg_raw);
+                        prev_bg_raw = Some(cell_bg_raw);
+                        prev_flags = flags;
                         c = c.saturating_add(width.max(1));
                     }
                     if need_full_content {
@@ -519,6 +531,295 @@ pub fn dump_panes_delta_json(
     let s = serde_json::to_string(&LayoutDeltaJson { panes })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok((s, title_changed, changed))
+}
+
+/// Direct JSON serialisation of the layout tree – writes JSON straight into
+/// a pre-allocated `String`, avoiding the intermediate `LayoutJson` / `CellRunJson`
+/// allocations **and** the `serde_json::to_string` traversal.  Produces the
+/// identical JSON format that the client deserialises into `LayoutJson`.
+pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
+    let in_copy = matches!(app.mode, Mode::CopyMode);
+    let scroll_off = app.copy_scroll_offset;
+    let anchor = app.copy_anchor;
+    let cpos = app.copy_pos;
+
+    // ── tiny helpers (no captures needed, so plain `fn` items) ───────
+
+    /// Append the JSON-escaped form of `s` into `out`.
+    fn json_esc(s: &str, out: &mut String) {
+        // Fast path – most cell text needs no escaping.
+        if !s.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+            out.push_str(s);
+            return;
+        }
+        for ch in s.chars() {
+            match ch {
+                '"'  => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => {
+                    let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+    }
+
+    /// Append a `vt100::Color` as its JSON string value (**no** surrounding quotes).
+    fn push_color(c: vt100::Color, out: &mut String) {
+        match c {
+            vt100::Color::Default => out.push_str("default"),
+            vt100::Color::Idx(i) => {
+                let _ = std::fmt::Write::write_fmt(out, format_args!("idx:{}", i));
+            }
+            vt100::Color::Rgb(r, g, b) => {
+                let _ = std::fmt::Write::write_fmt(out, format_args!("rgb:{},{},{}", r, g, b));
+            }
+        }
+    }
+
+    /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
+    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
+        out.push_str("\",\"fg\":\"");
+        push_color(fg, out);
+        out.push_str("\",\"bg\":\"");
+        push_color(bg, out);
+        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}}}", fl, w));
+    }
+
+    // ── recursive tree walker ────────────────────────────────────────
+
+    fn write_node(
+        node: &mut Node,
+        cur_path: &mut Vec<usize>,
+        active_path: &[usize],
+        in_copy: bool,
+        scroll_off: usize,
+        anchor: Option<(u16, u16)>,
+        cpos: Option<(u16, u16)>,
+        out: &mut String,
+    ) {
+        match node {
+            Node::Split { kind, sizes, children } => {
+                out.push_str("{\"type\":\"split\",\"kind\":\"");
+                match kind {
+                    LayoutKind::Horizontal => out.push_str("Horizontal"),
+                    LayoutKind::Vertical   => out.push_str("Vertical"),
+                }
+                out.push_str("\",\"sizes\":[");
+                for (i, s) in sizes.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    let _ = std::fmt::Write::write_fmt(out, format_args!("{}", s));
+                }
+                out.push_str("],\"children\":[");
+                for (i, c) in children.iter_mut().enumerate() {
+                    if i > 0 { out.push(','); }
+                    cur_path.push(i);
+                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, cpos, out);
+                    cur_path.pop();
+                }
+                out.push_str("]}");
+            }
+
+            Node::Leaf(p) => {
+                const FLAG_DIM: u8      = 1;
+                const FLAG_BOLD: u8     = 2;
+                const FLAG_ITALIC: u8   = 4;
+                const FLAG_UNDERLINE: u8 = 8;
+                const FLAG_INVERSE: u8  = 16;
+
+                let is_active    = cur_path.as_slice() == active_path;
+                let need_content = in_copy && is_active;
+
+                let parser = p.term.lock().unwrap();
+                let screen = parser.screen();
+                let (cr, cc) = screen.cursor_position();
+
+                // Alternate-screen heuristic (ConPTY never passes ESC[?1049h)
+                let alt = screen.alternate_screen() || {
+                    let lr = p.last_rows.saturating_sub(1);
+                    (0..p.last_cols).any(|col| {
+                        screen.cell(lr, col).map_or(false, |c| {
+                            let t = c.contents();
+                            !t.is_empty() && t != " "
+                        })
+                    })
+                };
+
+                // Throttled title inference
+                let now = std::time::Instant::now();
+                if now.duration_since(p.last_infer_title).as_millis() >= 500 {
+                    if let Some(t) = infer_title_from_prompt(screen, p.last_rows, p.last_cols) {
+                        p.title = t;
+                    }
+                    p.last_infer_title = now;
+                }
+
+                // ── leaf header ──────────────────────────────────────
+                let so = if is_active && in_copy { scroll_off } else { 0 };
+                let _ = std::fmt::Write::write_fmt(out, format_args!(
+                    concat!(
+                        "{{\"type\":\"leaf\",\"id\":{},",
+                        "\"rows\":{},\"cols\":{},",
+                        "\"cursor_row\":{},\"cursor_col\":{},",
+                        "\"alternate_screen\":{},",
+                        "\"active\":{},\"copy_mode\":{},",
+                        "\"scroll_offset\":{},"),
+                    p.id, p.last_rows, p.last_cols,
+                    cr, cc, alt, is_active, need_content, so,
+                ));
+
+                // selection bounds
+                if is_active && in_copy {
+                    if let (Some((ar, ac)), Some((pr, pc))) = (anchor, cpos) {
+                        let _ = std::fmt::Write::write_fmt(out, format_args!(
+                            "\"sel_start_row\":{},\"sel_start_col\":{},\"sel_end_row\":{},\"sel_end_col\":{},",
+                            ar.min(pr), ac.min(pc), ar.max(pr), ac.max(pc),
+                        ));
+                    } else {
+                        out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                    }
+                } else {
+                    out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                }
+
+                // ── content (per-cell, only in copy-mode active pane) ──
+                if need_content {
+                    out.push_str("\"content\":[");
+                    for r in 0..p.last_rows {
+                        if r > 0 { out.push(','); }
+                        out.push('[');
+                        let mut c = 0u16;
+                        let mut first = true;
+                        while c < p.last_cols {
+                            if !first { out.push(','); }
+                            first = false;
+                            if let Some(cell) = screen.cell(r, c) {
+                                let t = cell.contents();
+                                let t = if t.is_empty() { " " } else { t };
+                                let w = UnicodeWidthStr::width(t).max(1) as u16;
+                                out.push_str("{\"text\":\"");
+                                json_esc(t, out);
+                                out.push_str("\",\"fg\":\"");
+                                push_color(cell.fgcolor(), out);
+                                out.push_str("\",\"bg\":\"");
+                                push_color(cell.bgcolor(), out);
+                                let _ = std::fmt::Write::write_fmt(out, format_args!(
+                                    "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{}}}",
+                                    cell.bold(), cell.italic(), cell.underline(), cell.inverse(), cell.dim(),
+                                ));
+                                for _ in 1..w {
+                                    out.push_str(",{\"text\":\"\",\"fg\":\"");
+                                    push_color(cell.fgcolor(), out);
+                                    out.push_str("\",\"bg\":\"");
+                                    push_color(cell.bgcolor(), out);
+                                    let _ = std::fmt::Write::write_fmt(out, format_args!(
+                                        "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{}}}",
+                                        cell.bold(), cell.italic(), cell.underline(), cell.inverse(), cell.dim(),
+                                    ));
+                                }
+                                c += w;
+                            } else {
+                                out.push_str("{\"text\":\" \",\"fg\":\"default\",\"bg\":\"default\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false}");
+                                c += 1;
+                            }
+                        }
+                        // pad to full column width
+                        while (c as usize) < p.last_cols as usize {
+                            out.push_str(",{\"text\":\" \",\"fg\":\"default\",\"bg\":\"default\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false}");
+                            c += 1;
+                        }
+                        out.push(']');
+                    }
+                    out.push_str("],");
+                } else {
+                    out.push_str("\"content\":[],");
+                }
+
+                // ── rows_v2 (run-merged, the normal hot path) ────────
+                out.push_str("\"rows_v2\":[");
+                for r in 0..p.last_rows {
+                    if r > 0 { out.push(','); }
+                    out.push_str("{\"runs\":[");
+                    let mut c = 0u16;
+                    let mut prev_fg: Option<vt100::Color> = None;
+                    let mut prev_bg: Option<vt100::Color> = None;
+                    let mut prev_fl: u8 = 0;
+                    let mut run_w: u16 = 0;
+                    let mut in_run = false;
+
+                    while c < p.last_cols {
+                        let (cfg, cbg, fl, w) = if let Some(cell) = screen.cell(r, c) {
+                            let t = cell.contents();
+                            let t = if t.is_empty() { " " } else { t };
+                            let cfg = cell.fgcolor();
+                            let cbg = cell.bgcolor();
+                            let mut w = UnicodeWidthStr::width(t) as u16;
+                            if w == 0 { w = 1; }
+                            let mut fl = 0u8;
+                            if cell.dim()       { fl |= FLAG_DIM; }
+                            if cell.bold()      { fl |= FLAG_BOLD; }
+                            if cell.italic()    { fl |= FLAG_ITALIC; }
+                            if cell.underline() { fl |= FLAG_UNDERLINE; }
+                            if cell.inverse()   { fl |= FLAG_INVERSE; }
+
+                            if in_run && prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                // merge into current open run
+                                json_esc(t, out);
+                                run_w += w;
+                            } else {
+                                if in_run {
+                                    close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
+                                    out.push(',');
+                                }
+                                out.push_str("{\"text\":\"");
+                                json_esc(t, out);
+                                run_w = w;
+                                in_run = true;
+                            }
+                            (cfg, cbg, fl, w)
+                        } else {
+                            let cfg = vt100::Color::Default;
+                            let cbg = vt100::Color::Default;
+                            let fl  = 0u8;
+                            if in_run && prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                out.push(' ');
+                                run_w += 1;
+                            } else {
+                                if in_run {
+                                    close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
+                                    out.push(',');
+                                }
+                                out.push_str("{\"text\":\" ");
+                                run_w = 1;
+                                in_run = true;
+                            }
+                            (cfg, cbg, fl, 1u16)
+                        };
+                        prev_fg = Some(cfg);
+                        prev_bg = Some(cbg);
+                        prev_fl = fl;
+                        c += w.max(1);
+                    }
+                    // close last run of the row
+                    if in_run {
+                        close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
+                    }
+                    out.push_str("]}");
+                }
+                out.push_str("]}");
+            }
+        }
+    }
+
+    let win = &mut app.windows[app.active_idx];
+    let active_path = win.active_path.clone();
+    let mut path = Vec::new();
+    let mut out = String::with_capacity(32768);
+    write_node(
+        &mut win.root, &mut path, &active_path,
+        in_copy, scroll_off, anchor, cpos, &mut out,
+    );
+    Ok(out)
 }
 
 /// Apply a named layout to the current window

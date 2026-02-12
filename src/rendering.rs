@@ -13,25 +13,7 @@ use crate::types::*;
 pub fn vt_to_color(c: vt100::Color) -> Color {
     match c {
         vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => match i {
-            0 => Color::Black,
-            1 => Color::Red,
-            2 => Color::Green,
-            3 => Color::Yellow,
-            4 => Color::Blue,
-            5 => Color::Magenta,
-            6 => Color::Cyan,
-            7 => Color::Rgb(128, 128, 128),
-            8 => Color::Rgb(80, 80, 80),
-            9 => Color::LightRed,
-            10 => Color::LightGreen,
-            11 => Color::LightYellow,
-            12 => Color::LightBlue,
-            13 => Color::LightMagenta,
-            14 => Color::LightCyan,
-            15 => Color::White,
-            _ => Color::Reset,
-        },
+        vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
@@ -70,8 +52,10 @@ pub fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {
 
 pub fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
     let dim_preds = app.prediction_dimming;
+    let border_style = parse_tmux_style(&app.pane_border_style);
+    let active_border_style = parse_tmux_style(&app.pane_active_border_style);
     let win = &mut app.windows[app.active_idx];
-    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds);
+    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style);
 }
 
 pub fn render_node(
@@ -81,12 +65,17 @@ pub fn render_node(
     cur_path: &mut Vec<usize>,
     area: Rect,
     dim_preds: bool,
+    border_style: Style,
+    active_border_style: Style,
 ) {
     match node {
         Node::Leaf(pane) => {
             let is_active = *cur_path == *active_path;
             let title = if is_active { "* pane" } else { " pane" };
-            let pane_block = Block::default().borders(Borders::ALL).title(title);
+            let pane_block = Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(if is_active { active_border_style } else { border_style });
             let inner = pane_block.inner(area);
             let target_rows = inner.height.max(1);
             let target_cols = inner.width.max(1);
@@ -162,7 +151,7 @@ pub fn render_node(
             };
             for (i, child) in children.iter_mut().enumerate() {
                 cur_path.push(i);
-                render_node(f, child, active_path, cur_path, rects[i], dim_preds);
+                render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style);
                 cur_path.pop();
             }
         }
@@ -192,9 +181,26 @@ pub fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'stat
                     if p.starts_with("fg=") { cur_style = cur_style.fg(map_color(&p[3..])); }
                     else if p.starts_with("bg=") { cur_style = cur_style.bg(map_color(&p[3..])); }
                     else if p == "bold" { cur_style = cur_style.add_modifier(Modifier::BOLD); }
-                    else if p == "italic" { cur_style = cur_style.add_modifier(Modifier::ITALIC); }
-                    else if p == "underline" { cur_style = cur_style.add_modifier(Modifier::UNDERLINED); }
-                    else if p == "default" { cur_style = Style::default(); }
+                    else if p == "dim" { cur_style = cur_style.add_modifier(Modifier::DIM); }
+                    else if p == "italic" || p == "italics" { cur_style = cur_style.add_modifier(Modifier::ITALIC); }
+                    else if p == "underline" || p == "underscore" { cur_style = cur_style.add_modifier(Modifier::UNDERLINED); }
+                    else if p == "blink" { cur_style = cur_style.add_modifier(Modifier::SLOW_BLINK); }
+                    else if p == "reverse" { cur_style = cur_style.add_modifier(Modifier::REVERSED); }
+                    else if p == "hidden" { cur_style = cur_style.add_modifier(Modifier::HIDDEN); }
+                    else if p == "strikethrough" { cur_style = cur_style.add_modifier(Modifier::CROSSED_OUT); }
+                    else if p == "overline" { /* ratatui doesn't support overline natively */ }
+                    else if p == "double-underscore" || p == "curly-underscore" || p == "dotted-underscore" || p == "dashed-underscore" {
+                        cur_style = cur_style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    else if p == "default" || p == "none" { cur_style = Style::default(); }
+                    else if p == "nobold" { cur_style = cur_style.remove_modifier(Modifier::BOLD); }
+                    else if p == "nodim" { cur_style = cur_style.remove_modifier(Modifier::DIM); }
+                    else if p == "noitalics" || p == "noitalic" { cur_style = cur_style.remove_modifier(Modifier::ITALIC); }
+                    else if p == "nounderline" || p == "nounderscore" { cur_style = cur_style.remove_modifier(Modifier::UNDERLINED); }
+                    else if p == "noblink" { cur_style = cur_style.remove_modifier(Modifier::SLOW_BLINK); }
+                    else if p == "noreverse" { cur_style = cur_style.remove_modifier(Modifier::REVERSED); }
+                    else if p == "nohidden" { cur_style = cur_style.remove_modifier(Modifier::HIDDEN); }
+                    else if p == "nostrikethrough" { cur_style = cur_style.remove_modifier(Modifier::CROSSED_OUT); }
                 }
                 i += 2 + end + 1; 
                 continue;
@@ -211,11 +217,14 @@ pub fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'stat
 }
 
 pub fn map_color(name: &str) -> Color {
+    let name = name.trim();
+    // idx:N (psmux custom)
     if let Some(idx_str) = name.strip_prefix("idx:") {
         if let Ok(idx) = idx_str.parse::<u8>() {
             return Color::Indexed(idx);
         }
     }
+    // rgb:R,G,B (psmux custom)
     if let Some(rgb_str) = name.strip_prefix("rgb:") {
         let mut it = rgb_str.split(',');
         if let (Some(r), Some(g), Some(b), None) = (it.next(), it.next(), it.next(), it.next()) {
@@ -224,27 +233,43 @@ pub fn map_color(name: &str) -> Color {
             }
         }
     }
-    if name.eq_ignore_ascii_case("black") { return Color::Black; }
-    if name.eq_ignore_ascii_case("red") { return Color::Red; }
-    if name.eq_ignore_ascii_case("green") { return Color::Green; }
-    if name.eq_ignore_ascii_case("yellow") { return Color::Yellow; }
-    if name.eq_ignore_ascii_case("blue") { return Color::Blue; }
-    if name.eq_ignore_ascii_case("magenta") { return Color::Magenta; }
-    if name.eq_ignore_ascii_case("cyan") { return Color::Cyan; }
-    if name.eq_ignore_ascii_case("white") { return Color::White; }
-    if name.eq_ignore_ascii_case("default") { return Color::Reset; }
-    Color::Reset
-}
-
-pub fn map_color_code(code: u32) -> Color {
-    match code >> 24 {
-        0 => Color::Reset,
-        1 => Color::Indexed((code & 0xff) as u8),
-        2 => Color::Rgb(
-            ((code >> 16) & 0xff) as u8,
-            ((code >> 8) & 0xff) as u8,
-            (code & 0xff) as u8,
-        ),
+    // #RRGGBB hex
+    if let Some(hex_str) = name.strip_prefix('#') {
+        if hex_str.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex_str[0..2], 16),
+                u8::from_str_radix(&hex_str[2..4], 16),
+                u8::from_str_radix(&hex_str[4..6], 16),
+            ) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
+    // colour0-colour255 / color0-color255 (tmux primary indexed color format)
+    let lower = name.to_lowercase();
+    if let Some(idx_str) = lower.strip_prefix("colour").or_else(|| lower.strip_prefix("color")) {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Color::Indexed(idx);
+        }
+    }
+    match lower.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "brightblack" | "bright-black" => Color::DarkGray,
+        "brightred" | "bright-red" => Color::LightRed,
+        "brightgreen" | "bright-green" => Color::LightGreen,
+        "brightyellow" | "bright-yellow" => Color::LightYellow,
+        "brightblue" | "bright-blue" => Color::LightBlue,
+        "brightmagenta" | "bright-magenta" => Color::LightMagenta,
+        "brightcyan" | "bright-cyan" => Color::LightCyan,
+        "brightwhite" | "bright-white" => Color::White,
+        "default" | "terminal" => Color::Reset,
         _ => Color::Reset,
     }
 }
@@ -262,4 +287,34 @@ pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let width = (middle.width * percent_x) / 100;
     let x = middle.x + (middle.width - width) / 2;
     Rect { x, y: middle.y, width, height }
+}
+
+/// Parse a tmux style string (e.g. "bg=green,fg=black,bold") into a ratatui Style.
+/// Used for status-style, pane-border-style, message-style, mode-style, etc.
+pub fn parse_tmux_style(style_str: &str) -> Style {
+    let mut style = Style::default();
+    if style_str.is_empty() { return style; }
+    for part in style_str.split(',') {
+        let p = part.trim();
+        if p.starts_with("fg=") { style = style.fg(map_color(&p[3..])); }
+        else if p.starts_with("bg=") { style = style.bg(map_color(&p[3..])); }
+        else if p == "bold" { style = style.add_modifier(Modifier::BOLD); }
+        else if p == "dim" { style = style.add_modifier(Modifier::DIM); }
+        else if p == "italic" || p == "italics" { style = style.add_modifier(Modifier::ITALIC); }
+        else if p == "underline" || p == "underscore" { style = style.add_modifier(Modifier::UNDERLINED); }
+        else if p == "blink" { style = style.add_modifier(Modifier::SLOW_BLINK); }
+        else if p == "reverse" { style = style.add_modifier(Modifier::REVERSED); }
+        else if p == "hidden" { style = style.add_modifier(Modifier::HIDDEN); }
+        else if p == "strikethrough" { style = style.add_modifier(Modifier::CROSSED_OUT); }
+        else if p == "default" || p == "none" { style = Style::default(); }
+        else if p == "nobold" { style = style.remove_modifier(Modifier::BOLD); }
+        else if p == "nodim" { style = style.remove_modifier(Modifier::DIM); }
+        else if p == "noitalics" || p == "noitalic" { style = style.remove_modifier(Modifier::ITALIC); }
+        else if p == "nounderline" || p == "nounderscore" { style = style.remove_modifier(Modifier::UNDERLINED); }
+        else if p == "noblink" { style = style.remove_modifier(Modifier::SLOW_BLINK); }
+        else if p == "noreverse" { style = style.remove_modifier(Modifier::REVERSED); }
+        else if p == "nohidden" { style = style.remove_modifier(Modifier::HIDDEN); }
+        else if p == "nostrikethrough" { style = style.remove_modifier(Modifier::CROSSED_OUT); }
+    }
+    style
 }

@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
@@ -40,11 +40,8 @@ vt100 = "0.16"
 unicode-width = "0.1"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-simd-json = { version = "0.15", optional = true, default-features = false, features = ["serde_impl"] }
-
-[features]
-default = []
-simd-json = ["dep:simd-json"]
+regex = "1"
+glob = "0.3"
 
 [profile.release]
 opt-level = 3

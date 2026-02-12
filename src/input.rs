@@ -10,7 +10,31 @@ use crate::tree::*;
 use crate::pane::*;
 use crate::commands::*;
 use crate::copy_mode::*;
-use crate::layout::cycle_top_layout;
+use crate::layout::{cycle_top_layout, apply_layout};
+use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
+
+/// Write a mouse event to the child PTY using the encoding the child requested.
+fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+    use std::io::Write;
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let ch = if press { 'M' } else { 'm' };
+            let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
+            let _ = master.flush();
+        }
+        _ => {
+            // Default / Utf8 X10-style encoding: \x1b[M Cb Cx Cy (all + 32)
+            if press {
+                let cb = (button + 32) as u8;
+                let cx = ((col as u8).min(223)) + 32;
+                let cy = ((row as u8).min(223)) + 32;
+                let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
+                let _ = master.flush();
+            }
+            // X10-style has no release encoding for individual buttons
+        }
+    }
+}
 
 pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
     let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -27,6 +51,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 app.mode = Mode::Prefix { armed_at: Instant::now() };
                 return Ok(false);
             }
+            // Check root key table for bindings (bind-key -n / bind-key -T root)
+            let key_tuple = (key.code, key.modifiers);
+            if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
+                return execute_action(app, &bind.action);
+            }
             forward_key_to_active(app, key)?;
             Ok(false)
         }
@@ -34,12 +63,43 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             let elapsed = armed_at.elapsed().as_millis() as u64;
             
             let key_tuple = (key.code, key.modifiers);
-            if let Some(bind) = app.binds.iter().find(|b| b.key == key_tuple).cloned() {
-                app.mode = Mode::Passthrough;
+            if let Some(bind) = app.key_tables.get("prefix").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
+                if bind.repeat {
+                    // Stay in prefix mode for repeat-time window
+                    app.mode = Mode::Prefix { armed_at: Instant::now() };
+                } else {
+                    app.mode = Mode::Passthrough;
+                }
                 return execute_action(app, &bind.action);
             }
             
             let handled = match key.code {
+                // Alt+Arrow: resize pane by 5 (must be before plain arrows)
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_vertical(app, -5); true
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_vertical(app, 5); true
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_horizontal(app, -5); true
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    crate::window_ops::resize_pane_horizontal(app, 5); true
+                }
+                // Ctrl+Arrow: resize pane by 1 (must be before plain arrows)
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_vertical(app, -1); true
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_vertical(app, 1); true
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_horizontal(app, -1); true
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crate::window_ops::resize_pane_horizontal(app, 1); true
+                }
                 KeyCode::Left => { move_focus(app, FocusDir::Left); true }
                 KeyCode::Right => { move_focus(app, FocusDir::Right); true }
                 KeyCode::Up => { move_focus(app, FocusDir::Up); true }
@@ -85,20 +145,28 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('x') => {
-                    kill_active_pane(app)?;
-                    invalidate_layout_cache(app);
+                    app.mode = Mode::ConfirmMode {
+                        prompt: "kill-pane? (y/n)".into(),
+                        command: "kill-pane".into(),
+                        input: String::new(),
+                    };
                     true
                 }
                 KeyCode::Char('d') => {
                     return Ok(true);
                 }
-                KeyCode::Char('w') => { app.mode = Mode::WindowChooser { selected: app.active_idx }; true }
+                KeyCode::Char('w') => {
+                    let tree = crate::commands::build_choose_tree(app);
+                    let selected = tree.iter().position(|e| e.is_current_session && e.is_active_window && !e.is_session_header).unwrap_or(0);
+                    app.mode = Mode::WindowChooser { selected, tree };
+                    true
+                }
                 KeyCode::Char(',') => { app.mode = Mode::RenamePrompt { input: String::new() }; true }
                 KeyCode::Char(' ') => { cycle_top_layout(app); invalidate_layout_cache(app); true }
                 KeyCode::Char('[') => { enter_copy_mode(app); true }
                 KeyCode::Char(']') => { paste_latest(app)?; app.mode = Mode::Passthrough; true }
                 KeyCode::Char(':') => {
-                    app.mode = Mode::CommandPrompt { input: String::new() };
+                    app.mode = Mode::CommandPrompt { input: String::new(), cursor: 0 };
                     true
                 }
                 KeyCode::Char('q') => {
@@ -109,6 +177,100 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         if n <= 10 { app.display_map.push((n, path)); } else { break; }
                     }
                     app.mode = Mode::PaneChooser { opened_at: Instant::now() };
+                    true
+                }
+                // --- zoom pane (z) ---
+                KeyCode::Char('z') => { toggle_zoom(app); true }
+                // --- next pane (o) ---
+                KeyCode::Char('o') => {
+                    let win = &app.windows[app.active_idx];
+                    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+                    compute_rects(&win.root, app.last_window_area, &mut rects);
+                    if let Some(cur) = rects.iter().position(|r| r.0 == win.active_path) {
+                        let next = (cur + 1) % rects.len();
+                        let new_path = rects[next].0.clone();
+                        let win = &mut app.windows[app.active_idx];
+                        app.last_pane_path = win.active_path.clone();
+                        win.active_path = new_path;
+                    }
+                    true
+                }
+                // --- last pane (;) ---
+                KeyCode::Char(';') => {
+                    let win = &mut app.windows[app.active_idx];
+                    if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
+                        let tmp = win.active_path.clone();
+                        win.active_path = app.last_pane_path.clone();
+                        app.last_pane_path = tmp;
+                    }
+                    true
+                }
+                // --- last window (l) ---
+                KeyCode::Char('l') => {
+                    if app.last_window_idx < app.windows.len() {
+                        let tmp = app.active_idx;
+                        app.active_idx = app.last_window_idx;
+                        app.last_window_idx = tmp;
+                    }
+                    true
+                }
+                // --- swap pane up/left ({) ---
+                KeyCode::Char('{') => { swap_pane(app, FocusDir::Up); true }
+                // --- swap pane down/right (}) ---
+                KeyCode::Char('}') => { swap_pane(app, FocusDir::Down); true }
+                // --- break pane to new window (!) ---
+                KeyCode::Char('!') => { break_pane_to_window(app); true }
+                // --- kill window (&) with confirmation ---
+                KeyCode::Char('&') => {
+                    app.mode = Mode::ConfirmMode {
+                        prompt: "kill-window? (y/n)".into(),
+                        command: "kill-window".into(),
+                        input: String::new(),
+                    };
+                    true
+                }
+                // --- rename session ($) ---
+                KeyCode::Char('$') => {
+                    app.mode = Mode::RenameSessionPrompt { input: String::new() };
+                    true
+                }
+                // --- Meta+1..5 preset layouts (like tmux) ---
+                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "even-horizontal"); true
+                }
+                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "even-vertical"); true
+                }
+                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "main-horizontal"); true
+                }
+                KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "main-vertical"); true
+                }
+                KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    apply_layout(app, "tiled"); true
+                }
+                // --- display pane info (i) ---
+                KeyCode::Char('i') => {
+                    // Display window/pane info in status bar (tmux prefix+i)
+                    let win = &app.windows[app.active_idx];
+                    let pane_count = crate::tree::count_panes(&win.root);
+                    app.status_right = format!(
+                        "#{} ({}) [{}x{}] panes:{}", 
+                        app.active_idx, win.name,
+                        app.last_window_area.width, app.last_window_area.height,
+                        pane_count
+                    );
+                    true
+                }
+                // --- clock mode (t) ---
+                KeyCode::Char('t') => {
+                    app.mode = Mode::ClockMode;
+                    true
+                }
+                // --- buffer chooser (=) ---
+                KeyCode::Char('=') => {
+                    app.mode = Mode::BufferChooser { selected: 0 };
                     true
                 }
                 _ => false,
@@ -125,23 +287,158 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::CommandPrompt { .. } => {
             match key.code {
                 KeyCode::Esc => { app.mode = Mode::Passthrough; }
-                KeyCode::Enter => { execute_command_prompt(app)?; }
+                KeyCode::Enter => {
+                    // Save to history before executing
+                    if let Mode::CommandPrompt { input, .. } = &app.mode {
+                        if !input.is_empty() {
+                            let cmd = input.clone();
+                            app.command_history.push(cmd);
+                            app.command_history_idx = app.command_history.len();
+                        }
+                    }
+                    execute_command_prompt(app)?;
+                }
                 KeyCode::Backspace => {
-                    if let Mode::CommandPrompt { input } = &mut app.mode { let _ = input.pop(); }
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        if *cursor > 0 {
+                            input.remove(*cursor - 1);
+                            *cursor -= 1;
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        if *cursor < input.len() {
+                            input.remove(*cursor);
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if let Mode::CommandPrompt { cursor, .. } = &mut app.mode {
+                        if *cursor > 0 { *cursor -= 1; }
+                    }
+                }
+                KeyCode::Right => {
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        if *cursor < input.len() { *cursor += 1; }
+                    }
+                }
+                KeyCode::Home => {
+                    if let Mode::CommandPrompt { cursor, .. } = &mut app.mode {
+                        *cursor = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        *cursor = input.len();
+                    }
+                }
+                KeyCode::Up => {
+                    // Cycle through command history (older)
+                    if app.command_history_idx > 0 {
+                        app.command_history_idx -= 1;
+                        let cmd = app.command_history[app.command_history_idx].clone();
+                        let len = cmd.len();
+                        if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                            *input = cmd;
+                            *cursor = len;
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    // Cycle through command history (newer)
+                    if app.command_history_idx < app.command_history.len() {
+                        app.command_history_idx += 1;
+                        let cmd = if app.command_history_idx < app.command_history.len() {
+                            app.command_history[app.command_history_idx].clone()
+                        } else {
+                            String::new()
+                        };
+                        let len = cmd.len();
+                        if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                            *input = cmd;
+                            *cursor = len;
+                        }
+                    }
+                }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+A: move to beginning
+                    if let Mode::CommandPrompt { cursor, .. } = &mut app.mode {
+                        *cursor = 0;
+                    }
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+E: move to end
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        *cursor = input.len();
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+U: kill line (clear from cursor to start)
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        input.drain(..*cursor);
+                        *cursor = 0;
+                    }
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+K: kill to end of line
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        input.truncate(*cursor);
+                    }
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+W: delete word backwards
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        let mut pos = *cursor;
+                        while pos > 0 && input.as_bytes().get(pos - 1) == Some(&b' ') { pos -= 1; }
+                        while pos > 0 && input.as_bytes().get(pos - 1) != Some(&b' ') { pos -= 1; }
+                        input.drain(pos..*cursor);
+                        *cursor = pos;
+                    }
                 }
                 KeyCode::Char(c) => {
-                    if let Mode::CommandPrompt { input } = &mut app.mode { input.push(c); }
+                    if let Mode::CommandPrompt { input, cursor } = &mut app.mode {
+                        input.insert(*cursor, c);
+                        *cursor += 1;
+                    }
                 }
                 _ => {}
             }
             Ok(false)
         }
-        Mode::WindowChooser { selected } => {
+        Mode::WindowChooser { selected, ref tree } => {
+            let tree_len = tree.len();
             match key.code {
-                KeyCode::Esc => { app.mode = Mode::Passthrough; }
-                KeyCode::Up | KeyCode::Left => { if selected > 0 { if let Mode::WindowChooser { selected: s } = &mut app.mode { *s -= 1; } } }
-                KeyCode::Down | KeyCode::Right => { if selected + 1 < app.windows.len() { if let Mode::WindowChooser { selected: s } = &mut app.mode { *s += 1; } } }
-                KeyCode::Enter => { if let Mode::WindowChooser { selected: s } = &mut app.mode { app.active_idx = *s; app.mode = Mode::Passthrough; } }
+                KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Passthrough; }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0 { if let Mode::WindowChooser { selected: s, .. } = &mut app.mode { *s -= 1; } }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if selected + 1 < tree_len { if let Mode::WindowChooser { selected: s, .. } = &mut app.mode { *s += 1; } }
+                }
+                KeyCode::Enter => {
+                    if let Mode::WindowChooser { selected: s, ref tree } = &app.mode {
+                        let entry = &tree[*s];
+                        if entry.is_current_session {
+                            // Same session: switch window directly
+                            if let Some(wi) = entry.window_index {
+                                app.last_window_idx = app.active_idx;
+                                app.active_idx = wi;
+                            }
+                        } else {
+                            // Different session: set env and trigger switch
+                            std::env::set_var("PSMUX_SWITCH_TO", &entry.session_name);
+                        }
+                    }
+                    app.mode = Mode::Passthrough;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    // Quick-select by window number
+                    let n = c.to_digit(10).unwrap_or(0) as usize;
+                    if let Some(idx) = tree.iter().position(|e| !e.is_session_header && e.window_index == Some(n) && e.is_current_session) {
+                        if let Mode::WindowChooser { selected: s, .. } = &mut app.mode { *s = idx; }
+                    }
+                }
                 _ => {}
             }
             Ok(false)
@@ -156,7 +453,44 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             }
             Ok(false)
         }
+        Mode::RenameSessionPrompt { .. } => {
+            match key.code {
+                KeyCode::Esc => { app.mode = Mode::Passthrough; }
+                KeyCode::Enter => {
+                    if let Mode::RenameSessionPrompt { input } = &mut app.mode {
+                        app.session_name = input.clone();
+                        app.mode = Mode::Passthrough;
+                    }
+                }
+                KeyCode::Backspace => { if let Mode::RenameSessionPrompt { input } = &mut app.mode { let _ = input.pop(); } }
+                KeyCode::Char(c) => { if let Mode::RenameSessionPrompt { input } = &mut app.mode { input.push(c); } }
+                _ => {}
+            }
+            Ok(false)
+        }
         Mode::CopyMode => {
+            // Check copy-mode key table for user bindings first (used by plugins like tmux-yank)
+            let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
+            let key_tuple = (key.code, key.modifiers);
+            if let Some(bind) = app.key_tables.get(table_name)
+                .and_then(|t| t.iter().find(|b| b.key == key_tuple))
+                .cloned()
+            {
+                return execute_action(app, &bind.action);
+            }
+            // Handle find-char pending state (waiting for char after f/F/t/T)
+            if let Some(pending) = app.copy_find_char_pending.take() {
+                if let KeyCode::Char(ch) = key.code {
+                    match pending {
+                        0 => crate::copy_mode::find_char_forward(app, ch),
+                        1 => crate::copy_mode::find_char_backward(app, ch),
+                        2 => crate::copy_mode::find_char_to_forward(app, ch),
+                        3 => crate::copy_mode::find_char_to_backward(app, ch),
+                        _ => {}
+                    }
+                }
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
                     app.mode = Mode::Passthrough; 
@@ -172,14 +506,200 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Left | KeyCode::Char('h') => { move_copy_cursor(app, -1, 0); }
                 KeyCode::Right | KeyCode::Char('l') => { move_copy_cursor(app, 1, 0); }
-                KeyCode::Up | KeyCode::Char('k') => { scroll_copy_up(app, 1); }
-                KeyCode::Down | KeyCode::Char('j') => { scroll_copy_down(app, 1); }
-                KeyCode::PageUp | KeyCode::Char('b') => { scroll_copy_up(app, 10); }
-                KeyCode::PageDown | KeyCode::Char('f') => { scroll_copy_down(app, 10); }
+                KeyCode::Up | KeyCode::Char('k') => { move_copy_cursor(app, 0, -1); }
+                KeyCode::Down | KeyCode::Char('j') => { move_copy_cursor(app, 0, 1); }
+                // Page scroll: C-b / PageUp = page up, C-f / PageDown = page down
+                KeyCode::PageUp => { scroll_copy_up(app, 10); }
+                KeyCode::PageDown => { scroll_copy_down(app, 10); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys == "emacs" { move_copy_cursor(app, -1, 0); }
+                    else { scroll_copy_up(app, 10); }
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
+                    else { scroll_copy_down(app, 10); }
+                }
+                // Half-page scroll: C-u / C-d
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                    scroll_copy_up(app, half);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                    scroll_copy_down(app, half);
+                }
                 KeyCode::Char('g') => { scroll_to_top(app); }
                 KeyCode::Char('G') => { scroll_to_bottom(app); }
-                KeyCode::Char('v') => { if let Some((r,c)) = current_prompt_pos(app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
-                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+                // Word motions: w = next word, b = prev word, e = end of word
+                KeyCode::Char('w') => { crate::copy_mode::move_word_forward(app); }
+                KeyCode::Char('b') => { crate::copy_mode::move_word_backward(app); }
+                KeyCode::Char('e') => { crate::copy_mode::move_word_end(app); }
+                // WORD motions: W = next WORD, B = prev WORD, E = end WORD
+                KeyCode::Char('W') => { crate::copy_mode::move_word_forward_big(app); }
+                KeyCode::Char('B') => { crate::copy_mode::move_word_backward_big(app); }
+                KeyCode::Char('E') => { crate::copy_mode::move_word_end_big(app); }
+                // Screen position: H = top, M = middle, L = bottom
+                KeyCode::Char('H') => { crate::copy_mode::move_to_screen_top(app); }
+                KeyCode::Char('M') => { crate::copy_mode::move_to_screen_middle(app); }
+                KeyCode::Char('L') => { crate::copy_mode::move_to_screen_bottom(app); }
+                // Find char: f/F/t/T — sets pending state for next char
+                KeyCode::Char('f') => { app.copy_find_char_pending = Some(0); }
+                KeyCode::Char('F') => { app.copy_find_char_pending = Some(1); }
+                KeyCode::Char('t') => { app.copy_find_char_pending = Some(2); }
+                KeyCode::Char('T') => { app.copy_find_char_pending = Some(3); }
+                // D = copy from cursor to end of line
+                KeyCode::Char('D') => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                // Line motions: 0 = start, $ = end, ^ = first non-blank
+                KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
+                KeyCode::Char('^') => { crate::copy_mode::move_to_first_nonblank(app); }
+                KeyCode::Home => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::End => { crate::copy_mode::move_to_line_end(app); }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // vi: toggle rectangle selection, emacs: page down
+                    if app.mode_keys == "emacs" {
+                        scroll_copy_down(app, 10);
+                    } else {
+                        app.copy_selection_mode = crate::types::SelectionMode::Rect;
+                    }
+                }
+                KeyCode::Char('v') => {
+                    // Start char-wise selection (vi visual mode)
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Char;
+                    }
+                }
+                KeyCode::Char('V') => {
+                    // Start line-wise selection (vi visual-line mode)
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Line;
+                    }
+                }
+                KeyCode::Char('o') => {
+                    // Swap cursor and anchor
+                    if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                        app.copy_anchor = Some(p);
+                        app.copy_pos = Some(a);
+                    }
+                }
+                KeyCode::Char('A') => {
+                    // Append to buffer (yank + append to buffer 0)
+                    if let (Some(_), Some(_)) = (app.copy_anchor, app.copy_pos) {
+                        // Save current buffer 0
+                        let prev = app.paste_buffers.first().cloned().unwrap_or_default();
+                        yank_selection(app)?;
+                        // buffer 0 is now the new yank; prepend old text
+                        if let Some(buf) = app.paste_buffers.first_mut() {
+                            let new_text = buf.clone();
+                            *buf = format!("{}{}", prev, new_text);
+                        }
+                        app.mode = Mode::Passthrough;
+                        app.copy_scroll_offset = 0;
+                        app.copy_pos = None;
+                    }
+                }
+                // Space = begin selection (vi mode), Enter = copy-selection-and-cancel
+                KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Char;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Copy selection and exit copy mode (vi Enter)
+                    if app.copy_anchor.is_some() {
+                        yank_selection(app)?;
+                    }
+                    app.mode = Mode::Passthrough;
+                    app.copy_scroll_offset = 0;
+                    app.copy_pos = None;
+                }
+                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                // --- copy-mode search ---
+                KeyCode::Char('/') => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                }
+                KeyCode::Char('?') => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                }
+                KeyCode::Char('n') => { search_next(app); }
+                KeyCode::Char('N') => { search_prev(app); }
+                // Emacs copy-mode keys
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 1); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
+                // C-v handled above (mode-keys aware)
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Passthrough;
+                    app.copy_anchor = None;
+                    app.copy_pos = None;
+                    app.copy_scroll_offset = 0;
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut parser) = p.term.lock() {
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                }
+                KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Set mark (anchor)
+                    if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r, c));
+                        app.copy_pos = Some((r, c));
+                    }
+                }
+                _ => {}
+            }
+            Ok(false)
+        }
+        Mode::CopySearch { .. } => {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel search, return to copy mode
+                    app.mode = Mode::CopyMode;
+                }
+                KeyCode::Enter => {
+                    // Execute search
+                    if let Mode::CopySearch { ref input, forward } = app.mode {
+                        let query = input.clone();
+                        let fwd = forward;
+                        app.copy_search_query = query.clone();
+                        app.copy_search_forward = fwd;
+                        search_copy_mode(app, &query, fwd);
+                        // Jump to first match
+                        if !app.copy_search_matches.is_empty() {
+                            let (r, c, _) = app.copy_search_matches[0];
+                            app.copy_pos = Some((r, c));
+                        }
+                    }
+                    app.mode = Mode::CopyMode;
+                }
+                KeyCode::Backspace => {
+                    if let Mode::CopySearch { ref mut input, .. } = app.mode { let _ = input.pop(); }
+                }
+                KeyCode::Char(c) => {
+                    if let Mode::CopySearch { ref mut input, .. } = app.mode { input.push(c); }
+                }
                 _ => {}
             }
             Ok(false)
@@ -249,38 +769,83 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             }
             Ok(false)
         }
-        Mode::PopupMode { ref mut output, ref mut process, close_on_exit, .. } => {
+        Mode::PopupMode { ref mut output, ref mut process, close_on_exit, ref mut popup_pty, .. } => {
             let mut should_close = false;
             let mut exit_status: Option<std::process::ExitStatus> = None;
             
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    if let Some(ref mut proc) = process {
-                        let _ = proc.kill();
+            // If we have a PTY popup, forward keys to it
+            if let Some(ref mut pty) = popup_pty {
+                match key.code {
+                    KeyCode::Esc => {
+                        // Check if the child has exited
+                        if let Ok(Some(_)) = pty.child.try_wait() {
+                            should_close = true;
+                        } else {
+                            // Forward Escape to the PTY
+                            let _ = pty.master.write_all(b"\x1b");
+                        }
                     }
-                    should_close = true;
+                    KeyCode::Char(c) => {
+                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                            let ctrl = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+                            let _ = pty.master.write_all(&[ctrl]);
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let s = c.encode_utf8(&mut buf);
+                            let _ = pty.master.write_all(s.as_bytes());
+                        }
+                    }
+                    KeyCode::Enter => { let _ = pty.master.write_all(b"\r"); }
+                    KeyCode::Backspace => { let _ = pty.master.write_all(b"\x7f"); }
+                    KeyCode::Tab => { let _ = pty.master.write_all(b"\t"); }
+                    KeyCode::Up => { let _ = pty.master.write_all(b"\x1b[A"); }
+                    KeyCode::Down => { let _ = pty.master.write_all(b"\x1b[B"); }
+                    KeyCode::Right => { let _ = pty.master.write_all(b"\x1b[C"); }
+                    KeyCode::Left => { let _ = pty.master.write_all(b"\x1b[D"); }
+                    KeyCode::Home => { let _ = pty.master.write_all(b"\x1b[H"); }
+                    KeyCode::End => { let _ = pty.master.write_all(b"\x1b[F"); }
+                    KeyCode::PageUp => { let _ = pty.master.write_all(b"\x1b[5~"); }
+                    KeyCode::PageDown => { let _ = pty.master.write_all(b"\x1b[6~"); }
+                    KeyCode::Delete => { let _ = pty.master.write_all(b"\x1b[3~"); }
+                    _ => {}
                 }
-                KeyCode::Char(c) => {
-                    output.push(c);
-                }
-                KeyCode::Enter => {
-                    output.push('\n');
-                }
-                _ => {}
-            }
-            
-            if let Some(ref mut proc) = process {
-                if let Ok(Some(status)) = proc.try_wait() {
-                    exit_status = Some(status);
+                // Check if child exited
+                if let Ok(Some(_status)) = pty.child.try_wait() {
                     if close_on_exit {
                         should_close = true;
                     }
                 }
-            }
-            
-            if let Some(status) = exit_status {
-                if !close_on_exit {
-                    output.push_str(&format!("\n[Process exited with status: {}]", status));
+            } else {
+                // Non-PTY popup (static output)
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        if let Some(ref mut proc) = process {
+                            let _ = proc.kill();
+                        }
+                        should_close = true;
+                    }
+                    KeyCode::Char(c) => {
+                        output.push(c);
+                    }
+                    KeyCode::Enter => {
+                        output.push('\n');
+                    }
+                    _ => {}
+                }
+                
+                if let Some(ref mut proc) = process {
+                    if let Ok(Some(status)) = proc.try_wait() {
+                        exit_status = Some(status);
+                        if close_on_exit {
+                            should_close = true;
+                        }
+                    }
+                }
+                
+                if let Some(status) = exit_status {
+                    if !close_on_exit {
+                        output.push_str(&format!("\n[Process exited with status: {}]", status));
+                    }
                 }
             }
             
@@ -305,6 +870,52 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Backspace => {
                     input.pop();
+                }
+                _ => {}
+            }
+            Ok(false)
+        }
+        Mode::ClockMode => {
+            // Any key exits clock mode
+            app.mode = Mode::Passthrough;
+            Ok(false)
+        }
+        Mode::BufferChooser { selected } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Passthrough; }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0 {
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode { *s -= 1; }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = app.paste_buffers.len().saturating_sub(1);
+                    if selected < max {
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode { *s += 1; }
+                    }
+                }
+                KeyCode::Enter => {
+                    // Paste selected buffer
+                    if selected < app.paste_buffers.len() {
+                        let text = app.paste_buffers[selected].clone();
+                        app.mode = Mode::Passthrough;
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                            let _ = write!(p.master, "{}", text);
+                        }
+                    } else {
+                        app.mode = Mode::Passthrough;
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    // Delete selected buffer
+                    if selected < app.paste_buffers.len() {
+                        app.paste_buffers.remove(selected);
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode {
+                            if *s >= app.paste_buffers.len() && *s > 0 { *s -= 1; }
+                        }
+                        if app.paste_buffers.is_empty() { app.mode = Mode::Passthrough; }
+                    }
                 }
                 _ => {}
             }
@@ -336,35 +947,54 @@ pub fn move_focus(app: &mut AppState, dir: FocusDir) {
 }
 
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
-    let win = &mut app.windows[app.active_idx];
-    let Some(active) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
-    match key.code {
+    // Encode the key into bytes
+    let encoded: Vec<u8> = match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-            let _ = active.master.write_all(&[0x1b, ctrl_char]);
+            vec![0x1b, ctrl_char]
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
-            let _ = write!(active.master, "\x1b{}", c);
+            format!("\x1b{}", c).into_bytes()
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-            let _ = active.master.write_all(&[ctrl_char]);
+            vec![ctrl_char]
         }
         KeyCode::Char(c) if (c as u8) >= 0x01 && (c as u8) <= 0x1A => {
-            let _ = active.master.write_all(&[c as u8]);
+            vec![c as u8]
         }
         KeyCode::Char(c) => {
-            let _ = write!(active.master, "{}", c);
+            format!("{}", c).into_bytes()
         }
-        KeyCode::Enter => { let _ = write!(active.master, "\r"); }
-        KeyCode::Tab => { let _ = write!(active.master, "\t"); }
-        KeyCode::Backspace => { let _ = write!(active.master, "\x08"); }
-        KeyCode::Esc => { let _ = write!(active.master, "\x1b"); }
-        KeyCode::Left => { let _ = write!(active.master, "\x1b[D"); }
-        KeyCode::Right => { let _ = write!(active.master, "\x1b[C"); }
-        KeyCode::Up => { let _ = write!(active.master, "\x1b[A"); }
-        KeyCode::Down => { let _ = write!(active.master, "\x1b[B"); }
-        _ => {}
+        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::Backspace => b"\x08".to_vec(),
+        KeyCode::Esc => b"\x1b".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        _ => return Ok(()),
+    };
+
+    if app.sync_input {
+        // Fan out to ALL panes in the current window
+        let win = &mut app.windows[app.active_idx];
+        fn write_all_panes(node: &mut Node, data: &[u8]) {
+            match node {
+                Node::Leaf(p) if !p.dead => { let _ = p.master.write_all(data); }
+                Node::Leaf(_) => {}
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
+            }
+        }
+        write_all_panes(&mut win.root, &encoded);
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            if !active.dead {
+                let _ = active.master.write_all(&encoded);
+            }
+        }
     }
     Ok(())
 }
@@ -388,53 +1018,152 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 }
 
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
-    app.last_window_area = window_area;
-    ensure_rects_cache(app);
-    ensure_borders_cache(app);
-    let rects = &app.scratch_rects;
-    let borders = &app.scratch_borders;
+    use crossterm::event::{MouseEventKind, MouseButton};
+
+    // --- Tab click: check if click is on the status bar row ---
+    let status_row = window_area.y + window_area.height; // status bar is 1 row below window area
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) && me.row == status_row {
+        for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
+            if me.column >= x_start && me.column < x_end {
+                if win_idx < app.windows.len() {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = win_idx;
+                }
+                return Ok(());
+            }
+        }
+        // Click was on status bar but not on a tab — ignore
+        return Ok(());
+    }
+
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, window_area, &mut rects);
+    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16, u16)> = Vec::new();
+    compute_split_borders(&win.root, window_area, &mut borders);
     let mut active_area = rects
         .iter()
         .find(|(path, _)| *path == win.active_path)
         .map(|(_, area)| *area);
 
-    use crossterm::event::{MouseEventKind, MouseButton};
+    /// Convert absolute screen coordinates to pane-local 1-based cell coordinates,
+    /// accounting for the 1px border on each side (Block with Borders::ALL).
+    fn pane_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
+        let col = abs_x.saturating_sub(area.x + 1) + 1;
+        let row = abs_y.saturating_sub(area.y + 1) + 1;
+        (col, row)
+    }
+
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            for (path, area) in rects.iter() {
-                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
-                    win.active_path = path.clone();
-                }
-            }
+            // Check if click is on a split border (for dragging)
+            let mut on_border = false;
             let tol = 1u16;
-            for (path, kind, idx, pos) in borders.iter() {
+            for (path, kind, idx, pos, total_px) in borders.iter() {
                 match kind {
                     LayoutKind::Horizontal => {
                         if me.column >= pos.saturating_sub(tol) && me.column <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: *pos, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
+                            on_border = true;
                             break;
                         }
                     }
                     LayoutKind::Vertical => {
                         if me.row >= pos.saturating_sub(tol) && me.row <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: *pos, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
+                            on_border = true;
                             break;
                         }
                     }
                 }
             }
+
+            // Switch pane focus if clicking inside a pane
+            for (path, area) in rects.iter() {
+                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
+                    win.active_path = path.clone();
+                    active_area = Some(*area);
+                }
+            }
+
+            // Forward left-click to child pane via Windows Console API
+            if !on_border {
+                if let Some(area) = active_area {
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let col = me.column.saturating_sub(area.x + 1) as i16;
+                        let row = me.row.saturating_sub(area.y + 1) as i16;
+                        if active.child_pid.is_none() {
+                            active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
+                        }
+                        if let Some(pid) = active.child_pid {
+                            crate::platform::mouse_inject::send_mouse_event(
+                                pid, col, row,
+                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Right-click not forwarded - reserved for psmux context menu
+        }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            // Middle-click not forwarded - reserved for paste
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let was_dragging = app.drag.is_some();
+            app.drag = None;
+            if was_dragging {
+                resize_all_panes(app);
+            } else if let Some(area) = active_area {
+                // Forward mouse release via Windows Console API
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let col = me.column.saturating_sub(area.x + 1) as i16;
+                    let row = me.row.saturating_sub(area.y + 1) as i16;
+                    if let Some(pid) = active.child_pid {
+                        crate::platform::mouse_inject::send_mouse_event(pid, col, row, 0, 0, true);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Right) => {
+            // Not forwarded
+        }
+        MouseEventKind::Up(MouseButton::Middle) => {
+            // Not forwarded
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
+            } else {
+                // Forward drag via Windows Console API
+                if let Some(area) = active_area {
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let col = me.column.saturating_sub(area.x + 1) as i16;
+                        let row = me.row.saturating_sub(area.y + 1) as i16;
+                        if let Some(pid) = active.child_pid {
+                            crate::platform::mouse_inject::send_mouse_event(
+                                pid, col, row,
+                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
+                                crate::platform::mouse_inject::MOUSE_MOVED,
+                                true,
+                            );
+                        }
+                    }
+                }
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => { app.drag = None; }
+        MouseEventKind::Moved => {
+            // Don't forward bare motion - only forward drag events
+            // Most TUI apps don't want constant mouse position updates
+        }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, Mode::CopyMode) {
                 scroll_copy_up(app, 3);
@@ -469,12 +1198,180 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 }
 
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
-    let win = &mut app.windows[app.active_idx];
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+    // In clock mode, any input exits back to passthrough
+    if matches!(app.mode, Mode::ClockMode) {
+        app.mode = Mode::Passthrough;
+        return Ok(());
+    }
+    // In copy mode, interpret characters as copy-mode actions (never send to PTY)
+    if matches!(app.mode, Mode::CopyMode) {
+        for c in text.chars() {
+            handle_copy_mode_char(app, c)?;
+        }
+        return Ok(());
+    }
+    // In copy-search mode, append characters to the search input
+    if matches!(app.mode, Mode::CopySearch { .. }) {
+        if let Mode::CopySearch { ref mut input, .. } = app.mode {
+            for c in text.chars() {
+                input.push(c);
+            }
+        }
+        return Ok(());
+    }
+
+    if app.sync_input {
+        // Fan out to ALL panes in the current window
+        let win = &mut app.windows[app.active_idx];
+        fn write_all_panes(node: &mut Node, text: &[u8]) {
+            match node {
+                Node::Leaf(p) => { let _ = p.master.write_all(text); let _ = p.master.flush(); }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, text); } }
+            }
+        }
+        write_all_panes(&mut win.root, text.as_bytes());
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = p.master.write_all(text.as_bytes());
+            let _ = p.master.flush();
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a single character as a copy-mode action.
+fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
+    // Handle find-char pending state (waiting for char after f/F/t/T)
+    if let Some(pending) = app.copy_find_char_pending.take() {
+        match pending {
+            0 => crate::copy_mode::find_char_forward(app, c),
+            1 => crate::copy_mode::find_char_backward(app, c),
+            2 => crate::copy_mode::find_char_to_forward(app, c),
+            3 => crate::copy_mode::find_char_to_backward(app, c),
+            _ => {}
+        }
+        return Ok(());
+    }
+    match c {
+        'q' | ']' | '\x1b' => {
+            app.mode = Mode::Passthrough;
+            app.copy_anchor = None;
+            app.copy_pos = None;
+            app.copy_scroll_offset = 0;
+            let win = &mut app.windows[app.active_idx];
+            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                if let Ok(mut parser) = p.term.lock() {
+                    parser.screen_mut().set_scrollback(0);
+                }
+            }
+        }
+        'h' => { move_copy_cursor(app, -1, 0); }
+        'l' => { move_copy_cursor(app, 1, 0); }
+        'k' => { move_copy_cursor(app, 0, -1); }
+        'j' => { move_copy_cursor(app, 0, 1); }
+        'g' => { scroll_to_top(app); }
+        'G' => { scroll_to_bottom(app); }
+        'w' => { crate::copy_mode::move_word_forward(app); }
+        'b' => { crate::copy_mode::move_word_backward(app); }
+        'e' => { crate::copy_mode::move_word_end(app); }
+        'W' => { crate::copy_mode::move_word_forward_big(app); }
+        'B' => { crate::copy_mode::move_word_backward_big(app); }
+        'E' => { crate::copy_mode::move_word_end_big(app); }
+        'H' => { crate::copy_mode::move_to_screen_top(app); }
+        'M' => { crate::copy_mode::move_to_screen_middle(app); }
+        'L' => { crate::copy_mode::move_to_screen_bottom(app); }
+        'f' => { app.copy_find_char_pending = Some(0); }
+        'F' => { app.copy_find_char_pending = Some(1); }
+        't' => { app.copy_find_char_pending = Some(2); }
+        'T' => { app.copy_find_char_pending = Some(3); }
+        'D' => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+        '0' => { crate::copy_mode::move_to_line_start(app); }
+        '$' => { crate::copy_mode::move_to_line_end(app); }
+        '^' => { crate::copy_mode::move_to_first_nonblank(app); }
+        ' ' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
+            }
+        }
+        'v' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
+            }
+        }
+        'V' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Line;
+            }
+        }
+        'o' => {
+            if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                app.copy_anchor = Some(p);
+                app.copy_pos = Some(a);
+            }
+        }
+        'A' => {
+            if let (Some(_), Some(_)) = (app.copy_anchor, app.copy_pos) {
+                let prev = app.paste_buffers.first().cloned().unwrap_or_default();
+                yank_selection(app)?;
+                if let Some(buf) = app.paste_buffers.first_mut() {
+                    let new_text = buf.clone();
+                    *buf = format!("{}{}", prev, new_text);
+                }
+                app.mode = Mode::Passthrough;
+                app.copy_scroll_offset = 0;
+                app.copy_pos = None;
+            }
+        }
+        'y' => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+        '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
+        '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+        'n' => { search_next(app); }
+        'N' => { search_prev(app); }
+        _ => {} // Swallow unrecognized characters in copy mode
+    }
     Ok(())
 }
 
 pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
+    // In clock mode, any key exits back to passthrough
+    if matches!(app.mode, Mode::ClockMode) {
+        app.mode = Mode::Passthrough;
+        return Ok(());
+    }
+    // --- Copy-search mode: handle esc/enter/backspace ---
+    if matches!(app.mode, Mode::CopySearch { .. }) {
+        match k {
+            "esc" => { app.mode = Mode::CopyMode; }
+            "enter" => {
+                if let Mode::CopySearch { ref input, forward } = app.mode {
+                    let query = input.clone();
+                    let fwd = forward;
+                    app.copy_search_query = query.clone();
+                    app.copy_search_forward = fwd;
+                    search_copy_mode(app, &query, fwd);
+                    if !app.copy_search_matches.is_empty() {
+                        let (r, c, _) = app.copy_search_matches[0];
+                        app.copy_pos = Some((r, c));
+                    }
+                }
+                app.mode = Mode::CopyMode;
+            }
+            "backspace" => {
+                if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // --- Copy mode: full vi-style key table ---
     if matches!(app.mode, Mode::CopyMode) {
         match k {
             "esc" | "q" => {
@@ -489,12 +1386,81 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     }
                 }
             }
-            "up" => { scroll_copy_up(app, 1); }
-            "down" => { scroll_copy_down(app, 1); }
+            "enter" => {
+                // Copy selection and exit copy mode (vi Enter)
+                if app.copy_anchor.is_some() {
+                    yank_selection(app)?;
+                }
+                app.mode = Mode::Passthrough;
+                app.copy_scroll_offset = 0;
+                app.copy_pos = None;
+            }
+            "space" => {
+                // Begin selection (like v in vi mode)
+                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                    app.copy_anchor = Some((r, c));
+                    app.copy_pos = Some((r, c));
+                    app.copy_selection_mode = crate::types::SelectionMode::Char;
+                }
+            }
+            "up" => { move_copy_cursor(app, 0, -1); }
+            "down" => { move_copy_cursor(app, 0, 1); }
             "pageup" => { scroll_copy_up(app, 10); }
             "pagedown" => { scroll_copy_down(app, 10); }
             "left" => { move_copy_cursor(app, -1, 0); }
             "right" => { move_copy_cursor(app, 1, 0); }
+            "home" => { crate::copy_mode::move_to_line_start(app); }
+            "end" => { crate::copy_mode::move_to_line_end(app); }
+            "C-b" | "c-b" => {
+                if app.mode_keys == "emacs" { move_copy_cursor(app, -1, 0); }
+                else { scroll_copy_up(app, 10); }
+            }
+            "C-f" | "c-f" => {
+                if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
+                else { scroll_copy_down(app, 10); }
+            }
+            "C-n" | "c-n" => { move_copy_cursor(app, 0, 1); }
+            "C-p" | "c-p" => { move_copy_cursor(app, 0, -1); }
+            "C-a" | "c-a" => { crate::copy_mode::move_to_line_start(app); }
+            "C-e" | "c-e" => { crate::copy_mode::move_to_line_end(app); }
+            "C-v" | "c-v" => { scroll_copy_down(app, 10); }
+            "M-v" | "m-v" => { scroll_copy_up(app, 10); }
+            "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
+            "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
+            "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+            "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
+            "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+            "C-g" | "c-g" => {
+                app.mode = Mode::Passthrough;
+                app.copy_anchor = None;
+                app.copy_pos = None;
+                app.copy_scroll_offset = 0;
+                let win = &mut app.windows[app.active_idx];
+                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                    if let Ok(mut parser) = p.term.lock() {
+                        parser.screen_mut().set_scrollback(0);
+                    }
+                }
+            }
+            "c-space" | "C-space" => {
+                // Set mark (anchor) at current position
+                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                    app.copy_anchor = Some((r, c));
+                    app.copy_pos = Some((r, c));
+                }
+            }
+            "C-u" | "c-u" => {
+                let half = app.windows.get(app.active_idx)
+                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                    .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                scroll_copy_up(app, half);
+            }
+            "C-d" | "c-d" => {
+                let half = app.windows.get(app.active_idx)
+                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                    .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                scroll_copy_down(app, half);
+            }
             _ => {}
         }
         return Ok(());
@@ -516,7 +1482,28 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
             "home" => { let _ = write!(p.master, "\x1b[H"); }
             "end" => { let _ = write!(p.master, "\x1b[F"); }
+            "insert" => { let _ = write!(p.master, "\x1b[2~"); }
             "space" => { let _ = write!(p.master, " "); }
+            s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
+                if let Ok(n) = s[1..].parse::<u8>() {
+                    let seq = match n {
+                        1 => "\x1bOP",
+                        2 => "\x1bOQ",
+                        3 => "\x1bOR",
+                        4 => "\x1bOS",
+                        5 => "\x1b[15~",
+                        6 => "\x1b[17~",
+                        7 => "\x1b[18~",
+                        8 => "\x1b[19~",
+                        9 => "\x1b[20~",
+                        10 => "\x1b[21~",
+                        11 => "\x1b[23~",
+                        12 => "\x1b[24~",
+                        _ => "",
+                    };
+                    if !seq.is_empty() { let _ = write!(p.master, "{}", seq); }
+                }
+            }
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
