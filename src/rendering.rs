@@ -9,6 +9,7 @@ use crossterm::execute;
 use portable_pty::PtySize;
 
 use crate::types::*;
+use crate::tree::active_pane_mut;
 
 pub fn vt_to_color(c: vt100::Color) -> Color {
     match c {
@@ -81,13 +82,12 @@ pub fn render_node(
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
                 let _ = pane.master.resize(PtySize { rows: target_rows, cols: target_cols, pixel_width: 0, pixel_height: 0 });
-                if let Ok(mut parser) = pane.term.lock() {
-                    parser.screen_mut().set_size(target_rows, target_cols);
-                }
+                let mut parser = pane.term.lock().unwrap();
+                parser.screen_mut().set_size(target_rows, target_cols);
                 pane.last_rows = target_rows;
                 pane.last_cols = target_cols;
             }
-            let Ok(parser) = pane.term.lock() else { return };
+            let parser = pane.term.lock().unwrap();
             let screen = parser.screen();
             let (cur_r, cur_c) = screen.cursor_position();
             let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);
@@ -226,9 +226,9 @@ pub fn map_color(name: &str) -> Color {
     }
     // rgb:R,G,B (psmux custom)
     if let Some(rgb_str) = name.strip_prefix("rgb:") {
-        let mut it = rgb_str.split(',');
-        if let (Some(r), Some(g), Some(b), None) = (it.next(), it.next(), it.next(), it.next()) {
-            if let (Ok(r), Ok(g), Ok(b)) = (r.parse::<u8>(), g.parse::<u8>(), b.parse::<u8>()) {
+        let parts: Vec<&str> = rgb_str.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
                 return Color::Rgb(r, g, b);
             }
         }

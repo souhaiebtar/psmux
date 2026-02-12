@@ -1,6 +1,4 @@
-use std::io;
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::io::{self, Write};
 use ratatui::prelude::*;
 
 use crate::types::*;
@@ -206,56 +204,11 @@ pub fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>)
     rec(node, area, &mut path, out);
 }
 
-pub fn invalidate_layout_cache(app: &mut AppState) {
-    app.rects_cache_dirty = true;
-    app.borders_cache_dirty = true;
-}
-
-pub fn ensure_rects_cache(app: &mut AppState) {
-    if app.windows.is_empty() {
-        app.scratch_rects.clear();
-        return;
-    }
-    let win = &app.windows[app.active_idx];
-    let area = app.last_window_area;
-    let needs_rebuild = app.rects_cache_dirty
-        || app.rects_cache_window_id != Some(win.id)
-        || app.rects_cache_area != area;
-    if needs_rebuild {
-        app.scratch_rects.clear();
-        compute_rects(&win.root, area, &mut app.scratch_rects);
-        app.rects_cache_area = area;
-        app.rects_cache_window_id = Some(win.id);
-        app.rects_cache_dirty = false;
-    }
-}
-
-pub fn ensure_borders_cache(app: &mut AppState) {
-    if app.windows.is_empty() {
-        app.scratch_borders.clear();
-        return;
-    }
-    let win = &app.windows[app.active_idx];
-    let area = app.last_window_area;
-    let needs_rebuild = app.borders_cache_dirty
-        || app.borders_cache_window_id != Some(win.id)
-        || app.borders_cache_area != area;
-    if needs_rebuild {
-        app.scratch_borders.clear();
-        compute_split_borders(&win.root, area, &mut app.scratch_borders);
-        app.borders_cache_area = area;
-        app.borders_cache_window_id = Some(win.id);
-        app.borders_cache_dirty = false;
-    }
-}
-
 /// Resize all panes in the current window to match their computed areas
 pub fn resize_all_panes(app: &mut AppState) {
     if app.windows.is_empty() { return; }
     let area = app.last_window_area;
     if area.width == 0 || area.height == 0 { return; }
-
-    invalidate_layout_cache(app);
     
     fn resize_node(node: &mut Node, rects: &[(Vec<usize>, Rect)], path: &mut Vec<usize>) {
         match node {

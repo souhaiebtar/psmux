@@ -1,6 +1,4 @@
-use std::io::{self, Write, BufRead, BufReader, Read};
-use std::borrow::Cow;
-use std::collections::HashMap;
+use std::io::{self, Write, BufRead, BufReader};
 use std::time::{Duration, Instant};
 use std::env;
 
@@ -9,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::layout::{LayoutJson, PaneDeltaJson};
+use crate::layout::LayoutJson;
 use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
@@ -320,7 +318,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
-    fn default_refresh_ms() -> u64 { 40 }
 
     #[derive(serde::Deserialize)]
     struct DumpState {
@@ -1060,9 +1057,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 selection_changed = false;
                 continue;
             }
-        } else {
-            trim_dump_line(&mut state_buf);
-        }
+        };
 
         let root = state.layout;
         let windows = state.windows;
@@ -1071,25 +1066,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         let dim_preds = state.prediction_dimming;
         let clock_active = state.clock_mode;
 
-            cached_root = Some(state.layout);
-            cached_windows = state.windows;
-            last_tree = state.tree;
-            cached_base_index = state.base_index;
-            cached_dim_preds = state.prediction_dimming;
-            target_idle_refresh_ms = state.refresh_ms.clamp(16, 250);
-
-            // Update prefix key from server config (if provided)
-            if let Some(ref prefix_str) = state.prefix {
-                if let Some((kc, km)) = parse_key_string(prefix_str) {
-                    if (kc, km) != prefix_key {
-                        prefix_key = (kc, km);
-                        // Compute raw control character for Ctrl+<letter> prefix
-                        prefix_raw_char = if km.contains(KeyModifiers::CONTROL) {
-                            if let KeyCode::Char(c) = kc {
-                                Some((c as u8 & 0x1f) as char)
-                            } else { None }
-                        } else { None };
-                    }
+        // Update prefix key from server config (if provided)
+        if let Some(ref prefix_str) = state.prefix {
+            if let Some((kc, km)) = parse_key_string(prefix_str) {
+                if (kc, km) != prefix_key {
+                    prefix_key = (kc, km);
+                    // Compute raw control character for Ctrl+<letter> prefix
+                    prefix_raw_char = if km.contains(KeyModifiers::CONTROL) {
+                        if let KeyCode::Char(c) = kc {
+                            Some((c as u8 & 0x1f) as char)
+                        } else { None }
+                    } else { None };
                 }
             }
         }
@@ -1205,20 +1192,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         let inner = area;
                         let mut lines: Vec<Line> = Vec::new();
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
-                        f.render_widget(pane_block, area);
-                        f.render_widget(Clear, inner);
                         if use_full_cells || rows_v2.is_empty() {
-                            let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
                             for r in 0..inner.height.min(content.len() as u16) {
-                                let mut spans: Vec<Span> = Vec::with_capacity(inner.width as usize);
+                                let mut spans: Vec<Span> = Vec::new();
                                 let row = &content[r as usize];
                                 let max_c = inner.width.min(row.len() as u16);
                                 let mut c: u16 = 0;
                                 while c < max_c {
                                     let cell = &row[c as usize];
-                                    let mut fg = map_color_code(cell.fg);
-                                    let mut bg = map_color_code(cell.bg);
-                                    if cell.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
+                                    let mut fg = map_color(&cell.fg);
+                                    let mut bg = map_color(&cell.bg);
+                                    if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
                                     let in_selection = if *copy_mode && *active {
                                         if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
                                             r >= *sr && r <= *er && c >= *sc && c <= *ec
@@ -1248,27 +1232,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 }
                                 lines.push(Line::from(spans));
                             }
-                            let para = Paragraph::new(Text::from(lines));
-                            f.render_widget(para, inner);
                         } else {
-                            let buf = f.buffer_mut();
                             for r in 0..inner.height.min(rows_v2.len() as u16) {
-                                let row_runs = &rows_v2[r as usize].runs;
-                                let y = inner.y + r;
-                                let mut x = inner.x;
+                                let mut spans: Vec<Span> = Vec::new();
                                 let mut c: u16 = 0;
-                                for run in row_runs {
-                                    if c >= inner.width {
-                                        break;
-                                    }
-                                    let mut fg = map_color_code(run.fg);
-                                    let mut bg = map_color_code(run.bg);
-                                    if run.flags & 16 != 0 {
-                                        std::mem::swap(&mut fg, &mut bg);
-                                    }
-                                    if *active
-                                        && dim_preds
-                                        && !*alternate_screen
+                                for run in &rows_v2[r as usize].runs {
+                                    if c >= inner.width { break; }
+                                    let mut fg = map_color(&run.fg);
+                                    let mut bg = map_color(&run.bg);
+                                    if run.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
+                                    if *active && dim_preds && !*alternate_screen
                                         && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
                                     {
                                         fg = dim_color(fg);
@@ -1282,6 +1255,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     spans.push(Span::styled(text, style));
                                     c = c.saturating_add(run.width.max(1));
                                 }
+                                lines.push(Line::from(spans));
                             }
                         }
                         f.render_widget(Clear, inner);
@@ -1459,7 +1433,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         }
                     }
                 }
-                rec(root, chunks[0], &mut rects);
+                rec(&root, chunks[0], &mut rects);
                 choices.clear();
                 for (i, (pid, r)) in rects.iter().enumerate() {
                     if i < 10 {

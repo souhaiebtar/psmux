@@ -2,67 +2,6 @@ use std::io::{self, Write};
 use std::time::Duration;
 use std::env;
 
-/// Validate a session name to prevent path traversal attacks.
-/// Session names must be alphanumeric with optional hyphens, underscores, and dots.
-/// Returns true if the name is valid, false otherwise.
-pub fn is_valid_session_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 {
-        return false;
-    }
-    // Reject path traversal attempts
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return false;
-    }
-    // Allow alphanumeric, hyphen, underscore, dot (but not starting with dot)
-    if name.starts_with('.') {
-        return false;
-    }
-    name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
-
-/// Sanitize a session name by replacing invalid characters.
-/// Returns a safe version of the name or "default" if completely invalid.
-pub fn sanitize_session_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "default".to_string();
-    }
-
-    // Keep valid characters (including dots), but prevent leading dot and "..".
-    let mut sanitized = String::with_capacity(trimmed.len().min(64));
-    let mut prev_dot = false;
-    for c in trimmed.chars().take(64) {
-        if !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            continue;
-        }
-        if sanitized.is_empty() && c == '.' {
-            continue;
-        }
-        if c == '.' && prev_dot {
-            continue;
-        }
-        prev_dot = c == '.';
-        sanitized.push(c);
-    }
-
-    if is_valid_session_name(&sanitized) {
-        sanitized
-    } else {
-        "default".to_string()
-    }
-}
-
-fn validate_session_name(name: &str) -> io::Result<()> {
-    if is_valid_session_name(name) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid session name: {}", name),
-        ))
-    }
-}
-
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
@@ -77,15 +16,8 @@ pub fn cleanup_stale_port_files() {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
-                        let sock_addr = match addr.parse::<std::net::SocketAddr>() {
-                            Ok(a) => a,
-                            Err(_) => {
-                                let _ = std::fs::remove_file(&path);
-                                continue;
-                            }
-                        };
                         if std::net::TcpStream::connect_timeout(
-                            &sock_addr,
+                            &addr.parse().unwrap(),
                             Duration::from_millis(50)
                         ).is_err() {
                             let _ = std::fs::remove_file(&path);
@@ -101,7 +33,6 @@ pub fn cleanup_stale_port_files() {
 
 /// Read the session key from the key file
 pub fn read_session_key(session: &str) -> io::Result<String> {
-    validate_session_name(session)?;
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let keypath = format!("{}\\.psmux\\{}.key", home, session);
     std::fs::read_to_string(&keypath).map(|s| s.trim().to_string())
@@ -110,26 +41,25 @@ pub fn read_session_key(session: &str) -> io::Result<String> {
 /// Send an authenticated command to a server
 pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
     let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut s = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50))?;
-    write!(s, "AUTH {}\n", key)?;
-    std::io::Write::write_all(&mut s, cmd)?;
-    s.flush()?;
+    if let Ok(mut s) = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)) {
+        let _ = write!(s, "AUTH {}\n", key);
+        let _ = std::io::Write::write_all(&mut s, cmd);
+        let _ = s.flush();
+    }
     Ok(())
 }
 
 /// Send an authenticated command and get response
 pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
     let mut s = std::net::TcpStream::connect(addr)?;
-    s.set_read_timeout(Some(Duration::from_millis(500)))?;
-    write!(s, "AUTH {}\n", key)?;
-    std::io::Write::write_all(&mut s, cmd)?;
-    s.flush()?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = write!(s, "AUTH {}\n", key);
+    let _ = std::io::Write::write_all(&mut s, cmd);
+    let _ = s.flush();
     let mut br = std::io::BufReader::new(&mut s);
     let mut auth_line = String::new();
-    // Read auth response line - ignore read errors as connection may have closed
     let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
     let mut buf = String::new();
-    // Read remaining response - ignore read errors for same reason
     let _ = std::io::Read::read_to_string(&mut br, &mut buf);
     Ok(buf)
 }
@@ -137,7 +67,6 @@ pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<S
 pub fn send_control(line: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    validate_session_name(&target)?;
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
@@ -147,7 +76,7 @@ pub fn send_control(line: String) -> io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
-        write!(stream, "TARGET {}\n", ft)?;
+        let _ = write!(stream, "TARGET {}\n", ft);
     }
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
@@ -162,20 +91,19 @@ pub fn send_control(line: String) -> io::Result<()> {
 pub fn send_control_with_response(line: String) -> io::Result<String> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    validate_session_name(&target)?;
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
-    stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
-    write!(stream, "AUTH {}\n", session_key)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+    let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
-        write!(stream, "TARGET {}\n", ft)?;
+        let _ = write!(stream, "TARGET {}\n", ft);
     }
-    write!(stream, "{}", line)?;
-    stream.flush()?;
+    let _ = write!(stream, "{}", line);
+    let _ = stream.flush();
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     loop {
@@ -201,9 +129,9 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
 /// Send a control message to a specific port
 pub fn send_control_to_port(port: u16, msg: &str) -> io::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(&addr)?;
-    stream.write_all(msg.as_bytes())?;
-    stream.flush()?;
+    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+        let _ = stream.write_all(msg.as_bytes());
+    }
     Ok(())
 }
 
@@ -213,9 +141,6 @@ pub fn resolve_last_session_name() -> Option<String> {
     let last = std::fs::read_to_string(format!("{}\\last_session", dir)).ok();
     if let Some(name) = last {
         let name = name.trim().to_string();
-        if !is_valid_session_name(&name) {
-            return None;
-        }
         let p = format!("{}\\{}.port", dir, name);
         if std::path::Path::new(&p).exists() { return Some(name); }
     }
@@ -224,11 +149,7 @@ pub fn resolve_last_session_name() -> Option<String> {
         for e in rd.flatten() {
             if let Some(fname) = e.file_name().to_str() {
                 if let Some((base, ext)) = fname.rsplit_once('.') {
-                    if ext == "port" && is_valid_session_name(base) {
-                        if let Ok(md) = e.metadata() {
-                            picks.push((base.to_string(), md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
-                        }
-                    }
+                    if ext == "port" { if let Ok(md) = e.metadata() { picks.push((base.to_string(), md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))); } }
                 }
             }
         }
@@ -239,9 +160,6 @@ pub fn resolve_last_session_name() -> Option<String> {
 
 pub fn resolve_default_session_name() -> Option<String> {
     if let Ok(name) = env::var("PSMUX_DEFAULT_SESSION") {
-        if !is_valid_session_name(&name) {
-            return None;
-        }
         let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
         let p = format!("{}\\.psmux\\{}.port", home, name);
         if std::path::Path::new(&p).exists() { return Some(name); }
@@ -252,9 +170,6 @@ pub fn resolve_default_session_name() -> Option<String> {
         if let Ok(text) = std::fs::read_to_string(cfg) {
             let line = text.lines().find(|l| !l.trim().is_empty())?;
             let name = if let Some(rest) = line.strip_prefix("default-session ") { rest.trim().to_string() } else { line.trim().to_string() };
-            if !is_valid_session_name(&name) {
-                continue;
-            }
             let p = format!("{}\\.psmux\\{}.port", home, name);
             if std::path::Path::new(&p).exists() { return Some(name); }
         }

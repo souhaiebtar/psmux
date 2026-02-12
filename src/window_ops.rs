@@ -1,7 +1,7 @@
-use std::io::{self, Write};
-use std::sync::atomic::AtomicBool;
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
 use portable_pty::{PtySize, PtySystemSelection};
 use ratatui::prelude::*;
@@ -75,14 +75,12 @@ pub fn toggle_zoom(app: &mut AppState) {
             }
         }
         app.zoom_saved = Some(saved);
-        invalidate_layout_cache(app);
     } else {
         if let Some(saved) = app.zoom_saved.take() {
             for (p, sz) in saved.into_iter() {
                 if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &p) { *sizes = sz; }
             }
         }
-        invalidate_layout_cache(app);
     }
 }
 
@@ -123,6 +121,8 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     }
 
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
     let mut active_area: Option<Rect> = None;
     for (path, area) in rects.iter() {
         if area.contains(ratatui::layout::Position { x, y }) {
@@ -167,11 +167,12 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 }
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
-    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
 
     if matches!(app.mode, Mode::CopyMode) {
-        if let Some((path, area)) = app.scratch_rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
+        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
             let (row, col) = copy_cell_for_area(*area, x, y);
             if app.copy_anchor.is_none() {
@@ -196,11 +197,12 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
 }
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
-    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
 
     if matches!(app.mode, Mode::CopyMode) {
-        if let Some((path, area)) = app.scratch_rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
+        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
             let (row, col) = copy_cell_for_area(*area, x, y);
             if app.copy_anchor.is_none() {
@@ -277,11 +279,12 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         return;
     }
 
-    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
 
     let mut target_area: Option<Rect> = None;
-    for (path, area) in &app.scratch_rects {
+    for (path, area) in &rects {
         if area.contains(ratatui::layout::Position { x, y }) {
             win.active_path = path.clone();
             target_area = Some(*area);
@@ -289,7 +292,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         }
     }
     if target_area.is_none() {
-        target_area = app.scratch_rects
+        target_area = rects
             .iter()
             .find(|(path, _)| *path == win.active_path)
             .map(|(_, area)| *area);
@@ -309,18 +312,19 @@ pub fn remote_scroll_up(app: &mut AppState, x: u16, y: u16) { remote_scroll_whee
 pub fn remote_scroll_down(app: &mut AppState, x: u16, y: u16) { remote_scroll_wheel(app, x, y, false); }
 
 pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
-    ensure_rects_cache(app);
     let win = &mut app.windows[app.active_idx];
-
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    
     let mut active_idx = None;
-    for (i, (path, _)) in app.scratch_rects.iter().enumerate() {
-        if *path == win.active_path { active_idx = Some(i); break; }
+    for (i, (path, _)) in rects.iter().enumerate() { 
+        if *path == win.active_path { active_idx = Some(i); break; } 
     }
     let Some(ai) = active_idx else { return; };
-    let (_, arect) = &app.scratch_rects[ai];
-
+    let (_, arect) = &rects[ai];
+    
     let mut best: Option<(usize, u32)> = None;
-    for (i, (_, r)) in app.scratch_rects.iter().enumerate() {
+    for (i, (_, r)) in rects.iter().enumerate() {
         if i == ai { continue; }
         let candidate = match dir {
             FocusDir::Left => if r.x + r.width <= arect.x { Some((arect.x - (r.x + r.width)) as u32) } else { None },
@@ -333,8 +337,8 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
         }
     }
     
-    if let Some((ni, _)) = best {
-        win.active_path = app.scratch_rects[ni].0.clone();
+    if let Some((ni, _)) = best { 
+        win.active_path = rects[ni].0.clone(); 
     }
 }
 
@@ -356,7 +360,6 @@ pub fn resize_pane_vertical(app: &mut AppState, amount: i16) {
                     } else if idx > 0 {
                         sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
                     }
-                    invalidate_layout_cache(app);
                 }
                 return;
             }
@@ -382,7 +385,6 @@ pub fn resize_pane_horizontal(app: &mut AppState, amount: i16) {
                     } else if idx > 0 {
                         sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
                     }
-                    invalidate_layout_cache(app);
                 }
                 return;
             }

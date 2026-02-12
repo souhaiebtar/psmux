@@ -119,7 +119,6 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         .get()
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, app, None)?;
-                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('n') => {
@@ -136,12 +135,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('%') => {
                     split_active(app, LayoutKind::Horizontal)?;
-                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('"') => {
                     split_active(app, LayoutKind::Vertical)?;
-                    invalidate_layout_cache(app);
                     true
                 }
                 KeyCode::Char('x') => {
@@ -162,7 +159,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char(',') => { app.mode = Mode::RenamePrompt { input: String::new() }; true }
-                KeyCode::Char(' ') => { cycle_top_layout(app); invalidate_layout_cache(app); true }
+                KeyCode::Char(' ') => { cycle_top_layout(app); true }
                 KeyCode::Char('[') => { enter_copy_mode(app); true }
                 KeyCode::Char(']') => { paste_latest(app)?; app.mode = Mode::Passthrough; true }
                 KeyCode::Char(':') => {
@@ -170,9 +167,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('q') => {
-                    ensure_rects_cache(app);
+                    let win = &app.windows[app.active_idx];
+                    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+                    compute_rects(&win.root, app.last_window_area, &mut rects);
                     app.display_map.clear();
-                    for (i, (path, _)) in app.scratch_rects.iter().cloned().enumerate() {
+                    for (i, (path, _)) in rects.into_iter().enumerate() {
                         let n = i + 1;
                         if n <= 10 { app.display_map.push((n, path)); } else { break; }
                     }
@@ -855,7 +854,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             
             Ok(false)
         }
-        Mode::ConfirmMode { prompt: _, ref command, ref mut input } => {
+        Mode::ConfirmMode { ref prompt, ref command, ref mut input } => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     app.mode = Mode::Passthrough;
@@ -925,9 +924,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
 }
 
 pub fn move_focus(app: &mut AppState, dir: FocusDir) {
-    ensure_rects_cache(app);
-    let rects = &app.scratch_rects;
     let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
     let mut active_idx = None;
     for (i, (path, _)) in rects.iter().enumerate() { if *path == win.active_path { active_idx = Some(i); break; } }
     let Some(ai) = active_idx else { return; };

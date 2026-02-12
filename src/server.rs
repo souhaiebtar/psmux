@@ -1,6 +1,5 @@
 use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::env;
@@ -106,112 +105,6 @@ const TMUX_COMMANDS: &[&str] = &[
     "wait-for (wait)",
 ];
 
-const MAX_CONTROL_LINE_LEN: usize = 64 * 1024;
-const MAX_RETAINED_LINE_CAP: usize = 64 * 1024;
-
-fn trim_reusable_line_buffer(line: &mut String) {
-    if line.capacity() > MAX_RETAINED_LINE_CAP {
-        line.shrink_to(MAX_RETAINED_LINE_CAP);
-    }
-}
-
-fn build_dump_state_payload(
-    layout_json: &str,
-    windows_json: &str,
-    prefix_str: &str,
-    tree_json: &str,
-    base_index: usize,
-    prediction_dimming: bool,
-    refresh_ms: u64,
-) -> Arc<str> {
-    let mut out = String::with_capacity(
-        layout_json.len() + windows_json.len() + tree_json.len() + prefix_str.len() + 128,
-    );
-    out.push_str("{\"layout\":");
-    out.push_str(layout_json);
-    out.push_str(",\"windows\":");
-    out.push_str(windows_json);
-    out.push_str(",\"prefix\":\"");
-    out.push_str(prefix_str);
-    out.push_str("\",\"tree\":");
-    out.push_str(tree_json);
-    out.push_str(",\"base_index\":");
-    let _ = write!(&mut out, "{}", base_index);
-    out.push_str(",\"prediction_dimming\":");
-    out.push_str(if prediction_dimming { "true" } else { "false" });
-    out.push_str(",\"refresh_ms\":");
-    let _ = write!(&mut out, "{}", refresh_ms);
-    out.push('}');
-    out.into()
-}
-
-fn build_dump_delta_payload(delta_json: &str) -> Arc<str> {
-    let mut out = String::with_capacity(delta_json.len() + 16);
-    out.push_str("{\"delta\":");
-    out.push_str(delta_json);
-    out.push('}');
-    out.into()
-}
-
-fn write_framed_json<W: Write>(writer: &mut W, json: &str) -> io::Result<()> {
-    write!(writer, "FRAME {}\n", json.len())?;
-    writer.write_all(json.as_bytes())?;
-    writer.flush()
-}
-
-fn collect_live_pane_ids(node: &Node, out: &mut HashSet<usize>) {
-    match node {
-        Node::Leaf(p) => {
-            out.insert(p.id);
-        }
-        Node::Split { children, .. } => {
-            for child in children {
-                collect_live_pane_ids(child, out);
-            }
-        }
-    }
-}
-
-fn remove_pipe_pane_by_id(app: &mut AppState, pane_id: usize) {
-    let mut i = 0;
-    while i < app.pipe_panes.len() {
-        if app.pipe_panes[i].pane_id == pane_id {
-            if let Some(mut proc) = app.pipe_panes[i].process.take() {
-                let _ = proc.kill();
-                let _ = proc.wait();
-            }
-            app.pipe_panes.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn prune_stale_pipe_panes(app: &mut AppState) {
-    let mut live_pane_ids: HashSet<usize> = HashSet::new();
-    for win in &app.windows {
-        collect_live_pane_ids(&win.root, &mut live_pane_ids);
-    }
-
-    let mut i = 0;
-    while i < app.pipe_panes.len() {
-        if live_pane_ids.contains(&app.pipe_panes[i].pane_id) {
-            i += 1;
-            continue;
-        }
-        if let Some(mut proc) = app.pipe_panes[i].process.take() {
-            let _ = proc.kill();
-            let _ = proc.wait();
-        }
-        app.pipe_panes.remove(i);
-    }
-}
-
-fn prune_wait_channels(app: &mut AppState) {
-    app.wait_channels
-        .retain(|_, ch| ch.locked || !ch.waiters.is_empty());
-}
-
 pub fn run_server(session_name: String, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     std::panic::set_hook(Box::new(|info| {
@@ -247,25 +140,27 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     let _ = std::fs::create_dir_all(&dir);
     
     // Generate a random session key for security
-    let session_key: Arc<str> = {
+    let session_key: String = {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
         let s = RandomState::new();
         let mut h = s.build_hasher();
         h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
         h.write_u64(std::process::id() as u64);
-        Arc::from(format!("{:016x}", h.finish()).as_str())
+        format!("{:016x}", h.finish())
     };
-
+    
     // Write port and key to files
     let regpath = format!("{}\\{}.port", dir, app.session_name);
     let _ = std::fs::write(&regpath, port.to_string());
     let keypath = format!("{}\\{}.key", dir, app.session_name);
-    let _ = std::fs::write(&keypath, &*session_key);
-
-    // Write session key to file (permissions handled by user's umask/ACLs)
+    let _ = std::fs::write(&keypath, &session_key);
+    
+    // Try to set file permissions to user-only (Windows)
     #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Recreate key file with restricted permissions
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -273,31 +168,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             .open(&keypath)
             .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
     }
-
+    
     thread::spawn(move || {
-        use std::sync::atomic::AtomicUsize;
-        let active_connections = Arc::new(AtomicUsize::new(0));
-        const MAX_CONNECTIONS: usize = 64;
-
-        struct ConnGuard(Arc<AtomicUsize>);
-        impl Drop for ConnGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
-                if active_connections.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNECTIONS {
-                    drop(stream);
-                    continue;
-                }
                 let tx = tx.clone();
                 let session_key_clone = session_key.clone();
-                active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let active_connections = active_connections.clone();
                 thread::spawn(move || {
-                let _guard = ConnGuard(active_connections);
                 // Clone stream for writing, original goes into BufReader for reading
                 let mut write_stream = match stream.try_clone() {
                     Ok(s) => s,
@@ -323,7 +200,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     return;
                 }
                 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
-                if provided_key != &*session_key_clone {
+                if provided_key != session_key_clone {
                     let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
                     let _ = write_stream.flush();
                     return;
@@ -341,7 +218,6 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 let mut global_target_win: Option<usize> = None;
                 let mut global_target_pane: Option<usize> = None;
                 let mut global_pane_is_id = false;
-                let mut framed_dump_state = false;
                 let mut line = String::new();
                 if r.read_line(&mut line).is_err() {
                     return;
@@ -396,30 +272,18 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     if line.trim().is_empty() {
                         // Try to read another command with timeout
                         line.clear();
-                        trim_reusable_line_buffer(&mut line);
                         match r.read_line(&mut line) {
                             Ok(0) => break, // EOF - client disconnected
                             Err(e) => {
                                 // In persistent mode, timeouts are expected - keep waiting
                                 if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                                     line.clear(); // Clear any partial data from interrupted read
-                                    trim_reusable_line_buffer(&mut line);
                                     continue;
                                 }
                                 break; // Real error or non-persistent timeout
                             }
                             Ok(_) => continue, // Process the new line
                         }
-                    }
-                    if line.len() > MAX_CONTROL_LINE_LEN {
-                        let _ = write_stream.write_all(b"ERROR: command too long\n");
-                        let _ = write_stream.flush();
-                        line.clear();
-                        trim_reusable_line_buffer(&mut line);
-                        if !persistent {
-                            break;
-                        }
-                        continue;
                     }
                     
                     // Use quote-aware parser to preserve arguments with spaces
@@ -543,7 +407,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if !persistent { break; }
                     }
                     "dump-state" => {
-                        let (rtx, rrx) = mpsc::channel::<Arc<str>>();
+                        let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::DumpState(rtx));
                         if let Some(ref rtx_bg) = resp_tx_opt {
                             // Persistent mode: hand off to writer thread (non-blocking).
@@ -1233,13 +1097,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                     // Try to read next command for batching (with timeout)
                     line.clear();
-                    trim_reusable_line_buffer(&mut line);
                     match r.read_line(&mut line) {
                         Ok(0) => break, // EOF - client disconnected
                         Err(e) => {
                             if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                                 line.clear(); // Clear any partial data from interrupted read
-                                trim_reusable_line_buffer(&mut line);
                                 continue; // Persistent mode - keep waiting
                             }
                             break; // Non-persistent timeout or real error
@@ -1636,8 +1498,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => {
-                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
+                CtrlReq::ClientSize(w, h) => { 
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
@@ -2548,10 +2410,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
                     
                     if cmd.is_empty() {
-                        remove_pipe_pane_by_id(&mut app, pane_id);
+                        app.pipe_panes.retain(|p| p.pane_id != pane_id);
                     } else {
-                        if app.pipe_panes.iter().any(|p| p.pane_id == pane_id) {
-                            remove_pipe_pane_by_id(&mut app, pane_id);
+                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
+                                let _ = proc.kill();
+                            }
+                            app.pipe_panes.remove(idx);
                         } else {
                             #[cfg(windows)]
                             let process = std::process::Command::new("cmd")
@@ -2872,12 +2737,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     parse_config_line(&mut app, &cmd);
                 }
             }
-            prune_wait_channels(&mut app);
             if mutates_state {
                 state_dirty = true;
-            }
-            if metadata_mutation {
-                metadata_dirty = true;
             }
         }
             }
@@ -2885,11 +2746,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         // Check if all windows/panes have exited
         let (all_empty, any_pruned) = tree::reap_children(&mut app)?;
         if any_pruned {
-            prune_stale_pipe_panes(&mut app);
             // A pane exited naturally - resize remaining panes to fill the space
             resize_all_panes(&mut app);
             state_dirty = true;
-            metadata_dirty = true;
         }
         if all_empty {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();

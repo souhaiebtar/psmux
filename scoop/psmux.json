@@ -1,7 +1,7 @@
 {
   "version": "0.3.0",
   "description": "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal",
-  "homepage": "https://github.com/souhaiebtar/psmux",
+  "homepage": "https://github.com/marlocarlo/psmux",
   "license": "MIT",
   "architecture": {
     "64bit": {
@@ -15,12 +15,12 @@
     "tmux.exe"
   ],
   "checkver": {
-    "github": "https://github.com/souhaiebtar/psmux"
+    "github": "https://github.com/marlocarlo/psmux"
   },
   "autoupdate": {
     "architecture": {
       "64bit": {
-        "url": "https://github.com/souhaiebtar/psmux/releases/download/v$version/psmux-v$version-windows-x64.zip"
+        "url": "https://github.com/marlocarlo/psmux/releases/download/v$version/psmux-v$version-windows-x64.zip"
       }
     }
   }

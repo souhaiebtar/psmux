@@ -13,16 +13,6 @@ use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, 
 use crate::types::*;
 use crate::tree::*;
 
-const PASTE_BUFFER_LIMIT: usize = 10;
-
-fn push_paste_buffer(app: &mut AppState, text: String) {
-    app.paste_buffers.push(text);
-    if app.paste_buffers.len() > PASTE_BUFFER_LIMIT {
-        // Keep newest entries and drop the oldest to avoid unbounded growth.
-        app.paste_buffers.remove(0);
-    }
-}
-
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 
     app.copy_scroll_offset = 0;

@@ -8,6 +8,7 @@ use crate::copy_mode::*;
 use crate::session::{send_control_to_port, list_all_sessions_tree};
 use crate::layout::cycle_top_layout;
 use crate::window_ops::toggle_zoom;
+use crate::window_ops;
 
 /// Build the choose-tree data for the WindowChooser mode.
 pub fn build_choose_tree(app: &AppState) -> Vec<crate::session::TreeEntry> {
@@ -232,9 +233,11 @@ pub fn fire_hooks(app: &mut AppState, event: &str) {
 pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
     match action {
         Action::DisplayPanes => {
-            ensure_rects_cache(app);
+            let win = &app.windows[app.active_idx];
+            let mut rects: Vec<(Vec<usize>, ratatui::prelude::Rect)> = Vec::new();
+            compute_rects(&win.root, app.last_window_area, &mut rects);
             app.display_map.clear();
-            for (i, (path, _)) in app.scratch_rects.iter().cloned().enumerate() {
+            for (i, (path, _)) in rects.into_iter().enumerate() {
                 let n = i + 1;
                 if n <= 10 { app.display_map.push((n, path)); } else { break; }
             }
@@ -248,19 +251,15 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
                 .get()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
             create_window(&*pty_system, app, None)?;
-            invalidate_layout_cache(app);
         }
         Action::SplitHorizontal => {
             split_active(app, LayoutKind::Horizontal)?;
-            invalidate_layout_cache(app);
         }
         Action::SplitVertical => {
             split_active(app, LayoutKind::Vertical)?;
-            invalidate_layout_cache(app);
         }
         Action::KillPane => {
             kill_active_pane(app)?;
-            invalidate_layout_cache(app);
         }
         Action::NextWindow => {
             if !app.windows.is_empty() {

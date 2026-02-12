@@ -52,13 +52,6 @@ Write-Host "-" * 70
 $Results["Advanced Features"] = $LASTEXITCODE
 Write-Host ""
 
-# Run end-to-end regression + performance tests
-Write-Host "Running: E2E Regression + Performance Tests (test_e2e_regression_perf.ps1)"
-Write-Host "-" * 70
-& "$TestsDir\test_e2e_regression_perf.ps1"
-$Results["E2E Regression+Perf"] = $LASTEXITCODE
-Write-Host ""
-
 # Summary
 Write-Host ""
 Write-Host "=" * 70

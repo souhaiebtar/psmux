@@ -1,4 +1,5 @@
 use std::io;
+use std::env;
 
 use serde::{Serialize, Deserialize};
 
@@ -125,36 +126,19 @@ pub fn base64_encode(data: &str) -> String {
     result
 }
 
-/// Lookup table for O(1) base64 decoding (maps ASCII byte to 6-bit value, 0xFF = invalid).
-const BASE64_DECODE_TABLE: [u8; 128] = {
-    let mut table = [0xFFu8; 128];
-    let mut i = 0usize;
-    while i < 64 {
-        table[BASE64_CHARS[i] as usize] = i as u8;
-        i += 1;
-    }
-    table
-};
-
-fn base64_char_to_val(b: u8) -> Option<u8> {
-    if b >= 128 { return None; }
-    let v = BASE64_DECODE_TABLE[b as usize];
-    if v == 0xFF { None } else { Some(v) }
-}
-
 pub fn base64_decode(encoded: &str) -> Option<String> {
     let mut result = Vec::new();
     let chars: Vec<u8> = encoded.bytes().filter(|&b| b != b'=').collect();
     for chunk in chars.chunks(4) {
         if chunk.len() < 2 { break; }
-        let b0 = base64_char_to_val(chunk[0])?;
-        let b1 = base64_char_to_val(chunk[1])?;
+        let b0 = BASE64_CHARS.iter().position(|&c| c == chunk[0])? as u8;
+        let b1 = BASE64_CHARS.iter().position(|&c| c == chunk[1])? as u8;
         result.push((b0 << 2) | (b1 >> 4));
         if chunk.len() > 2 {
-            let b2 = base64_char_to_val(chunk[2])?;
+            let b2 = BASE64_CHARS.iter().position(|&c| c == chunk[2])? as u8;
             result.push((b1 << 4) | (b2 >> 2));
             if chunk.len() > 3 {
-                let b3 = base64_char_to_val(chunk[3])?;
+                let b3 = BASE64_CHARS.iter().position(|&c| c == chunk[3])? as u8;
                 result.push((b2 << 6) | b3);
             }
         }

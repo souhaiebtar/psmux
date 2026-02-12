@@ -28,12 +28,14 @@ use crossterm::{execute};
 use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
+use crate::types::*;
 use crate::platform::enable_virtual_terminal_processing;
 use crate::cli::*;
 use crate::session::*;
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
+use crate::util::*;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -130,9 +132,8 @@ fn main() -> io::Result<()> {
                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                         if let Ok(_p) = port_str.trim().parse::<u16>() {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>() else { continue };
                                             if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                                                &sock_addr,
+                                                &addr.parse().unwrap(),
                                                 Duration::from_millis(50)
                                             ) {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
@@ -182,8 +183,7 @@ fn main() -> io::Result<()> {
             }
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
-                let raw_name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
-                let name = sanitize_session_name(&raw_name);
+                let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
                 // Check for initial command via -c flag (shell-wrapped)
                 let initial_cmd = args.iter().position(|a| a == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for raw command after -- (direct execution)
@@ -193,8 +193,7 @@ fn main() -> io::Result<()> {
                 return run_server(name, initial_cmd, raw_cmd);
             }
             "new-session" | "new" => {
-                let raw_name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
-                let name = sanitize_session_name(&raw_name);
+                let name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
                 let detached = cmd_args.iter().any(|a| *a == "-d");
                 // Check for -- separator: everything after it is a raw command (direct execution)
                 let dash_dash_pos = cmd_args.iter().position(|a| *a == "--");
@@ -225,9 +224,10 @@ fn main() -> io::Result<()> {
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                         if let Ok(port) = port_str.trim().parse::<u16>() {
                             let addr = format!("127.0.0.1:{}", port);
-                            addr.parse::<std::net::SocketAddr>().ok().map_or(false, |sock_addr| {
-                                std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(100)).is_ok()
-                            })
+                            std::net::TcpStream::connect_timeout(
+                                &addr.parse().unwrap(),
+                                Duration::from_millis(100)
+                            ).is_ok()
                         } else { false }
                     } else { false };
                     
@@ -568,13 +568,7 @@ fn main() -> io::Result<()> {
                 let session_name = target.clone().unwrap_or_else(|| {
                     env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string())
                 });
-                if !is_valid_session_name(&session_name) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid session name: {}", session_name)));
-                }
                 if let Some(t) = target {
-                    if !is_valid_session_name(&t) {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid session name: {}", t)));
-                    }
                     env::set_var("PSMUX_TARGET_SESSION", &t);
                 }
                 // Try to send kill command to server
@@ -605,9 +599,6 @@ fn main() -> io::Result<()> {
                     }
                     t
                 });
-                if !is_valid_session_name(&target) {
-                    std::process::exit(1);
-                }
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let path = format!("{}\\.psmux\\{}.port", home, target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
@@ -1594,9 +1585,10 @@ fn main() -> io::Result<()> {
             if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                 if let Ok(port) = port_str.trim().parse::<u16>() {
                     let addr = format!("127.0.0.1:{}", port);
-                    addr.parse::<std::net::SocketAddr>().ok().map_or(false, |sock_addr| {
-                        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)).is_ok()
-                    })
+                    std::net::TcpStream::connect_timeout(
+                        &addr.parse().unwrap(),
+                        Duration::from_millis(50)
+                    ).is_ok()
                 } else {
                     false
                 }

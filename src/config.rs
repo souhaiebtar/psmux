@@ -136,11 +136,6 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 app.escape_time_ms = ms;
             }
         }
-        "refresh-interval" => {
-            if let Ok(ms) = value.parse::<u64>() {
-                app.refresh_interval_ms = ms.clamp(16, 250);
-            }
-        }
         "prediction-dimming" | "dim-predictions" => {
             app.prediction_dimming = !matches!(value, "off" | "false" | "0");
         }

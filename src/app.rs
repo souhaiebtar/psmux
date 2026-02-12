@@ -26,7 +26,6 @@ use crate::layout::dump_layout_json;
 use crate::window_ops::*;
 use crate::util::*;
 use crate::input::{send_text_to_active, send_key_to_active};
-use crate::tree::invalidate_layout_cache;
 
 pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let pty_system = PtySystemSelection::default()
@@ -374,8 +373,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
 
             if let Mode::PaneChooser { .. } = &app.mode {
-                ensure_rects_cache(&mut app);
-                for (i, (_, r)) in app.scratch_rects.iter().enumerate() {
+                let win = &app.windows[app.active_idx];
+                let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+                compute_rects(&win.root, app.last_window_area, &mut rects);
+                for (i, (_, r)) in rects.iter().enumerate() {
                     let n = i + 1;
                     if n > 9 { break; }
                     let bw = 7u16;
@@ -571,9 +572,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let win = &mut app.windows[app.active_idx];
                         if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
                             let _ = pane.master.resize(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 });
-                            if let Ok(mut parser) = pane.term.lock() {
-                                parser.screen_mut().set_size(rows, cols);
-                            }
+                            let mut parser = pane.term.lock().unwrap();
+                            parser.screen_mut().set_size(rows, cols);
                         }
                         last_resize = Instant::now();
                     }
@@ -591,17 +591,6 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);
-                    invalidate_layout_cache(&mut app);
-                }
-                CtrlReq::SplitWindow(k, cmd) => {
-                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
-                    resize_all_panes(&mut app);
-                    invalidate_layout_cache(&mut app);
-                }
-                CtrlReq::KillPane => {
-                    let _ = kill_active_pane(&mut app);
-                    resize_all_panes(&mut app);
-                    invalidate_layout_cache(&mut app);
                 }
                 CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
@@ -644,10 +633,9 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
-                CtrlReq::ClientSize(w, h) => {
-                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
+                CtrlReq::ClientSize(w, h) => { 
+                    app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
-                    invalidate_layout_cache(&mut app);
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
@@ -679,7 +667,6 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         let (all_empty, any_pruned) = reap_children(&mut app)?;
         if any_pruned {
             resize_all_panes(&mut app);
-            invalidate_layout_cache(&mut app);
         }
         if all_empty {
             quit = true;
