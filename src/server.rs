@@ -1016,8 +1016,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                     "clock-mode" => { let _ = tx.send(CtrlReq::ClockMode); }
-                    "show-messages" | "showmsgs" => {} // not implemented but accepted
-                    "command-prompt" => {} // accepted (client handles internally)
+                    "show-messages" | "showmsgs" => {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ShowMessages(rtx));
+                        if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}", text); let _ = write_stream.flush(); }
+                        if !persistent { break; }
+                    }
+                    "command-prompt" => {
+                        let initial = args.windows(2).find(|w| w[0] == "-I").map(|w| w[1].to_string()).unwrap_or_default();
+                        let _ = tx.send(CtrlReq::CommandPrompt(initial));
+                    }
                     "run-shell" | "run" => {
                         let background = args.iter().any(|a| *a == "-b");
                         let cmd_parts: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
@@ -2096,7 +2104,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     hook_event = Some("after-rotate-window");
                 }
                 CtrlReq::DisplayPanes => {
-                    // This would show pane numbers overlay - no-op for server mode
+                    app.mode = Mode::PaneChooser { opened_at: std::time::Instant::now() };
+                    state_dirty = true;
                 }
                 CtrlReq::BreakPane => {
                     break_pane_to_window(&mut app);
@@ -2777,6 +2786,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         send_focus_seq(&mut win.root, b"\x1b[O");
                     }
                     hook_event = Some("pane-focus-out");
+                }
+                CtrlReq::CommandPrompt(initial) => {
+                    app.mode = Mode::CommandPrompt { input: initial.clone(), cursor: initial.len() };
+                    state_dirty = true;
+                }
+                CtrlReq::ShowMessages(resp) => {
+                    // Return message log (tmux stores recent log messages)
+                    let _ = resp.send(String::new());
                 }
                 CtrlReq::ResizeWindow(_dim, _size) => {
                     // On Windows, window size is controlled by the terminal emulator;

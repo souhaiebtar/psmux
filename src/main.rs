@@ -1767,6 +1767,160 @@ fn main() -> io::Result<()> {
                 send_control("previous-layout\n".to_string())?;
                 return Ok(());
             }
+            // command-prompt - Open interactive command prompt
+            "command-prompt" => {
+                let mut cmd = "command-prompt".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-I" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -I {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-p" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -p {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-1" => { cmd.push_str(" -1"); }
+                        "-N" => { cmd.push_str(" -N"); }
+                        "-W" => { cmd.push_str(" -W"); }
+                        "-T" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -T {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // display-menu - Display a menu
+            "display-menu" | "menu" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // display-popup - Display a popup window
+            "display-popup" | "popup" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // server-info - Show server information
+            "server-info" | "info" => {
+                let resp = send_control_with_response("server-info\n".to_string())?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // start-server - Start the server if not running
+            "start-server" | "start" => {
+                // In psmux, the server starts automatically with new-session.
+                // If we're here, a session exists. This is a compatibility no-op.
+                return Ok(());
+            }
+            // confirm-before - Ask for confirmation before running a command
+            "confirm-before" | "confirm" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // refresh-client - Refresh the client display
+            "refresh-client" | "refresh" => {
+                let mut cmd = "refresh-client".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-S" => { cmd.push_str(" -S"); }
+                        "-l" => { cmd.push_str(" -l"); }
+                        "-C" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -C {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // send-prefix - Send the prefix key to the active pane
+            "send-prefix" => {
+                send_control("send-prefix\n".to_string())?;
+                return Ok(());
+            }
+            // show-messages - Show message log
+            "show-messages" | "showmsgs" => {
+                let resp = send_control_with_response("show-messages\n".to_string())?;
+                if !resp.trim().is_empty() {
+                    print!("{}", resp);
+                }
+                return Ok(());
+            }
+            // suspend-client - Suspend client (no-op on Windows)
+            "suspend-client" | "suspendc" => {
+                // No-op on Windows — no SIGTSTP concept
+                return Ok(());
+            }
+            // lock-client / lock-server / lock-session (no-op on Windows)
+            "lock-client" | "lockc" | "lock-server" | "lock" | "lock-session" | "locks" => {
+                // No-op on Windows — no terminal locking concept
+                return Ok(());
+            }
+            // resize-window - Resize window (no-op on Windows)
+            "resize-window" | "resizew" => {
+                // On Windows, window size is controlled by the terminal emulator
+                return Ok(());
+            }
+            // customize-mode - tmux 3.2+ customize mode (stub)
+            "customize-mode" => {
+                // Stub for compatibility
+                return Ok(());
+            }
+            // choose-client - List clients interactively
+            "choose-client" => {
+                // Single-client model — returns current client info
+                let resp = send_control_with_response("list-clients\n".to_string())?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // respawn-window - Respawn active pane in window
+            "respawn-window" | "respawnw" => {
+                send_control("respawn-window\n".to_string())?;
+                return Ok(());
+            }
+            // link-window - Link a window (stub)
+            "link-window" | "linkw" => {
+                // Accepted for compatibility
+                return Ok(());
+            }
+            // unlink-window - Unlink a window
+            "unlink-window" | "unlinkw" => {
+                send_control("unlink-window\n".to_string())?;
+                return Ok(());
+            }
             _ => {
                 // Unknown command - print error and exit
                 if !cmd.is_empty() {

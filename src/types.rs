@@ -576,6 +576,8 @@ pub enum CtrlReq {
     RespawnWindow,
     FocusIn,
     FocusOut,
+    CommandPrompt(String),
+    ShowMessages(mpsc::Sender<String>),
 }
 
 /// Global flag set by PTY reader threads when new output arrives.
