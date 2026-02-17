@@ -60,6 +60,10 @@ pub enum LayoutJson {
         sel_end_row: Option<u16>,
         sel_end_col: Option<u16>,
         #[serde(default)]
+        copy_cursor_row: Option<u16>,
+        #[serde(default)]
+        copy_cursor_col: Option<u16>,
+        #[serde(default)]
         content: Vec<Vec<CellJson>>,
         #[serde(default)]
         rows_v2: Vec<RowRunsJson>,
@@ -242,6 +246,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     sel_start_col: None,
                     sel_end_row: None,
                     sel_end_col: None,
+                    copy_cursor_row: None,
+                    copy_cursor_col: None,
                     content: lines,
                     rows_v2,
                 }
@@ -270,6 +276,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                 sel_start_col,
                 sel_end_row,
                 sel_end_col,
+                copy_cursor_row,
+                copy_cursor_col,
                 ..
             } => {
                 let is_active = idx >= path.len();
@@ -278,6 +286,13 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     *copy_mode = in_copy_mode;
                     *so = scroll_offset;
                     if in_copy_mode {
+                        if let Some((pr, pc)) = copy_pos {
+                            *copy_cursor_row = Some(pr);
+                            *copy_cursor_col = Some(pc);
+                        } else {
+                            *copy_cursor_row = None;
+                            *copy_cursor_col = None;
+                        }
                         if let (Some((ar, ac)), Some((pr, pc))) = (copy_anchor, copy_pos) {
                             *sel_start_row = Some(ar.min(pr));
                             *sel_start_col = Some(ac.min(pc));
@@ -294,6 +309,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         *sel_start_col = None;
                         *sel_end_row = None;
                         *sel_end_col = None;
+                        *copy_cursor_row = None;
+                        *copy_cursor_col = None;
                     }
                 }
             }
@@ -416,29 +433,136 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 let is_active    = cur_path.as_slice() == active_path;
                 let need_content = in_copy && is_active;
 
-                let parser = p.term.lock().unwrap();
-                let screen = parser.screen();
-                let (cr, cc) = screen.cursor_position();
-
-                // Alternate-screen heuristic (ConPTY never passes ESC[?1049h)
-                let alt = screen.alternate_screen() || {
-                    let lr = p.last_rows.saturating_sub(1);
-                    (0..p.last_cols).any(|col| {
-                        screen.cell(lr, col).map_or(false, |c| {
-                            let t = c.contents();
-                            !t.is_empty() && t != " "
-                        })
-                    })
-                };
-
-                // Throttled title inference
-                let now = std::time::Instant::now();
-                if now.duration_since(p.last_infer_title).as_millis() >= 500 {
-                    if let Some(t) = infer_title_from_prompt(screen, p.last_rows, p.last_cols) {
-                        p.title = t;
-                    }
-                    p.last_infer_title = now;
+                // ── Snapshot cell data under the mutex, then release ──
+                // This minimises the time we block the reader thread (which
+                // also holds p.term's mutex while processing ConPTY output).
+                // Without this, WSL echo gets starved because its output sits
+                // in the ConPTY pipe while we build the JSON string.
+                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
+                struct RowSnap { runs: Vec<Run> }
+                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, width: u16 }
+                struct LeafSnap {
+                    cr: u16, cc: u16, alt: bool,
+                    rows_v2: Vec<RowSnap>,
+                    content: Vec<Vec<CopyCell>>,
                 }
+
+                let snap = {
+                    let parser = p.term.lock().unwrap();
+                    let screen = parser.screen();
+                    let (cr, cc) = screen.cursor_position();
+
+                    // Alternate-screen heuristic
+                    let alt = screen.alternate_screen() || {
+                        let lr = p.last_rows.saturating_sub(1);
+                        (0..p.last_cols).any(|col| {
+                            screen.cell(lr, col).map_or(false, |c| {
+                                let t = c.contents();
+                                !t.is_empty() && t != " "
+                            })
+                        })
+                    };
+
+                    // Throttled title inference (still under lock, but only every 500ms)
+                    let now = std::time::Instant::now();
+                    if now.duration_since(p.last_infer_title).as_millis() >= 500 {
+                        if let Some(t) = infer_title_from_prompt(screen, p.last_rows, p.last_cols) {
+                            p.title = t;
+                        }
+                        p.last_infer_title = now;
+                    }
+
+                    // Snapshot rows_v2 (run-merged)
+                    let mut snap_rows: Vec<RowSnap> = Vec::with_capacity(p.last_rows as usize);
+                    for r in 0..p.last_rows {
+                        let mut runs: Vec<Run> = Vec::new();
+                        let mut c = 0u16;
+                        let mut prev_fg: Option<vt100::Color> = None;
+                        let mut prev_bg: Option<vt100::Color> = None;
+                        let mut prev_fl: u8 = 0;
+
+                        while c < p.last_cols {
+                            if let Some(cell) = screen.cell(r, c) {
+                                let t = cell.contents();
+                                let t = if t.is_empty() { " " } else { t };
+                                let cfg = cell.fgcolor();
+                                let cbg = cell.bgcolor();
+                                let mut w = UnicodeWidthStr::width(t) as u16;
+                                if w == 0 { w = 1; }
+                                let mut fl = 0u8;
+                                if cell.dim()   { fl |= FLAG_DIM; }
+                                if cell.bold()  { fl |= FLAG_BOLD; }
+                                if cell.italic(){ fl |= FLAG_ITALIC; }
+                                if cell.underline() { fl |= FLAG_UNDERLINE; }
+                                if cell.inverse()   { fl |= FLAG_INVERSE; }
+
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                    if let Some(last) = runs.last_mut() {
+                                        last.text.push_str(t);
+                                        last.width += w;
+                                    }
+                                } else {
+                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w });
+                                }
+                                prev_fg = Some(cfg);
+                                prev_bg = Some(cbg);
+                                prev_fl = fl;
+                                c += w.max(1);
+                            } else {
+                                let cfg = vt100::Color::Default;
+                                let cbg = vt100::Color::Default;
+                                let fl  = 0u8;
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                    if let Some(last) = runs.last_mut() {
+                                        last.text.push(' ');
+                                        last.width += 1;
+                                    }
+                                } else {
+                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1 });
+                                }
+                                prev_fg = Some(cfg);
+                                prev_bg = Some(cbg);
+                                prev_fl = fl;
+                                c += 1;
+                            }
+                        }
+                        snap_rows.push(RowSnap { runs });
+                    }
+
+                    // Snapshot content (copy-mode only)
+                    let mut snap_content: Vec<Vec<CopyCell>> = Vec::new();
+                    if need_content {
+                        for r in 0..p.last_rows {
+                            let mut row_cells: Vec<CopyCell> = Vec::new();
+                            let mut c = 0u16;
+                            while c < p.last_cols {
+                                if let Some(cell) = screen.cell(r, c) {
+                                    let t = cell.contents();
+                                    let t = if t.is_empty() { " " } else { t };
+                                    let w = UnicodeWidthStr::width(t).max(1) as u16;
+                                    row_cells.push(CopyCell {
+                                        text: t.to_string(), fg: cell.fgcolor(), bg: cell.bgcolor(),
+                                        bold: cell.bold(), italic: cell.italic(), underline: cell.underline(),
+                                        inverse: cell.inverse(), dim: cell.dim(), width: w,
+                                    });
+                                    c += w;
+                                } else {
+                                    row_cells.push(CopyCell {
+                                        text: " ".to_string(), fg: vt100::Color::Default, bg: vt100::Color::Default,
+                                        bold: false, italic: false, underline: false, inverse: false, dim: false, width: 1,
+                                    });
+                                    c += 1;
+                                }
+                            }
+                            snap_content.push(row_cells);
+                        }
+                    }
+
+                    LeafSnap { cr, cc, alt, rows_v2: snap_rows, content: snap_content }
+                };
+                // ── Parser mutex is now RELEASED ──
+                // All JSON string building below happens without holding the lock,
+                // so the reader thread can process ConPTY output concurrently.
 
                 // ── leaf header ──────────────────────────────────────
                 let so = if is_active && in_copy { scroll_off } else { 0 };
@@ -451,10 +575,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         "\"active\":{},\"copy_mode\":{},",
                         "\"scroll_offset\":{},"),
                     p.id, p.last_rows, p.last_cols,
-                    cr, cc, alt, is_active, need_content, so,
+                    snap.cr, snap.cc, snap.alt, is_active, need_content, so,
                 ));
 
-                // selection bounds
+                // selection bounds + copy cursor position
                 if is_active && in_copy {
                     if let (Some((ar, ac)), Some((pr, pc))) = (anchor, cpos) {
                         let _ = std::fmt::Write::write_fmt(out, format_args!(
@@ -464,55 +588,53 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     } else {
                         out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
                     }
+                    if let Some((pr, pc)) = cpos {
+                        let _ = std::fmt::Write::write_fmt(out, format_args!(
+                            "\"copy_cursor_row\":{},\"copy_cursor_col\":{},",
+                            pr, pc,
+                        ));
+                    } else {
+                        out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
+                    }
                 } else {
                     out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                    out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
                 }
 
                 // ── content (per-cell, only in copy-mode active pane) ──
-                if need_content {
+                if need_content && !snap.content.is_empty() {
                     out.push_str("\"content\":[");
-                    for r in 0..p.last_rows {
-                        if r > 0 { out.push(','); }
+                    for (ri, row) in snap.content.iter().enumerate() {
+                        if ri > 0 { out.push(','); }
                         out.push('[');
-                        let mut c = 0u16;
-                        let mut first = true;
-                        while c < p.last_cols {
-                            if !first { out.push(','); }
-                            first = false;
-                            if let Some(cell) = screen.cell(r, c) {
-                                let t = cell.contents();
-                                let t = if t.is_empty() { " " } else { t };
-                                let w = UnicodeWidthStr::width(t).max(1) as u16;
-                                out.push_str("{\"text\":\"");
-                                json_esc(t, out);
-                                out.push_str("\",\"fg\":\"");
-                                push_color(cell.fgcolor(), out);
+                        for (ci, cell) in row.iter().enumerate() {
+                            if ci > 0 { out.push(','); }
+                            out.push_str("{\"text\":\"");
+                            json_esc(&cell.text, out);
+                            out.push_str("\",\"fg\":\"");
+                            push_color(cell.fg, out);
+                            out.push_str("\",\"bg\":\"");
+                            push_color(cell.bg, out);
+                            let _ = std::fmt::Write::write_fmt(out, format_args!(
+                                "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{}}}",
+                                cell.bold, cell.italic, cell.underline, cell.inverse, cell.dim,
+                            ));
+                            // Emit width-2 filler cells
+                            for _ in 1..cell.width {
+                                out.push_str(",{\"text\":\"\",\"fg\":\"");
+                                push_color(cell.fg, out);
                                 out.push_str("\",\"bg\":\"");
-                                push_color(cell.bgcolor(), out);
+                                push_color(cell.bg, out);
                                 let _ = std::fmt::Write::write_fmt(out, format_args!(
                                     "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{}}}",
-                                    cell.bold(), cell.italic(), cell.underline(), cell.inverse(), cell.dim(),
+                                    cell.bold, cell.italic, cell.underline, cell.inverse, cell.dim,
                                 ));
-                                for _ in 1..w {
-                                    out.push_str(",{\"text\":\"\",\"fg\":\"");
-                                    push_color(cell.fgcolor(), out);
-                                    out.push_str("\",\"bg\":\"");
-                                    push_color(cell.bgcolor(), out);
-                                    let _ = std::fmt::Write::write_fmt(out, format_args!(
-                                        "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{}}}",
-                                        cell.bold(), cell.italic(), cell.underline(), cell.inverse(), cell.dim(),
-                                    ));
-                                }
-                                c += w;
-                            } else {
-                                out.push_str("{\"text\":\" \",\"fg\":\"default\",\"bg\":\"default\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false}");
-                                c += 1;
                             }
                         }
                         // pad to full column width
-                        while (c as usize) < p.last_cols as usize {
+                        let total_w: u16 = row.iter().map(|c| c.width).sum();
+                        for _ in total_w..p.last_cols {
                             out.push_str(",{\"text\":\" \",\"fg\":\"default\",\"bg\":\"default\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false}");
-                            c += 1;
                         }
                         out.push(']');
                     }
@@ -521,74 +643,16 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     out.push_str("\"content\":[],");
                 }
 
-                // ── rows_v2 (run-merged, the normal hot path) ────────
+                // ── rows_v2 (from snapshot, no mutex held) ───────────
                 out.push_str("\"rows_v2\":[");
-                for r in 0..p.last_rows {
-                    if r > 0 { out.push(','); }
+                for (ri, row) in snap.rows_v2.iter().enumerate() {
+                    if ri > 0 { out.push(','); }
                     out.push_str("{\"runs\":[");
-                    let mut c = 0u16;
-                    let mut prev_fg: Option<vt100::Color> = None;
-                    let mut prev_bg: Option<vt100::Color> = None;
-                    let mut prev_fl: u8 = 0;
-                    let mut run_w: u16 = 0;
-                    let mut in_run = false;
-
-                    while c < p.last_cols {
-                        let (cfg, cbg, fl, w) = if let Some(cell) = screen.cell(r, c) {
-                            let t = cell.contents();
-                            let t = if t.is_empty() { " " } else { t };
-                            let cfg = cell.fgcolor();
-                            let cbg = cell.bgcolor();
-                            let mut w = UnicodeWidthStr::width(t) as u16;
-                            if w == 0 { w = 1; }
-                            let mut fl = 0u8;
-                            if cell.dim()       { fl |= FLAG_DIM; }
-                            if cell.bold()      { fl |= FLAG_BOLD; }
-                            if cell.italic()    { fl |= FLAG_ITALIC; }
-                            if cell.underline() { fl |= FLAG_UNDERLINE; }
-                            if cell.inverse()   { fl |= FLAG_INVERSE; }
-
-                            if in_run && prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
-                                // merge into current open run
-                                json_esc(t, out);
-                                run_w += w;
-                            } else {
-                                if in_run {
-                                    close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
-                                    out.push(',');
-                                }
-                                out.push_str("{\"text\":\"");
-                                json_esc(t, out);
-                                run_w = w;
-                                in_run = true;
-                            }
-                            (cfg, cbg, fl, w)
-                        } else {
-                            let cfg = vt100::Color::Default;
-                            let cbg = vt100::Color::Default;
-                            let fl  = 0u8;
-                            if in_run && prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
-                                out.push(' ');
-                                run_w += 1;
-                            } else {
-                                if in_run {
-                                    close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
-                                    out.push(',');
-                                }
-                                out.push_str("{\"text\":\" ");
-                                run_w = 1;
-                                in_run = true;
-                            }
-                            (cfg, cbg, fl, 1u16)
-                        };
-                        prev_fg = Some(cfg);
-                        prev_bg = Some(cbg);
-                        prev_fl = fl;
-                        c += w.max(1);
-                    }
-                    // close last run of the row
-                    if in_run {
-                        close_run(prev_fg.unwrap(), prev_bg.unwrap(), prev_fl, run_w, out);
+                    for (i, run) in row.runs.iter().enumerate() {
+                        if i > 0 { out.push(','); }
+                        out.push_str("{\"text\":\"");
+                        json_esc(&run.text, out);
+                        close_run(run.fg, run.bg, run.flags, run.width, out);
                     }
                     out.push_str("]}");
                 }

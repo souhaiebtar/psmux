@@ -43,9 +43,32 @@ fn main() -> io::Result<()> {
     // Clean up any stale port files at startup
     cleanup_stale_port_files();
     
+    // Parse -L flag early (tmux-compatible: names the server socket for namespace isolation)
+    // In psmux, -L <name> creates a namespace prefix for session port/key files.
+    // Sessions under -L "foo" are stored as "foo__sessionname.port".
+    // IMPORTANT: Only recognize -L as a global flag when it appears BEFORE the subcommand.
+    // This avoids conflict with subcommand flags (e.g. select-pane -L, resize-pane -L).
+    let mut l_socket_name: Option<String> = None;
+    {
+        let mut i = 1; // skip binary name
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "-L" && i + 1 < args.len() {
+                l_socket_name = Some(args[i + 1].clone());
+                i += 2;
+            } else if (arg == "-S" || arg == "-f" || arg == "-t") && i + 1 < args.len() {
+                i += 2; // skip other global flag-value pairs
+            } else if arg.starts_with('-') {
+                i += 1; // skip single global flags (e.g. -v, -V)
+            } else {
+                break; // hit the subcommand name — stop scanning for global flags
+            }
+        }
+    }
+
     // Parse -t flag early to set target session for all commands
     // Supports session:window.pane format (e.g., "dev:0.1")
-    // PSMUX_TARGET_SESSION stores just the session name (for port file lookup)
+    // PSMUX_TARGET_SESSION stores the port file base name (for port file lookup)
     // PSMUX_TARGET_FULL stores the full target (session:window.pane) for the server
     if let Some(pos) = args.iter().position(|a| a == "-t") {
         if let Some(target) = args.get(pos + 1) {
@@ -53,16 +76,54 @@ fn main() -> io::Result<()> {
             env::set_var("PSMUX_TARGET_FULL", target);
             // Extract just the session name for port file lookup
             let session = extract_session_from_target(target);
-            env::set_var("PSMUX_TARGET_SESSION", &session);
+            // Apply -L namespace prefix for port file lookup
+            let port_file_base = if let Some(ref l) = l_socket_name {
+                format!("{}__{}", l, session)
+            } else {
+                session.clone()
+            };
+            env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
+        }
+    } else if env::var("PSMUX_TARGET_SESSION").is_err() {
+        // No -t flag: try to resolve session from TMUX env var (set inside psmux panes)
+        // TMUX format: /tmp/psmux-<pid>/<socket_name>,<port>,<session_idx>
+        if let Ok(tmux_val) = env::var("TMUX") {
+            // Extract the port from the TMUX value
+            let parts: Vec<&str> = tmux_val.split(',').collect();
+            if parts.len() >= 2 {
+                if let Ok(port) = parts[1].trim().parse::<u16>() {
+                    // Look up which session owns this port (port file base
+                    // already includes -L namespace prefix if applicable)
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let psmux_dir = format!("{}\\.psmux", home);
+                    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map(|e| e == "port").unwrap_or(false) {
+                                if let Ok(port_str) = std::fs::read_to_string(&path) {
+                                    if let Ok(file_port) = port_str.trim().parse::<u16>() {
+                                        if file_port == port {
+                                            if let Some(port_file_base) = path.file_stem().and_then(|s| s.to_str()) {
+                                                env::set_var("PSMUX_TARGET_SESSION", port_file_base);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
-    // Find the actual command by skipping -t and its argument
+    // Find the actual command by skipping -t/-L and their arguments
     let cmd_args: Vec<&String> = args.iter().skip(1).filter(|a| {
-        if *a == "-t" { return false; }
-        // Check if previous arg was -t
+        if *a == "-t" || *a == "-L" { return false; }
+        // Check if previous arg was -t or -L
         if let Some(pos) = args.iter().position(|x| x == *a) {
-            if pos > 0 && args[pos - 1] == "-t" { return false; }
+            if pos > 0 && (args[pos - 1] == "-t" || args[pos - 1] == "-L") { return false; }
         }
         true
     }).collect();
@@ -91,19 +152,27 @@ fn main() -> io::Result<()> {
         "kill-server" => {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
             let psmux_dir = format!("{}\\.psmux", home);
+            // Compute namespace prefix for -L filtering (matches list-sessions behavior)
+            let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
             let mut sessions_killed = 0;
             if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map(|e| e == "port").unwrap_or(false) {
                         if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            // Apply -L namespace filtering:
+                            // With -L: only kill sessions under that namespace
+                            // Without -L: kill ALL sessions (tmux behavior)
+                            if let Some(ref pfx) = ns_prefix {
+                                if !session_name.starts_with(pfx.as_str()) { continue; }
+                            }
                             if let Ok(port_str) = std::fs::read_to_string(&path) {
                                 if let Ok(port) = port_str.trim().parse::<u16>() {
                                     let addr = format!("127.0.0.1:{}", port);
                                     let sess_key = read_session_key(session_name).unwrap_or_default();
                                     if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
                                         let _ = write!(stream, "AUTH {}\n", sess_key);
-                                        let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
+                                        let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
                                         sessions_killed += 1;
                                     } else {
                                         let _ = std::fs::remove_file(&path);
@@ -117,18 +186,28 @@ fn main() -> io::Result<()> {
                 }
             }
             if sessions_killed > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             return Ok(());
         }
         "ls" | "list-sessions" => {
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let dir = format!("{}\\.psmux", home);
+                // Compute namespace prefix for -L filtering
+                let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
                 if let Ok(entries) = std::fs::read_dir(&dir) {
                     for e in entries.flatten() {
                         if let Some(name) = e.file_name().to_str() {
                             if let Some((base, ext)) = name.rsplit_once('.') {
                                 if ext == "port" {
+                                    // Filter by -L namespace: when -L is given, only show
+                                    // sessions with that prefix; when no -L, only show
+                                    // sessions without any namespace prefix
+                                    if let Some(ref pfx) = ns_prefix {
+                                        if !base.starts_with(pfx.as_str()) { continue; }
+                                    } else {
+                                        if base.contains("__") { continue; }
+                                    }
                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                         if let Ok(_p) = port_str.trim().parse::<u16>() {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
@@ -184,17 +263,28 @@ fn main() -> io::Result<()> {
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
                 let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
+                // Parse -L socket name for namespace isolation
+                let server_socket_name = args.iter().position(|a| a == "-L").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for initial command via -c flag (shell-wrapped)
                 let initial_cmd = args.iter().position(|a| a == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for raw command after -- (direct execution)
                 let raw_cmd: Option<Vec<String>> = args.iter().position(|a| a == "--").map(|pos| {
                     args.iter().skip(pos + 1).cloned().collect()
                 }).filter(|v: &Vec<String>| !v.is_empty());
-                return run_server(name, initial_cmd, raw_cmd);
+                return run_server(name, server_socket_name, initial_cmd, raw_cmd);
             }
             "new-session" | "new" => {
-                let name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
+                let name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                // Compute port file base name: with -L namespace prefix if specified
+                let port_file_base = if let Some(ref l) = l_socket_name {
+                    format!("{}__{}", l, name)
+                } else {
+                    name.clone()
+                };
                 let detached = cmd_args.iter().any(|a| *a == "-d");
+                let print_info = cmd_args.iter().any(|a| *a == "-P");
+                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                 // Check for -- separator: everything after it is a raw command (direct execution)
                 let dash_dash_pos = cmd_args.iter().position(|a| *a == "--");
                 let raw_cmd_args: Option<Vec<String>> = dash_dash_pos.map(|pos| {
@@ -207,7 +297,7 @@ fn main() -> io::Result<()> {
                     let mut cmd_parts: Vec<&str> = Vec::new();
                     for (i, arg) in cmd_args.iter().enumerate().skip(1) { // Skip command name
                         if skip_next { skip_next = false; continue; }
-                        if *arg == "-s" || *arg == "-t" { skip_next = true; continue; }
+                        if *arg == "-s" || *arg == "-t" || *arg == "-F" { skip_next = true; continue; }
                         if arg.starts_with('-') { continue; }
                         // This arg and all following are the command
                         cmd_parts.extend(cmd_args.iter().skip(i).map(|s| s.as_str()));
@@ -218,7 +308,7 @@ fn main() -> io::Result<()> {
                 
                 // Check if session already exists AND is actually running
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let port_path = format!("{}\\.psmux\\{}.port", home, name);
+                let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
                 if std::path::Path::new(&port_path).exists() {
                     // Verify server is actually running
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
@@ -242,17 +332,22 @@ fn main() -> io::Result<()> {
                 
                 // Always spawn a background server first
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.arg("server").arg("-s").arg(&name);
+                let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), name.clone()];
+                // Pass -L socket name to server for namespace isolation
+                if let Some(ref l) = l_socket_name {
+                    server_args.push("-L".into());
+                    server_args.push(l.clone());
+                }
                 // Pass initial command if provided
                 if let Some(ref init_cmd) = initial_cmd {
-                    cmd.arg("-c").arg(init_cmd);
+                    server_args.push("-c".into());
+                    server_args.push(init_cmd.clone());
                 }
                 // Pass raw command args (direct execution) if -- was used
                 if let Some(ref raw_args) = raw_cmd_args {
-                    cmd.arg("--");
+                    server_args.push("--".into());
                     for a in raw_args {
-                        cmd.arg(a);
+                        server_args.push(a.clone());
                     }
                 }
                 // On Windows, mark parent's stdout/stderr as non-inheritable before
@@ -277,17 +372,19 @@ fn main() -> io::Result<()> {
                         SetHandleInformation(stderr, HANDLE_FLAG_INHERIT, 0);
                     }
                 }
-                // On Windows, use DETACHED_PROCESS to completely detach from parent console.
-                // This ensures the server survives when the parent SSH/console dies.
-                // CREATE_NEW_PROCESS_GROUP prevents Ctrl+C signals from propagating.
+                // Spawn server with a hidden console window via CreateProcessW.
+                // This gives ConPTY a real console while keeping the window invisible.
                 #[cfg(windows)]
+                crate::platform::spawn_server_hidden(&exe, &server_args)?;
+                #[cfg(not(windows))]
                 {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                    const DETACHED_PROCESS: u32 = 0x00000008;
-                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+                    let mut cmd = std::process::Command::new(&exe);
+                    for a in &server_args { cmd.arg(a); }
+                    cmd.stdin(std::process::Stdio::null());
+                    cmd.stdout(std::process::Stdio::null());
+                    cmd.stderr(std::process::Stdio::null());
+                    let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 }
-                let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 
                 // Wait for server to create port file (up to 2 seconds)
                 for _ in 0..20 {
@@ -298,11 +395,28 @@ fn main() -> io::Result<()> {
                 }
                 
                 if detached {
-                    // User wants detached session - we're done
+                    // If -P flag, print pane info before returning
+                    if print_info {
+                        // Set target session so send_control_with_response connects to the right server
+                        env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
+                        // Give server a moment to initialize
+                        std::thread::sleep(Duration::from_millis(200));
+                        // Query the server for pane info using display-message
+                        let fmt = if let Some(ref f) = format_str {
+                            f.clone()
+                        } else {
+                            // tmux default: new-session -P prints "session_name:"
+                            "#{session_name}:".to_string()
+                        };
+                        match send_control_with_response(format!("display-message -p {}\n", fmt)) {
+                            Ok(resp) => { let trimmed = resp.trim(); if !trimmed.is_empty() { println!("{}", trimmed); } }
+                            Err(_) => {}
+                        }
+                    }
                     return Ok(());
                 } else {
                     // User wants attached session - set env vars to attach
-                    env::set_var("PSMUX_SESSION_NAME", name);
+                    env::set_var("PSMUX_SESSION_NAME", &port_file_base);
                     env::set_var("PSMUX_REMOTE_ATTACH", "1");
                     // Continue to attach below...
                 }
@@ -311,18 +425,25 @@ fn main() -> io::Result<()> {
                 // Parse -n name flag
                 let name_arg: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
                 let detached = cmd_args.iter().any(|a| *a == "-d");
+                let print_info = cmd_args.iter().any(|a| *a == "-P");
+                // Parse -F format string
+                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                 // Parse -c start_dir flag
                 let start_dir: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-                // Parse command — first non-flag argument, excluding -n/-t/-c values
+                // Parse command — first non-flag argument, excluding -n/-t/-c/-F values
                 let cmd_arg = cmd_args.iter().skip(1)
                     .filter(|a| !a.starts_with('-'))
                     .find(|a| {
-                        // Exclude values of -n and -t flags
-                        !cmd_args.windows(2).any(|w| (w[0] == "-n" || w[0] == "-t" || w[0] == "-c") && w[1] == **a)
+                        // Exclude values of -n, -t, -c, -F flags
+                        !cmd_args.windows(2).any(|w| (w[0] == "-n" || w[0] == "-t" || w[0] == "-c" || w[0] == "-F") && w[1] == **a)
                     })
                     .map(|s| s.as_str()).unwrap_or("");
                 let mut cmd_line = "new-window".to_string();
                 if detached { cmd_line.push_str(" -d"); }
+                if print_info { cmd_line.push_str(" -P"); }
+                if let Some(ref fmt) = format_str {
+                    cmd_line.push_str(&format!(" -F \"{}\"", fmt.replace("\"", "\\\"")));
+                }
                 if let Some(name) = &name_arg {
                     cmd_line.push_str(&format!(" -n \"{}\"", name.replace("\"", "\\\"")));
                 }
@@ -333,21 +454,33 @@ fn main() -> io::Result<()> {
                     cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
                 }
                 cmd_line.push('\n');
-                send_control(cmd_line)?;
+                if print_info {
+                    let resp = send_control_with_response(cmd_line)?;
+                    print!("{}", resp);
+                } else {
+                    send_control(cmd_line)?;
+                }
                 return Ok(());
             }
             "split-window" | "splitw" => {
                 let flag = if cmd_args.iter().any(|a| *a == "-h") { "-h" } else { "-v" };
                 let detached = cmd_args.iter().any(|a| *a == "-d");
+                let print_info = cmd_args.iter().any(|a| *a == "-P");
+                // Parse -F format string
+                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                 // Parse -c start_dir, -p percentage, -l percentage flags
                 let start_dir: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
                 let size_pct: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-p" || w[0] == "-l").map(|w| w[1].to_string());
                 // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
                 let cmd_arg = cmd_args.iter().skip(1)
-                    .find(|a| !a.starts_with('-') && !cmd_args.windows(2).any(|w| (w[0] == "-c" || w[0] == "-p" || w[0] == "-l") && w[1] == **a))
+                    .find(|a| !a.starts_with('-') && !cmd_args.windows(2).any(|w| (w[0] == "-c" || w[0] == "-p" || w[0] == "-l" || w[0] == "-F") && w[1] == **a))
                     .map(|s| s.as_str()).unwrap_or("");
                 let mut cmd_line = format!("split-window {}", flag);
                 if detached { cmd_line.push_str(" -d"); }
+                if print_info { cmd_line.push_str(" -P"); }
+                if let Some(ref fmt) = format_str {
+                    cmd_line.push_str(&format!(" -F \"{}\"", fmt.replace("\"", "\\\"")));
+                }
                 if let Some(dir) = &start_dir {
                     cmd_line.push_str(&format!(" -c \"{}\"", dir.replace("\"", "\\\"")));
                 }
@@ -358,7 +491,12 @@ fn main() -> io::Result<()> {
                     cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
                 }
                 cmd_line.push('\n');
-                send_control(cmd_line)?;
+                if print_info {
+                    let resp = send_control_with_response(cmd_line)?;
+                    print!("{}", resp);
+                } else {
+                    send_control(cmd_line)?;
+                }
                 return Ok(());
             }
             "kill-pane" | "killp" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
@@ -496,6 +634,12 @@ fn main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-F" => {
+                            if let Some(f) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                                i += 1;
+                            }
+                        }
                         _ => {}
                     }
                     i += 1;
@@ -513,6 +657,12 @@ fn main() -> io::Result<()> {
                     match cmd_args[i].as_str() {
                         "-a" => { cmd.push_str(" -a"); }
                         "-J" => { cmd.push_str(" -J"); }
+                        "-F" => {
+                            if let Some(f) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                                i += 1;
+                            }
+                        }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", t));
@@ -557,7 +707,13 @@ fn main() -> io::Result<()> {
                     match cmd_args[i].as_str() {
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
-                                target = Some(t.to_string());
+                                // Apply -L namespace prefix for port file lookup
+                                let namespaced = if let Some(ref l) = l_socket_name {
+                                    format!("{}__{}", l, t)
+                                } else {
+                                    t.to_string()
+                                };
+                                target = Some(namespaced);
                                 i += 1;
                             }
                         }
@@ -566,10 +722,17 @@ fn main() -> io::Result<()> {
                     i += 1;
                 }
                 let session_name = target.clone().unwrap_or_else(|| {
-                    env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string())
+                    env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| {
+                        // Apply -L namespace prefix to default
+                        if let Some(ref l) = l_socket_name {
+                            format!("{}__{}", l, "default")
+                        } else {
+                            "default".to_string()
+                        }
+                    })
                 });
-                if let Some(t) = target {
-                    env::set_var("PSMUX_TARGET_SESSION", &t);
+                if let Some(ref t) = target {
+                    env::set_var("PSMUX_TARGET_SESSION", t);
                 }
                 // Try to send kill command to server
                 if send_control("kill-session\n".to_string()).is_err() {
@@ -584,7 +747,7 @@ fn main() -> io::Result<()> {
             "has-session" | "has" => {
                 // Get target from env (set from -t flag) or from remaining args
                 let target = env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| {
-                    // Try to get from cmd_args if -t is in there (shouldn't be, but just in case)
+                    // Try to get session name from cmd_args
                     let mut t = "default".to_string();
                     let mut i = 1;
                     while i < cmd_args.len() {
@@ -597,14 +760,38 @@ fn main() -> io::Result<()> {
                         }
                         i += 1;
                     }
-                    t
+                    // Apply -L namespace prefix for port file lookup
+                    if let Some(ref l) = l_socket_name {
+                        format!("{}__{}", l, t)
+                    } else {
+                        t
+                    }
                 });
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let path = format!("{}\\.psmux\\{}.port", home, target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect(&addr).is_ok() {
+                        // Actually authenticate and query the server to ensure it's healthy
+                        let session_key = read_session_key(&target).unwrap_or_default();
+                        if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                            &addr.parse().unwrap(),
+                            Duration::from_millis(500)
+                        ) {
+                            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                            let _ = write!(s, "AUTH {}\n", session_key);
+                            let _ = write!(s, "session-info\n");
+                            let _ = s.flush();
+                            let mut buf = [0u8; 256];
+                            if let Ok(n) = std::io::Read::read(&mut s, &mut buf) {
+                                if n > 0 {
+                                    let resp = String::from_utf8_lossy(&buf[..n]);
+                                    if resp.contains("OK") {
+                                        std::process::exit(0);
+                                    }
+                                }
+                            }
+                            // Fallback: connection succeeded so session likely exists
                             std::process::exit(0);
                         } else {
                             // Stale port file - clean it up
@@ -1049,19 +1236,37 @@ fn main() -> io::Result<()> {
             // bind-key - Bind a key to a command
             "bind-key" | "bind" => {
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
-                send_control(format!("{}\n", cmd_str))?;
+                match send_control(format!("{}\n", cmd_str)) {
+                    Ok(()) => {},
+                    Err(e) if e.to_string().contains("no session") => {
+                        eprintln!("warning: no active session; bind-key will take effect when set inside a session or via config file");
+                    },
+                    Err(e) => return Err(e),
+                }
                 return Ok(());
             }
             // unbind-key - Unbind a key
             "unbind-key" | "unbind" => {
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
-                send_control(format!("{}\n", cmd_str))?;
+                match send_control(format!("{}\n", cmd_str)) {
+                    Ok(()) => {},
+                    Err(e) if e.to_string().contains("no session") => {
+                        eprintln!("warning: no active session; unbind-key will take effect when set inside a session or via config file");
+                    },
+                    Err(e) => return Err(e),
+                }
                 return Ok(());
             }
             // set-option / set - Set an option
             "set-option" | "set" => {
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
-                send_control(format!("{}\n", cmd_str))?;
+                match send_control(format!("{}\n", cmd_str)) {
+                    Ok(()) => {},
+                    Err(e) if e.to_string().contains("no session") => {
+                        eprintln!("warning: no active session; option will take effect when set inside a session or via config file");
+                    },
+                    Err(e) => return Err(e),
+                }
                 return Ok(());
             }
             // show-options / show / show-window-options / showw - Show options
@@ -1562,6 +1767,160 @@ fn main() -> io::Result<()> {
                 send_control("previous-layout\n".to_string())?;
                 return Ok(());
             }
+            // command-prompt - Open interactive command prompt
+            "command-prompt" => {
+                let mut cmd = "command-prompt".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-I" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -I {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-p" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -p {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-1" => { cmd.push_str(" -1"); }
+                        "-N" => { cmd.push_str(" -N"); }
+                        "-W" => { cmd.push_str(" -W"); }
+                        "-T" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -T {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // display-menu - Display a menu
+            "display-menu" | "menu" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // display-popup - Display a popup window
+            "display-popup" | "popup" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // server-info - Show server information
+            "server-info" | "info" => {
+                let resp = send_control_with_response("server-info\n".to_string())?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // start-server - Start the server if not running
+            "start-server" | "start" => {
+                // In psmux, the server starts automatically with new-session.
+                // If we're here, a session exists. This is a compatibility no-op.
+                return Ok(());
+            }
+            // confirm-before - Ask for confirmation before running a command
+            "confirm-before" | "confirm" => {
+                let joined: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                send_control(format!("{}\n", joined))?;
+                return Ok(());
+            }
+            // refresh-client - Refresh the client display
+            "refresh-client" | "refresh" => {
+                let mut cmd = "refresh-client".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-S" => { cmd.push_str(" -S"); }
+                        "-l" => { cmd.push_str(" -l"); }
+                        "-C" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -C {}", t));
+                                i += 1;
+                            }
+                        }
+                        "-t" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -t {}", t));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                send_control(cmd)?;
+                return Ok(());
+            }
+            // send-prefix - Send the prefix key to the active pane
+            "send-prefix" => {
+                send_control("send-prefix\n".to_string())?;
+                return Ok(());
+            }
+            // show-messages - Show message log
+            "show-messages" | "showmsgs" => {
+                let resp = send_control_with_response("show-messages\n".to_string())?;
+                if !resp.trim().is_empty() {
+                    print!("{}", resp);
+                }
+                return Ok(());
+            }
+            // suspend-client - Suspend client (no-op on Windows)
+            "suspend-client" | "suspendc" => {
+                // No-op on Windows — no SIGTSTP concept
+                return Ok(());
+            }
+            // lock-client / lock-server / lock-session (no-op on Windows)
+            "lock-client" | "lockc" | "lock-server" | "lock" | "lock-session" | "locks" => {
+                // No-op on Windows — no terminal locking concept
+                return Ok(());
+            }
+            // resize-window - Resize window (no-op on Windows)
+            "resize-window" | "resizew" => {
+                // On Windows, window size is controlled by the terminal emulator
+                return Ok(());
+            }
+            // customize-mode - tmux 3.2+ customize mode (stub)
+            "customize-mode" => {
+                // Stub for compatibility
+                return Ok(());
+            }
+            // choose-client - List clients interactively
+            "choose-client" => {
+                // Single-client model — returns current client info
+                let resp = send_control_with_response("list-clients\n".to_string())?;
+                print!("{}", resp);
+                return Ok(());
+            }
+            // respawn-window - Respawn active pane in window
+            "respawn-window" | "respawnw" => {
+                send_control("respawn-window\n".to_string())?;
+                return Ok(());
+            }
+            // link-window - Link a window (stub)
+            "link-window" | "linkw" => {
+                // Accepted for compatibility
+                return Ok(());
+            }
+            // unlink-window - Unlink a window
+            "unlink-window" | "unlinkw" => {
+                send_control("unlink-window\n".to_string())?;
+                return Ok(());
+            }
             _ => {
                 // Unknown command - print error and exit
                 if !cmd.is_empty() {
@@ -1604,16 +1963,18 @@ fn main() -> io::Result<()> {
             let _ = std::fs::remove_file(&port_path);
             // No existing session - create one in background
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("server").arg("-s").arg(&session_name);
+            let server_args: Vec<String> = vec!["server".into(), "-s".into(), session_name.clone()];
             #[cfg(windows)]
+            crate::platform::spawn_server_hidden(&exe, &server_args)?;
+            #[cfg(not(windows))]
             {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                const DETACHED_PROCESS: u32 = 0x00000008;
-                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+                let mut cmd = std::process::Command::new(&exe);
+                for a in &server_args { cmd.arg(a); }
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             }
-            let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             
             // Wait for server to start
             for _ in 0..20 {

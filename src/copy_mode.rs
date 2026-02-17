@@ -18,7 +18,9 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_scroll_offset = 0;
     app.copy_selection_mode = crate::types::SelectionMode::Char;
     app.copy_anchor = None;
-    app.copy_pos = None;
+    // Initialize copy_pos from the terminal cursor so the cursor is
+    // visible immediately on entering copy mode (fixes #25).
+    app.copy_pos = current_prompt_pos(app);
     app.copy_find_char_pending = None;
 }
 

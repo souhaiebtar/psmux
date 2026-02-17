@@ -1,3 +1,115 @@
+/// Spawn a server process with a hidden console window on Windows.
+///
+/// Uses raw `CreateProcessW` with `STARTF_USESHOWWINDOW` + `SW_HIDE` and
+/// `CREATE_NEW_CONSOLE` so that ConPTY has a real console session while the
+/// window remains invisible.  This replicates the behaviour of
+/// `Start-Process -WindowStyle Hidden` in PowerShell.
+#[cfg(windows)]
+pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct STARTUPINFOW {
+        cb: u32,
+        lpReserved: *mut u16,
+        lpDesktop: *mut u16,
+        lpTitle: *mut u16,
+        dwX: u32,
+        dwY: u32,
+        dwXSize: u32,
+        dwYSize: u32,
+        dwXCountChars: u32,
+        dwYCountChars: u32,
+        dwFillAttribute: u32,
+        dwFlags: u32,
+        wShowWindow: u16,
+        cbReserved2: u16,
+        lpReserved2: *mut u8,
+        hStdInput: isize,
+        hStdOutput: isize,
+        hStdError: isize,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESS_INFORMATION {
+        hProcess: isize,
+        hThread: isize,
+        dwProcessId: u32,
+        dwThreadId: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateProcessW(
+            lpApplicationName: *const u16,
+            lpCommandLine: *mut u16,
+            lpProcessAttributes: *const std::ffi::c_void,
+            lpThreadAttributes: *const std::ffi::c_void,
+            bInheritHandles: i32,
+            dwCreationFlags: u32,
+            lpEnvironment: *const std::ffi::c_void,
+            lpCurrentDirectory: *const u16,
+            lpStartupInfo: *const STARTUPINFOW,
+            lpProcessInformation: *mut PROCESS_INFORMATION,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const STARTF_USESHOWWINDOW: u32 = 0x00000001;
+    const SW_HIDE: u16 = 0;
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+    // Build command line: "exe" arg1 arg2 ...
+    // Each argument is quoted to handle spaces.
+    let mut cmdline = format!("\"{}\"", exe.display());
+    for arg in args {
+        if arg.contains(' ') || arg.contains('"') {
+            cmdline.push_str(&format!(" \"{}\"", arg.replace('"', "\\\"")));
+        } else {
+            cmdline.push(' ');
+            cmdline.push_str(arg);
+        }
+    }
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline_wide.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // don't inherit handles
+            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Close handles – we don't need to wait for the child.
+    unsafe {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    Ok(())
+}
+
 /// Enable virtual terminal processing on Windows Console Host.
 /// This is required for ANSI color codes to work in conhost.exe (legacy console).
 #[cfg(windows)]
@@ -152,6 +264,11 @@ pub mod mouse_inject {
         fn GetLastError() -> u32;
     }
 
+    /// Console input mode flags
+    const ENABLE_MOUSE_INPUT: u32         = 0x0010;
+    const ENABLE_EXTENDED_FLAGS: u32      = 0x0080;
+    const ENABLE_QUICK_EDIT_MODE: u32     = 0x0040;
+
     #[inline]
     fn debug_log(_msg: &str) {
         // Debug logging disabled for performance.
@@ -246,6 +363,29 @@ pub mod mouse_inject {
                 return false;
             }
 
+            // Ensure ENABLE_MOUSE_INPUT is set on the console so mouse events
+            // are delivered to the foreground process (critical for WSL apps
+            // like htop that rely on wsl.exe relaying MOUSE_EVENT records).
+            {
+                // Re-use the top-level GetConsoleMode/SetConsoleMode declarations
+                // (they use *mut c_void for the handle parameter).
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+                    fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+                }
+                let mut mode: u32 = 0;
+                let h = handle as *mut c_void;
+                if GetConsoleMode(h, &mut mode) != 0 {
+                    let desired = mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+                    // Also disable Quick Edit mode which intercepts mouse events
+                    let desired = desired & !ENABLE_QUICK_EDIT_MODE;
+                    if desired != mode {
+                        SetConsoleMode(h, desired);
+                    }
+                }
+            }
+
             // Write the mouse event
             let record = INPUT_RECORD {
                 event_type: MOUSE_EVENT,
@@ -276,12 +416,131 @@ pub mod mouse_inject {
             result != 0
         }
     }
+
+    /// Inject a VT escape sequence into a child process's console input buffer
+    /// as a series of KEY_EVENT records.
+    ///
+    /// This bypasses ConPTY's VT input parser entirely — the raw characters of
+    /// the escape sequence are delivered directly to the foreground process
+    /// (e.g. wsl.exe) as keyboard input.  wsl.exe forwards them to the Linux
+    /// PTY, where the terminal application (e.g. htop) interprets them as
+    /// mouse events.
+    ///
+    /// This is more reliable than writing to the PTY master pipe because
+    /// ConPTY's input engine may not correctly handle SGR mouse sequences
+    /// written to hInput.
+    pub fn send_vt_sequence(child_pid: u32, sequence: &[u8]) -> bool {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            // Ensure ENABLE_VIRTUAL_TERMINAL_INPUT is set so wsl.exe receives
+            // VT sequences as-is through KEY_EVENT records.
+            {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+                    fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+                }
+                let mut mode: u32 = 0;
+                let h = handle as *mut c_void;
+                if GetConsoleMode(h, &mut mode) != 0 {
+                    let desired = (mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | 0x0200 /*ENABLE_VIRTUAL_TERMINAL_INPUT*/)
+                                  & !ENABLE_QUICK_EDIT_MODE;
+                    if desired != mode {
+                        SetConsoleMode(h, desired);
+                    }
+                }
+            }
+
+            // Build KEY_EVENT records for each byte of the VT sequence.
+            // Each record is a "key down" event with the character set.
+            const KEY_EVENT: u16 = 0x0001;
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct KEY_EVENT_RECORD {
+                key_down: i32,
+                repeat_count: u16,
+                virtual_key_code: u16,
+                virtual_scan_code: u16,
+                u_char: u16,       // UnicodeChar
+                control_key_state: u32,
+            }
+
+            #[repr(C)]
+            struct KEY_INPUT_RECORD {
+                event_type: u16,
+                _padding: u16,
+                event: KEY_EVENT_RECORD,
+            }
+
+            // Build the array of input records
+            let mut records: Vec<KEY_INPUT_RECORD> = Vec::with_capacity(sequence.len());
+            for &byte in sequence {
+                records.push(KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 1,
+                        repeat_count: 1,
+                        virtual_key_code: 0,
+                        virtual_scan_code: 0,
+                        u_char: byte as u16,
+                        control_key_state: 0,
+                    },
+                });
+            }
+
+            let mut written: u32 = 0;
+            let result = WriteConsoleInputW(
+                handle,
+                records.as_ptr() as *const INPUT_RECORD,
+                records.len() as u32,
+                &mut written,
+            );
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+
+            result != 0
+        }
+    }
 }
 
 #[cfg(not(windows))]
 pub mod mouse_inject {
     pub unsafe fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
     pub fn send_mouse_event(_pid: u32, _col: i16, _row: i16, _btn: u32, _flags: u32, _reattach: bool) -> bool { false }
+    pub fn send_vt_sequence(_pid: u32, _sequence: &[u8]) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +1006,59 @@ pub mod process_info {
         let nul = pe.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(pe.sz_exe_file.len());
         String::from_utf16_lossy(&pe.sz_exe_file[..nul]).to_lowercase()
     }
+
+    /// Check if an executable name is a VT bridge process (WSL, SSH, etc.)
+    /// that requires VT mouse injection instead of Win32 console injection.
+    fn is_vt_bridge_exe(name: &str) -> bool {
+        let stem = name.strip_suffix(".exe").unwrap_or(name);
+        matches!(stem, "wsl" | "ssh" | "ubuntu" | "debian" | "kali"
+                      | "fedoraremix" | "opensuse-leap" | "sles" | "arch")
+            || stem.starts_with("wsl")
+    }
+
+    /// Walk the process tree from `root_pid` and check if any descendant
+    /// is a VT bridge process (wsl.exe, ssh.exe, etc.).
+    /// This is used for mouse injection: VT bridge processes need VT mouse
+    /// sequences written to the PTY master, not Win32 MOUSE_EVENT records.
+    pub fn has_vt_bridge_descendant(root_pid: u32) -> bool {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE || snap == 0 { return false; }
+
+            let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(256);
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snap, &mut pe) != 0 {
+                let name = exe_name_from_entry(&pe);
+                entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
+                while Process32NextW(snap, &mut pe) != 0 {
+                    let name = exe_name_from_entry(&pe);
+                    entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
+                }
+            }
+            CloseHandle(snap);
+
+            // BFS from root_pid to check all descendants
+            let mut queue: Vec<u32> = vec![root_pid];
+            let mut head = 0;
+            while head < queue.len() {
+                let parent = queue[head];
+                head += 1;
+                for (pid, ppid, name) in &entries {
+                    if *ppid == parent && *pid != root_pid
+                        && !queue.contains(pid)
+                    {
+                        if is_vt_bridge_exe(name) {
+                            return true;
+                        }
+                        queue.push(*pid);
+                    }
+                }
+            }
+            false
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -755,4 +1067,5 @@ pub mod process_info {
     pub fn get_process_cwd(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_process_name(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
+    pub fn has_vt_bridge_descendant(_root_pid: u32) -> bool { false }
 }

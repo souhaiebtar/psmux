@@ -1,13 +1,13 @@
 $ErrorActionPreference = 'Stop'
 
 $toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
-$url64 = 'https://github.com/marlocarlo/psmux/releases/download/v0.3.0/psmux-v0.3.0-windows-x64.zip'
+$url64 = 'https://github.com/marlocarlo/psmux/releases/download/v0.3.5/psmux-v0.3.5-windows-x64.zip'
 
 $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
   unzipLocation  = $toolsDir
   url64bit       = $url64
-  checksum64     = 'EFD837DE03C013A356FC48F83AFE9F035FA1F9F5DECC84E1CD3A012CE7870C47'
+  checksum64     = 'PLACEHOLDER_WILL_BE_COMPUTED_BY_CI'
   checksumType64 = 'sha256'
 }
 

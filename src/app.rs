@@ -50,7 +50,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let dir = format!("{}\\.psmux", home);
     let _ = std::fs::create_dir_all(&dir);
-    let regpath = format!("{}\\{}.port", dir, app.session_name);
+    let regpath = format!("{}\\{}.port", dir, app.port_file_base());
     let _ = std::fs::write(&regpath, port.to_string());
     thread::spawn(move || {
         for conn in listener.incoming() {

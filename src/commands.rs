@@ -324,14 +324,21 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
         "save-buffer" => { if let Some(file) = parts.get(1) { save_latest_buffer(app, file)?; } }
         "list-sessions" => { println!("default"); }
         "attach-session" => { }
-        "next-window" => { app.active_idx = (app.active_idx + 1) % app.windows.len(); }
-        "previous-window" => { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }
+        "next-window" => {
+            app.last_window_idx = app.active_idx;
+            app.active_idx = (app.active_idx + 1) % app.windows.len();
+        }
+        "previous-window" => {
+            app.last_window_idx = app.active_idx;
+            app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+        }
         "select-window" => {
             if let Some(tidx) = parts.iter().position(|p| *p == "-t").and_then(|i| parts.get(i+1)) {
                 if let Some(n) = parse_window_target(tidx) {
                     if n >= app.window_base_index {
                         let internal_idx = n - app.window_base_index;
                         if internal_idx < app.windows.len() {
+                            app.last_window_idx = app.active_idx;
                             app.active_idx = internal_idx;
                         }
                     }

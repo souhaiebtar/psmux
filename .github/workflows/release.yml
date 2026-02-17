@@ -119,3 +119,164 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-chocolatey:
+    name: Publish to Chocolatey
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag -replace '^v', ''
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "TAG=$tag" >> $env:GITHUB_OUTPUT
+          Write-Output "Version: $ver  Tag: $tag"
+
+      - name: Download x64 release zip from GitHub Release
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.TAG }}"
+          $zipUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/psmux-$tag-windows-x64.zip"
+          Write-Output "Downloading $zipUrl"
+          Invoke-WebRequest -Uri $zipUrl -OutFile "psmux-release.zip" -MaximumRetryCount 3 -RetryIntervalSec 5
+
+      - name: Compute SHA256 checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "psmux-release.zip" -Algorithm SHA256).Hash
+          echo "SHA256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Output "SHA256: $hash"
+
+      - name: Verify checksum (download again and compare)
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.TAG }}"
+          $zipUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/psmux-$tag-windows-x64.zip"
+          Invoke-WebRequest -Uri $zipUrl -OutFile "psmux-verify.zip" -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash1 = (Get-FileHash "psmux-release.zip" -Algorithm SHA256).Hash
+          $hash2 = (Get-FileHash "psmux-verify.zip" -Algorithm SHA256).Hash
+          if ($hash1 -ne $hash2) {
+            Write-Error "Checksum mismatch! $hash1 vs $hash2"
+            exit 1
+          }
+          Write-Output "Checksum verified: $hash1"
+
+      - name: Generate chocolateyinstall.ps1
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          $tag = "${{ steps.version.outputs.TAG }}"
+          $hash = "${{ steps.checksum.outputs.SHA256 }}"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/psmux-$tag-windows-x64.zip"
+
+          $script = @"
+          `$ErrorActionPreference = 'Stop'
+
+          `$toolsDir = "`$(Split-Path -Parent `$MyInvocation.MyCommand.Definition)"
+          `$url64 = '$url'
+
+          `$packageArgs = @{
+            packageName    = `$env:ChocolateyPackageName
+            unzipLocation  = `$toolsDir
+            url64bit       = `$url64
+            checksum64     = '$hash'
+            checksumType64 = 'sha256'
+          }
+
+          Install-ChocolateyZipPackage @packageArgs
+
+          # Create shims for psmux, pmux, and tmux
+          `$psmuxPath = Join-Path `$toolsDir "psmux.exe"
+          `$pmuxPath = Join-Path `$toolsDir "pmux.exe"
+          `$tmuxPath = Join-Path `$toolsDir "tmux.exe"
+
+          Install-BinFile -Name "psmux" -Path `$psmuxPath
+          Install-BinFile -Name "pmux" -Path `$pmuxPath
+          Install-BinFile -Name "tmux" -Path `$tmuxPath
+          "@
+
+          # Remove leading whitespace from here-string indentation
+          $script = ($script -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+
+          New-Item -ItemType Directory -Path "choco-pkg/tools" -Force | Out-Null
+          Set-Content -Path "choco-pkg/tools/chocolateyinstall.ps1" -Value $script -NoNewline
+          Write-Output "Generated chocolateyinstall.ps1 with checksum $hash"
+
+      - name: Generate chocolateyuninstall.ps1
+        shell: pwsh
+        run: |
+          $script = @"
+          Uninstall-BinFile -Name "psmux"
+          Uninstall-BinFile -Name "pmux"
+          Uninstall-BinFile -Name "tmux"
+          "@
+          $script = ($script -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+          Set-Content -Path "choco-pkg/tools/chocolateyuninstall.ps1" -Value $script -NoNewline
+
+      - name: Generate nuspec
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          $nuspec = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+            <metadata>
+              <id>psmux</id>
+              <version>$ver</version>
+              <title>psmux - Terminal Multiplexer for Windows</title>
+              <authors>marlocarlo</authors>
+              <owners>marlocarlo</owners>
+              <licenseUrl>https://github.com/marlocarlo/psmux/blob/master/LICENSE</licenseUrl>
+              <projectUrl>https://github.com/marlocarlo/psmux</projectUrl>
+              <requireLicenseAcceptance>false</requireLicenseAcceptance>
+              <description>Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal. Includes psmux, pmux, and tmux commands.</description>
+              <summary>Terminal multiplexer for Windows (tmux alternative)</summary>
+              <releaseNotes>https://github.com/marlocarlo/psmux/releases</releaseNotes>
+              <tags>terminal multiplexer tmux powershell cli windows psmux pmux</tags>
+              <packageSourceUrl>https://github.com/marlocarlo/psmux</packageSourceUrl>
+              <docsUrl>https://github.com/marlocarlo/psmux#readme</docsUrl>
+              <bugTrackerUrl>https://github.com/marlocarlo/psmux/issues</bugTrackerUrl>
+            </metadata>
+            <files>
+              <file src="tools\**" target="tools" />
+            </files>
+          </package>
+          "@
+          $nuspec = ($nuspec -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+          Set-Content -Path "choco-pkg/psmux.nuspec" -Value $nuspec -NoNewline
+
+      - name: Pack Chocolatey package
+        shell: pwsh
+        run: |
+          cd choco-pkg
+          choco pack psmux.nuspec
+          Get-ChildItem *.nupkg
+
+      - name: Push to Chocolatey
+        shell: pwsh
+        run: |
+          cd choco-pkg
+          $nupkg = (Get-ChildItem *.nupkg)[0].Name
+          choco push $nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          Write-Output "Successfully pushed $nupkg to Chocolatey"

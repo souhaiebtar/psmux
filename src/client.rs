@@ -11,7 +11,7 @@ use crate::layout::LayoutJson;
 use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
-use crate::config::parse_key_string;
+use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
@@ -215,10 +215,29 @@ fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
 }
 
 /// Check if any leaf in a LayoutJson subtree is the active pane.
-fn has_active_leaf(node: &LayoutJson) -> bool {
+/// Compute the rectangle of the active pane by searching the LayoutJson tree.
+fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
     match node {
-        LayoutJson::Leaf { active, .. } => *active,
-        LayoutJson::Split { children, .. } => children.iter().any(|c| has_active_leaf(c)),
+        LayoutJson::Leaf { active, .. } => {
+            if *active { Some(area) } else { None }
+        }
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() {
+                    if let Some(r) = compute_active_rect_json(child, rects[i]) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
     }
 }
 
@@ -312,12 +331,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut win_status_fmt: String = "#I:#W#F".to_string();
     let mut win_status_current_fmt: String = "#I:#W#F".to_string();
     let mut win_status_sep: String = " ".to_string();
+    let mut win_status_style: Option<(Option<Color>, Option<Color>, bool)> = None;
+    let mut win_status_current_style: Option<(Option<Color>, Option<Color>, bool)> = None;
+    // Synced bindings from server (updated each frame from DumpState)
+    let mut synced_bindings: Vec<BindingEntry> = Vec::new();
 
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool, #[serde(default)] tab_text: String }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
+
+    /// A single key binding synced from the server.
+    #[derive(serde::Deserialize, Clone, Debug)]
+    struct BindingEntry {
+        /// Key table name (e.g. "prefix", "root")
+        t: String,
+        /// Key string (e.g. "C-a", "-", "F12")
+        k: String,
+        /// Command string (e.g. "split-window -v")
+        c: String,
+        /// Whether the binding is repeatable
+        #[serde(default)]
+        r: bool,
+    }
 
     #[derive(serde::Deserialize)]
     struct DumpState {
@@ -350,9 +387,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         /// window-status-separator
         #[serde(default)]
         wss: Option<String>,
+        /// window-status-style
+        #[serde(default)]
+        ws_style: Option<String>,
+        /// window-status-current-style
+        #[serde(default)]
+        wsc_style: Option<String>,
         /// clock-mode active
         #[serde(default)]
         clock_mode: bool,
+        /// Dynamic key bindings from server
+        #[serde(default)]
+        bindings: Vec<BindingEntry>,
     }
 
     let mut cmd_batch: Vec<String> = Vec::new();
@@ -360,6 +406,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut prev_dump_buf = String::new();
     let mut last_key_send_time: Option<Instant> = None;
     let mut dump_in_flight = false;
+
+    // Diagnostic latency log: set PSMUX_LATENCY_LOG=1 to enable
+    let latency_log_enabled = env::var("PSMUX_LATENCY_LOG").unwrap_or_default() == "1";
+    let mut latency_log: Option<std::fs::File> = if latency_log_enabled {
+        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+        let path = format!("{}\\.psmux\\latency.log", home);
+        std::fs::File::create(&path).ok()
+    } else { None };
+    let mut loop_count: u64 = 0;
+    let mut last_key_char: Option<char> = None;
+    let mut key_send_instant: Option<Instant> = None; // when the key was SENT to server
+
     // Text selection state (client-side only, left-click drag like pwsh)
     let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
     let mut rsel_end: Option<(u16, u16)> = None;
@@ -367,12 +425,34 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
     loop {
+        // Expire stale key_send_instant after 30ms — ConPTY echo should
+        // have arrived by then; stop force-dumping to save CPU.
+        if let Some(ks) = key_send_instant {
+            if ks.elapsed().as_millis() > 30 { key_send_instant = None; }
+        }
         // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
         // Drain channel, keeping only the most recent frame.
         let mut got_frame = false;
+        let mut nc_count = 0u32;
         loop {
             match frame_rx.try_recv() {
-                Ok(line) => { dump_buf = line; got_frame = true; dump_in_flight = false; }
+                Ok(line) => {
+                    if line.trim() == "NC" {
+                        nc_count += 1;
+                        // Server says nothing changed — release dump_in_flight
+                        // without touching dump_buf (saves 50-100KB clone + parse).
+                        dump_in_flight = false;
+                        last_dump_time = Instant::now();
+                        // If we're waiting for a key echo, force an
+                        // immediate dump-state re-request (~1ms TCP RTT)
+                        // instead of waiting the full 10ms typing interval.
+                        if key_send_instant.is_some() {
+                            force_dump = true;
+                        }
+                    } else {
+                        dump_buf = line; got_frame = true; dump_in_flight = false;
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => { quit = true; break; }
             }
@@ -386,12 +466,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             if kt.elapsed().as_millis() > 100 { last_key_send_time = None; }
         }
         let typing_active = last_key_send_time.is_some();
-        // When typing: dump ASAP, round-trip is the natural rate limiter.
+        // When typing: cap at ~100fps to avoid flooding the server with
+        // dump-state requests (each one is ~50-100KB of JSON over TCP).
         // When idle: 50ms refresh (20fps) saves CPU.
         let poll_ms = if got_frame { 0 }
             else if dump_in_flight { 1 }
             else if force_dump { 0 }
-            else if typing_active { 0 }             // dump immediately — no artificial wait
+            else if typing_active {
+                // Rate-limit to ~100fps (10ms) when typing.  The snapshot-
+                // based serialisation in dump_layout_json_fast now holds
+                // the parser mutex for only ~1ms (cell snapshot), so
+                // polling at 10ms no longer starves the ConPTY reader
+                // thread.  10ms is notably shorter than ConPTY's ~16ms
+                // render interval, avoiding systematic alignment delays.
+                let remaining = 10u64.saturating_sub(since_dump);
+                remaining
+            }
             else {
                 let idle_frame: u64 = 50;
                 let remaining = idle_frame.saturating_sub(since_dump);
@@ -403,16 +493,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
-                        let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
-                            || matches!(key.code, KeyCode::Char('\x11'));
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
                         let is_prefix = (key.code, key.modifiers) == prefix_key
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
 
-                        if is_ctrl_q { quit = true; }
                         // Overlay Esc must be checked BEFORE selection-Esc so that
                         // pressing Esc always closes the active overlay first.
-                        else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
+                        if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
                             command_input = false;
                             renaming = false;
                             pane_renaming = false;
@@ -432,7 +519,41 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             selection_changed = true;
                         }
                         else if is_prefix { prefix_armed = true; }
+                        // Check root-table bindings (bind-key -n / bind-key -T root)
+                        // These fire without prefix, before keys are forwarded to PTY
+                        else if !command_input && !renaming && !pane_renaming && !chooser && !tree_chooser && !session_chooser && confirm_cmd.is_none() && {
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
+                            synced_bindings.iter().any(|b| b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple))
+                        } {
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
+                            if let Some(entry) = synced_bindings.iter().find(|b| {
+                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                            }) {
+                                if entry.c == "detach-client" || entry.c == "detach" {
+                                    quit = true;
+                                } else {
+                                    cmd_batch.push(format!("{}\n", entry.c));
+                                }
+                            }
+                        }
                         else if prefix_armed {
+                            // Check user-defined synced bindings FIRST (like server-side input.rs).
+                            // This lets users override any default hardcoded key binding.
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
+                            let user_binding = synced_bindings.iter().find(|b| {
+                                b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                            });
+                            if let Some(entry) = user_binding {
+                                // User-defined binding takes priority
+                                if entry.c == "detach-client" || entry.c == "detach" {
+                                    quit = true;
+                                } else if entry.c.starts_with("confirm-before") || entry.c == "kill-pane" {
+                                    confirm_cmd = Some(entry.c.clone());
+                                } else {
+                                    cmd_batch.push(format!("{}\n", entry.c));
+                                }
+                            } else {
+                            // Default hardcoded bindings (only reached if no user override)
                             match key.code {
                                 KeyCode::Char('c') => { cmd_batch.push("new-window\n".into()); }
                                 KeyCode::Char('%') => { cmd_batch.push("split-window -h\n".into()); }
@@ -683,8 +804,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => { cmd_batch.push("select-layout tiled\n".into()); }
                                 // Display pane info
                                 KeyCode::Char('i') => { cmd_batch.push("display-message\n".into()); }
-                                _ => {}
+                                _ => {
+                                    // No default binding for this key (user bindings already checked above)
+                                }
                             }
+                            } // end of else (no user binding override)
                             prefix_armed = false;
                         } else {
                             match key.code {
@@ -1014,18 +1138,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
             let _ = writer.flush(); // push keys to server NOW
             last_key_send_time = Some(Instant::now());
+            key_send_instant = Some(Instant::now());
+            // Force immediate dump-state so we start the echo-detection
+            // polling chain right away (eliminates 0-10ms initial wait).
+            force_dump = true;
         }
 
         // ── STEP 2b: Request screen update (non-blocking) ────────────────
-        // Send dump-state ASAP when typing. The dump_in_flight flag naturally
-        // rate-limits to 1 outstanding request (round-trip = ~5-10ms).
-        // No artificial echo wait — the server processes keys before dumps
-        // in each batch, so ConPTY gets the input before serialization.
+        // Rate-limit dump-state requests to avoid flooding the server.
+        // dump_in_flight prevents >1 concurrent request; the interval check
+        // ensures we don't re-request faster than ~100fps when typing.
         let overlays_active = command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some();
         let should_dump = if force_dump || size_changed {
             true
         } else if typing_active {
-            true  // always request — dump_in_flight prevents flooding
+            since_dump >= 10  // ~100fps cap when typing (matches poll_ms)
         } else {
             let idle_frame: u64 = if overlays_active { 33 } else { 50 };
             since_dump >= idle_frame
@@ -1050,6 +1177,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
         // Parse the frame (use prev_dump_buf for selection-only redraws)
         let frame_to_parse = if got_frame && dump_buf != prev_dump_buf { &dump_buf } else { &prev_dump_buf };
+        let _t_parse = Instant::now();
         let state: DumpState = match serde_json::from_str(frame_to_parse) {
             Ok(s) => s,
             Err(_) => {
@@ -1058,6 +1186,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 continue;
             }
         };
+        let _parse_us = _t_parse.elapsed().as_micros();
 
         let root = state.layout;
         let windows = state.windows;
@@ -1090,6 +1219,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 status_bold = bold;
             }
         }
+
+        // Sync key bindings from server
+        if !state.bindings.is_empty() || !synced_bindings.is_empty() {
+            synced_bindings = state.bindings;
+        }
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             if !sl.is_empty() { custom_status_left = Some(sl); }
@@ -1114,6 +1248,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         if let Some(ref f) = state.wsf { if !f.is_empty() { win_status_fmt = f.clone(); } }
         if let Some(ref f) = state.wscf { if !f.is_empty() { win_status_current_fmt = f.clone(); } }
         if let Some(ref s) = state.wss { win_status_sep = s.clone(); }
+        // Update window-status styles
+        if let Some(ref s) = state.ws_style {
+            if !s.is_empty() {
+                win_status_style = Some(parse_tmux_style(s));
+            }
+        }
+        if let Some(ref s) = state.wsc_style {
+            if !s.is_empty() {
+                win_status_current_style = Some(parse_tmux_style(s));
+            }
+        }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
         let sel_s = rsel_start;
@@ -1169,7 +1314,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 }
             }
 
-            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool) {
+            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, active_rect: Option<Rect>) {
                 match node {
                     LayoutJson::Leaf {
                         id: _,
@@ -1185,6 +1330,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         sel_start_col,
                         sel_end_row,
                         sel_end_col,
+                        copy_cursor_row,
+                        copy_cursor_col,
                         content,
                         rows_v2,
                     } => {
@@ -1295,6 +1442,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
                             f.set_cursor(cx, cy);
                         }
+
+                        // In copy mode, show cursor at copy_pos with a
+                        // highlighted (reverse-video) cell so the user can see
+                        // where the cursor is before starting selection.
+                        if *copy_mode && *active {
+                            if let (Some(cr), Some(cc)) = (copy_cursor_row, copy_cursor_col) {
+                                let cr = (*cr).min(inner.height.saturating_sub(1));
+                                let cc = (*cc).min(inner.width.saturating_sub(1));
+                                let cy = inner.y + cr;
+                                let cx = inner.x + cc;
+                                f.set_cursor(cx, cy);
+                                // Highlight the cursor cell with reverse video
+                                let buf = f.buffer_mut();
+                                let buf_area = buf.area;
+                                if cy >= buf_area.y && cy < buf_area.y + buf_area.height
+                                    && cx >= buf_area.x && cx < buf_area.x + buf_area.width
+                                {
+                                    let idx = (cy - buf_area.y) as usize * buf_area.width as usize
+                                        + (cx - buf_area.x) as usize;
+                                    if idx < buf.content.len() {
+                                        let cell = &mut buf.content[idx];
+                                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                                    }
+                                }
+                            }
+                        }
                     }
                     LayoutJson::Split { kind, sizes, children } => {
                         let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
@@ -1307,39 +1480,91 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
                         // Render children first
                         for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode); }
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, active_rect); }
                         }
 
-                        // Draw separator lines between children using direct buffer access
+                        // Draw separator lines between children using direct buffer access.
+                        let border_style = Style::default().fg(border_fg);
+                        let active_border_style = Style::default().fg(active_border_fg);
                         let buf = f.buffer_mut();
                         for i in 0..children.len().saturating_sub(1) {
                             if i >= rects.len() { break; }
-                            let left_active = has_active_leaf(&children[i]);
-                            let right_active = children.get(i + 1).map_or(false, |c| has_active_leaf(c));
-                            let sep_fg = if left_active || right_active { active_border_fg } else { border_fg };
-                            let sep_style = Style::default().fg(sep_fg);
+
+                            // When both neighbours are direct leaves, use the midpoint
+                            // half-highlight so the colored half indicates which side
+                            // is active.  For nested splits, use adjacency to the
+                            // computed active pane rect so only the correct portion of
+                            // the separator is highlighted.
+                            let both_leaves = matches!(&children[i], LayoutJson::Leaf { .. })
+                                && matches!(children.get(i + 1), Some(LayoutJson::Leaf { .. }));
 
                             if is_horizontal {
+                                // Vertical separator line between left/right children.
                                 let sep_x = rects[i].x + rects[i].width;
                                 if sep_x < buf.area.x + buf.area.width {
-                                    for y in area.y..area.y + area.height {
-                                        let idx = (y - buf.area.y) as usize * buf.area.width as usize
-                                            + (sep_x - buf.area.x) as usize;
-                                        if idx < buf.content.len() {
-                                            buf.content[idx].set_char('│');
-                                            buf.content[idx].set_style(sep_style);
+                                    if both_leaves {
+                                        let left_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
+                                        let right_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
+                                        let left_sty = if left_active { active_border_style } else { border_style };
+                                        let right_sty = if right_active { active_border_style } else { border_style };
+                                        let mid_y = area.y + area.height / 2;
+                                        for y in area.y..area.y + area.height {
+                                            let sty = if y < mid_y { left_sty } else { right_sty };
+                                            let idx = (y - buf.area.y) as usize * buf.area.width as usize
+                                                + (sep_x - buf.area.x) as usize;
+                                            if idx < buf.content.len() {
+                                                buf.content[idx].set_char('│');
+                                                buf.content[idx].set_style(sty);
+                                            }
+                                        }
+                                    } else {
+                                        for y in area.y..area.y + area.height {
+                                            let active = active_rect.map_or(false, |ar| {
+                                                y >= ar.y && y < ar.y + ar.height
+                                                && (sep_x == ar.x + ar.width || sep_x + 1 == ar.x)
+                                            });
+                                            let sty = if active { active_border_style } else { border_style };
+                                            let idx = (y - buf.area.y) as usize * buf.area.width as usize
+                                                + (sep_x - buf.area.x) as usize;
+                                            if idx < buf.content.len() {
+                                                buf.content[idx].set_char('│');
+                                                buf.content[idx].set_style(sty);
+                                            }
                                         }
                                     }
                                 }
                             } else {
+                                // Horizontal separator line between top/bottom children.
                                 let sep_y = rects[i].y + rects[i].height;
                                 if sep_y < buf.area.y + buf.area.height {
-                                    for x in area.x..area.x + area.width {
-                                        let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
-                                            + (x - buf.area.x) as usize;
-                                        if idx < buf.content.len() {
-                                            buf.content[idx].set_char('─');
-                                            buf.content[idx].set_style(sep_style);
+                                    if both_leaves {
+                                        let top_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
+                                        let bot_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
+                                        let top_sty = if top_active { active_border_style } else { border_style };
+                                        let bot_sty = if bot_active { active_border_style } else { border_style };
+                                        let mid_x = area.x + area.width / 2;
+                                        for x in area.x..area.x + area.width {
+                                            let sty = if x < mid_x { top_sty } else { bot_sty };
+                                            let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
+                                                + (x - buf.area.x) as usize;
+                                            if idx < buf.content.len() {
+                                                buf.content[idx].set_char('─');
+                                                buf.content[idx].set_style(sty);
+                                            }
+                                        }
+                                    } else {
+                                        for x in area.x..area.x + area.width {
+                                            let active = active_rect.map_or(false, |ar| {
+                                                x >= ar.x && x < ar.x + ar.width
+                                                && (sep_y == ar.y + ar.height || sep_y + 1 == ar.y)
+                                            });
+                                            let sty = if active { active_border_style } else { border_style };
+                                            let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
+                                                + (x - buf.area.x) as usize;
+                                            if idx < buf.content.len() {
+                                                buf.content[idx].set_char('─');
+                                                buf.content[idx].set_style(sty);
+                                            }
                                         }
                                     }
                                 }
@@ -1349,7 +1574,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 }
             }
 
-            render_json(f, &root, chunks[0], dim_preds, pane_border_fg, pane_active_border_fg, clock_active);
+            let active_rect = compute_active_rect_json(&root, chunks[0]);
+            render_json(f, &root, chunks[0], dim_preds, pane_border_fg, pane_active_border_fg, clock_active, active_rect);
 
             // ── Left-click drag text selection overlay ────────────────
             if let (Some(s), Some(e)) = (sel_s, sel_e) {
@@ -1486,13 +1712,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
                 }
                 if w.active {
-                    status_spans.push(Span::styled(
-                        tab_text,
+                    let active_style = if let Some((fg, bg, bold)) = win_status_current_style {
+                        let mut s = Style::default();
+                        if let Some(c) = fg { s = s.fg(c); } else { s = s.fg(Color::Black); }
+                        if let Some(c) = bg { s = s.bg(c); } else { s = s.bg(Color::Yellow); }
+                        if bold { s = s.add_modifier(Modifier::BOLD); }
+                        s
+                    } else {
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    status_spans.push(Span::styled(tab_text, active_style));
                 } else if w.activity {
                     // Activity visual notification: reverse video for windows with activity
                     status_spans.push(Span::styled(
@@ -1503,7 +1735,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             .add_modifier(Modifier::BOLD),
                     ));
                 } else {
-                    status_spans.push(Span::styled(tab_text, sb_base));
+                    let inactive_style = if let Some((fg, bg, bold)) = win_status_style {
+                        let mut s = Style::default();
+                        if let Some(c) = fg { s = s.fg(c); }
+                        if let Some(c) = bg { s = s.bg(c); }
+                        if bold { s = s.add_modifier(Modifier::BOLD); }
+                        s
+                    } else {
+                        sb_base
+                    };
+                    status_spans.push(Span::styled(tab_text, inactive_style));
                 }
             }
             // Right portion: custom status_right (already expanded by server)
@@ -1553,7 +1794,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 f.render_widget(para, overlay.inner(oa));
             }
         })?;
+        let _render_us = _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128);
         last_dump_time = Instant::now();
+        // Latency log: measure full cycle from key-send to render-complete
+        if let (Some(ref mut log), Some(ks)) = (&mut latency_log, key_send_instant) {
+            let elapsed_ms = ks.elapsed().as_millis();
+            loop_count += 1;
+            use std::io::Write;
+            let _ = writeln!(log, "L{}: key->render {}ms  parse={}us  render={}us  json_len={}  since_dump={}",
+                loop_count, elapsed_ms, _parse_us, _render_us, dump_buf.len(), since_dump);
+            // Only clear after we rendered a DIFFERENT frame (echo arrived)
+            if got_frame && dump_buf != prev_dump_buf {
+                let _ = writeln!(log, "L{}: ECHO VISIBLE after {}ms  (parse={}us render={}us)",
+                    loop_count, elapsed_ms, _parse_us, _render_us);
+                key_send_instant = None;
+            }
+        }
         selection_changed = false;
         // Cache this frame so we can skip identical re-renders.
         // Only update cache when we got a genuinely new frame (not selection-only redraw)
@@ -1563,6 +1819,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         // DON'T clear last_key_send_time — keep fast-dumping for 100ms
         // after last keystroke so we catch the ConPTY echo promptly.
         // The timer expires naturally in the poll_ms calculation above.
+        // Clear key_send_instant once echo arrives (frame differs).
+        if got_frame && dump_buf != prev_dump_buf {
+            key_send_instant = None;
+        }
         force_dump = false;
     }
 

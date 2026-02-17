@@ -9,6 +9,7 @@ use crate::types::*;
 use crate::tree::*;
 use crate::pane::*;
 use crate::commands::*;
+use crate::config::normalize_key_for_binding;
 use crate::copy_mode::*;
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
@@ -37,12 +38,6 @@ fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, 
 }
 
 pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
-    let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
-        || matches!(key.code, KeyCode::Char('\x11'));
-    if is_ctrl_q {
-        return Ok(true);
-    }
-
     match app.mode {
         Mode::Passthrough => {
             let is_ctrl_b = (key.code, key.modifiers) == app.prefix_key
@@ -52,7 +47,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 return Ok(false);
             }
             // Check root key table for bindings (bind-key -n / bind-key -T root)
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 return execute_action(app, &bind.action);
             }
@@ -62,7 +57,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::Prefix { armed_at } => {
             let elapsed = armed_at.elapsed().as_millis() as u64;
             
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get("prefix").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 if bind.repeat {
                     // Stay in prefix mode for repeat-time window
@@ -109,6 +104,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     if idx >= app.window_base_index {
                         let internal_idx = idx - app.window_base_index;
                         if internal_idx < app.windows.len() {
+                            app.last_window_idx = app.active_idx;
                             app.active_idx = internal_idx;
                         }
                     }
@@ -123,12 +119,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('n') => {
                     if !app.windows.is_empty() {
+                        app.last_window_idx = app.active_idx;
                         app.active_idx = (app.active_idx + 1) % app.windows.len();
                     }
                     true
                 }
                 KeyCode::Char('p') => {
                     if !app.windows.is_empty() {
+                        app.last_window_idx = app.active_idx;
                         app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
                     }
                     true
@@ -470,7 +468,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::CopyMode => {
             // Check copy-mode key table for user bindings first (used by plugins like tmux-yank)
             let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get(table_name)
                 .and_then(|t| t.iter().find(|b| b.key == key_tuple))
                 .cloned()
@@ -495,6 +493,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     app.mode = Mode::Passthrough; 
                     app.copy_anchor = None; 
                     app.copy_pos = None; 
+                    app.copy_scroll_offset = 0;
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut parser) = p.term.lock() {
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                }
+                // Ctrl+C exits copy mode (tmux parity, fixes #25)
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Passthrough;
+                    app.copy_anchor = None;
+                    app.copy_pos = None;
                     app.copy_scroll_offset = 0;
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
@@ -981,7 +992,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         fn write_all_panes(node: &mut Node, data: &[u8]) {
             match node {
-                Node::Leaf(p) if !p.dead => { let _ = p.master.write_all(data); }
+                Node::Leaf(p) if !p.dead => { let _ = p.master.write_all(data); let _ = p.master.flush(); }
                 Node::Leaf(_) => {}
                 Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
             }
@@ -992,6 +1003,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if !active.dead {
                 let _ = active.master.write_all(&encoded);
+                let _ = active.master.flush();
             }
         }
     }
@@ -1089,21 +1101,36 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 }
             }
 
-            // Forward left-click to child pane via Windows Console API
+            // Forward left-click to child pane
             if !on_border {
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                         let col = me.column.saturating_sub(area.x + 1) as i16;
                         let row = me.row.saturating_sub(area.y + 1) as i16;
-                        if active.child_pid.is_none() {
-                            active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
-                        }
-                        if let Some(pid) = active.child_pid {
-                            crate::platform::mouse_inject::send_mouse_event(
-                                pid, col, row,
-                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
-                                true,
-                            );
+                        // Check if child has requested VT mouse protocol
+                        let (mode, enc) = {
+                            if let Ok(parser) = active.term.lock() {
+                                let s = parser.screen();
+                                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                            } else {
+                                (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
+                            }
+                        };
+                        if mode != vt100::MouseProtocolMode::None {
+                            let vt_col = (col + 1).max(1) as u16;
+                            let vt_row = (row + 1).max(1) as u16;
+                            write_mouse_event(&mut active.master, 0, vt_col, vt_row, true, enc);
+                        } else {
+                            if active.child_pid.is_none() {
+                                active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
+                            }
+                            if let Some(pid) = active.child_pid {
+                                crate::platform::mouse_inject::send_mouse_event(
+                                    pid, col, row,
+                                    crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
+                                    true,
+                                );
+                            }
                         }
                     }
                 }
@@ -1122,11 +1149,23 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             if was_dragging {
                 resize_all_panes(app);
             } else if let Some(area) = active_area {
-                // Forward mouse release via Windows Console API
+                // Forward mouse release
                 if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                     let col = me.column.saturating_sub(area.x + 1) as i16;
                     let row = me.row.saturating_sub(area.y + 1) as i16;
-                    if let Some(pid) = active.child_pid {
+                    let (mode, enc) = {
+                        if let Ok(parser) = active.term.lock() {
+                            let s = parser.screen();
+                            (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                        } else {
+                            (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
+                        }
+                    };
+                    if mode != vt100::MouseProtocolMode::None {
+                        let vt_col = (col + 1).max(1) as u16;
+                        let vt_row = (row + 1).max(1) as u16;
+                        write_mouse_event(&mut active.master, 0, vt_col, vt_row, false, enc);
+                    } else if let Some(pid) = active.child_pid {
                         crate::platform::mouse_inject::send_mouse_event(pid, col, row, 0, 0, true);
                     }
                 }
@@ -1142,18 +1181,33 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
             } else {
-                // Forward drag via Windows Console API
+                // Forward drag to child pane
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                         let col = me.column.saturating_sub(area.x + 1) as i16;
                         let row = me.row.saturating_sub(area.y + 1) as i16;
-                        if let Some(pid) = active.child_pid {
-                            crate::platform::mouse_inject::send_mouse_event(
-                                pid, col, row,
-                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
-                                crate::platform::mouse_inject::MOUSE_MOVED,
-                                true,
-                            );
+                        let (mode, enc) = {
+                            if let Ok(parser) = active.term.lock() {
+                                let s = parser.screen();
+                                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                            } else {
+                                (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
+                            }
+                        };
+                        if mode != vt100::MouseProtocolMode::None {
+                            let vt_col = (col + 1).max(1) as u16;
+                            let vt_row = (row + 1).max(1) as u16;
+                            // button 0 + 32 = drag modifier
+                            write_mouse_event(&mut active.master, 32, vt_col, vt_row, true, enc);
+                        } else {
+                            if let Some(pid) = active.child_pid {
+                                crate::platform::mouse_inject::send_mouse_event(
+                                    pid, col, row,
+                                    crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
+                                    crate::platform::mouse_inject::MOUSE_MOVED,
+                                    true,
+                                );
+                            }
                         }
                     }
                 }
@@ -1429,6 +1483,18 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
             "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
             "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+            "C-c" | "c-c" => {
+                app.mode = Mode::Passthrough;
+                app.copy_anchor = None;
+                app.copy_pos = None;
+                app.copy_scroll_offset = 0;
+                let win = &mut app.windows[app.active_idx];
+                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                    if let Ok(mut parser) = p.term.lock() {
+                        parser.screen_mut().set_scrollback(0);
+                    }
+                }
+            }
             "C-g" | "c-g" => {
                 app.mode = Mode::Passthrough;
                 app.copy_anchor = None;
@@ -1519,6 +1585,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             }
             _ => {}
         }
+        let _ = p.master.flush();
     }
     Ok(())
 }

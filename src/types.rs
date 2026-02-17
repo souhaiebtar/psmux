@@ -29,6 +29,9 @@ pub struct Pane {
     pub last_infer_title: Instant,
     /// True when the child process has exited but remain-on-exit keeps the pane visible.
     pub dead: bool,
+    /// Cached VT bridge detection result (for mouse injection).
+    /// Updated on first mouse event and refreshed every 2 seconds.
+    pub vt_bridge_cache: Option<(Instant, bool)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -187,6 +190,9 @@ pub struct AppState {
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_name: String,
+    /// -L socket name for namespace isolation (tmux compatible).
+    /// When set, port/key files are stored as `{socket_name}__{session_name}.port`.
+    pub socket_name: Option<String>,
     pub attached_clients: usize,
     pub created_at: chrono::DateTime<Local>,
     pub next_win_id: usize,
@@ -323,10 +329,21 @@ impl AppState {
             copy_search_forward: true,
             copy_find_char_pending: None,
             display_map: Vec::new(),
-            key_tables: std::collections::HashMap::new(),
+            key_tables: {
+                let mut tables = std::collections::HashMap::new();
+                tables.entry("root".to_string()).or_insert_with(Vec::new).push(
+                    Bind {
+                        key: (crossterm::event::KeyCode::Char('q'), crossterm::event::KeyModifiers::CONTROL),
+                        action: Action::Detach,
+                        repeat: false,
+                    },
+                );
+                tables
+            },
             control_rx: None,
             control_port: None,
             session_name,
+            socket_name: None,
             attached_clients: 0,
             created_at: Local::now(),
             next_win_id: 1,
@@ -384,6 +401,17 @@ impl AppState {
             status_justify: "left".to_string(),
         }
     }
+
+    /// Get the port/key file base name, incorporating socket_name for -L namespace isolation.
+    /// When socket_name is set (via -L flag), files are stored as `{socket_name}__{session_name}`.
+    /// Otherwise, just the session_name is used.
+    pub fn port_file_base(&self) -> String {
+        if let Some(ref sn) = self.socket_name {
+            format!("{}__{}", sn, self.session_name)
+        } else {
+            self.session_name.clone()
+        }
+    }
 }
 
 pub struct DragState {
@@ -426,7 +454,9 @@ pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repe
 
 pub enum CtrlReq {
     NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>),  // cmd, name, detached, start_dir, format, resp
     SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, Option<String>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, format, resp
     KillPane,
     CapturePane(mpsc::Sender<String>),
     CapturePaneStyled(mpsc::Sender<String>),
@@ -546,7 +576,14 @@ pub enum CtrlReq {
     RespawnWindow,
     FocusIn,
     FocusOut,
+    CommandPrompt(String),
+    ShowMessages(mpsc::Sender<String>),
 }
+
+/// Global flag set by PTY reader threads when new output arrives.
+/// The server loop checks this to use a shorter recv_timeout, reducing
+/// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
+pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Wait-for operation types
 #[derive(Clone, Copy)]

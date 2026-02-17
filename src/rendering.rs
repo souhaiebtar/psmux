@@ -9,7 +9,7 @@ use crossterm::execute;
 use portable_pty::PtySize;
 
 use crate::types::*;
-use crate::tree::active_pane_mut;
+use crate::tree::{active_pane_mut, split_with_gaps};
 
 pub fn vt_to_color(c: vt100::Color) -> Color {
     match c {
@@ -55,8 +55,10 @@ pub fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
     let dim_preds = app.prediction_dimming;
     let border_style = parse_tmux_style(&app.pane_border_style);
     let active_border_style = parse_tmux_style(&app.pane_active_border_style);
+    let copy_cursor = if matches!(app.mode, Mode::CopyMode) { app.copy_pos } else { None };
     let win = &mut app.windows[app.active_idx];
-    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style);
+    let active_rect = compute_active_rect(&win.root, &win.active_path, area);
+    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style, copy_cursor, active_rect);
 }
 
 pub fn render_node(
@@ -68,16 +70,15 @@ pub fn render_node(
     dim_preds: bool,
     border_style: Style,
     active_border_style: Style,
+    copy_cursor: Option<(u16, u16)>,
+    active_rect: Option<Rect>,
 ) {
     match node {
         Node::Leaf(pane) => {
             let is_active = *cur_path == *active_path;
-            let title = if is_active { "* pane" } else { " pane" };
-            let pane_block = Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(if is_active { active_border_style } else { border_style });
-            let inner = pane_block.inner(area);
+            // No borders on individual panes — separators are drawn by the
+            // parent Split node with tmux-style split coloring.
+            let inner = area;
             let target_rows = inner.height.max(1);
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
@@ -128,12 +129,12 @@ pub fn render_node(
                 }
                 lines.push(Line::from(spans));
             }
-            f.render_widget(pane_block, area);
             f.render_widget(Clear, inner);
             let para = Paragraph::new(Text::from(lines));
             f.render_widget(para, inner);
             if is_active {
-                let (cr, cc) = screen.cursor_position();
+                // In copy mode, use copy_pos for cursor; otherwise use PTY cursor.
+                let (cr, cc) = copy_cursor.unwrap_or_else(|| screen.cursor_position());
                 let cr = cr.min(target_rows.saturating_sub(1));
                 let cc = cc.min(target_cols.saturating_sub(1));
                 let cx = inner.x + cc;
@@ -142,17 +143,124 @@ pub fn render_node(
             }
         }
         Node::Split { kind, sizes, children } => {
-            let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
-            } else { vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()] };
-            let rects = match *kind {
-                LayoutKind::Horizontal => Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area),
-                LayoutKind::Vertical => Layout::default().direction(Direction::Vertical).constraints(constraints).split(area),
-            };
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else { vec![(100 / children.len().max(1) as u16); children.len()] };
+            let is_horizontal = *kind == LayoutKind::Horizontal;
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
             for (i, child) in children.iter_mut().enumerate() {
                 cur_path.push(i);
-                render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style);
+                if i < rects.len() {
+                    render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style, copy_cursor, active_rect);
+                }
                 cur_path.pop();
+            }
+            // Draw separator lines — color each cell based on adjacency to active pane rect.
+            // When both neighbours are direct leaves, use the midpoint half-highlight
+            // so the colored half indicates which side is active.
+            let buf = f.buffer_mut();
+            for i in 0..children.len().saturating_sub(1) {
+                if i >= rects.len() { break; }
+                let both_leaves = matches!(&children[i], Node::Leaf(_))
+                    && matches!(children.get(i + 1), Some(Node::Leaf(_)));
+
+                if is_horizontal {
+                    let sep_x = rects[i].x + rects[i].width;
+                    if sep_x < buf.area.x + buf.area.width {
+                        if both_leaves {
+                            let left_active = cur_path.len() < active_path.len()
+                                && active_path[..cur_path.len()] == cur_path[..]
+                                && active_path[cur_path.len()] == i;
+                            let right_active = cur_path.len() < active_path.len()
+                                && active_path[..cur_path.len()] == cur_path[..]
+                                && active_path[cur_path.len()] == i + 1;
+                            let left_sty = if left_active { active_border_style } else { border_style };
+                            let right_sty = if right_active { active_border_style } else { border_style };
+                            let mid_y = area.y + area.height / 2;
+                            for y in area.y..area.y + area.height {
+                                let sty = if y < mid_y { left_sty } else { right_sty };
+                                let idx = (y - buf.area.y) as usize * buf.area.width as usize + (sep_x - buf.area.x) as usize;
+                                if idx < buf.content.len() {
+                                    buf.content[idx].set_char('│');
+                                    buf.content[idx].set_style(sty);
+                                }
+                            }
+                        } else {
+                            for y in area.y..area.y + area.height {
+                                let active = active_rect.map_or(false, |ar| {
+                                    y >= ar.y && y < ar.y + ar.height
+                                    && (sep_x == ar.x + ar.width || sep_x + 1 == ar.x)
+                                });
+                                let sty = if active { active_border_style } else { border_style };
+                                let idx = (y - buf.area.y) as usize * buf.area.width as usize + (sep_x - buf.area.x) as usize;
+                                if idx < buf.content.len() {
+                                    buf.content[idx].set_char('│');
+                                    buf.content[idx].set_style(sty);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let sep_y = rects[i].y + rects[i].height;
+                    if sep_y < buf.area.y + buf.area.height {
+                        if both_leaves {
+                            let top_active = cur_path.len() < active_path.len()
+                                && active_path[..cur_path.len()] == cur_path[..]
+                                && active_path[cur_path.len()] == i;
+                            let bot_active = cur_path.len() < active_path.len()
+                                && active_path[..cur_path.len()] == cur_path[..]
+                                && active_path[cur_path.len()] == i + 1;
+                            let top_sty = if top_active { active_border_style } else { border_style };
+                            let bot_sty = if bot_active { active_border_style } else { border_style };
+                            let mid_x = area.x + area.width / 2;
+                            for x in area.x..area.x + area.width {
+                                let sty = if x < mid_x { top_sty } else { bot_sty };
+                                let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize + (x - buf.area.x) as usize;
+                                if idx < buf.content.len() {
+                                    buf.content[idx].set_char('─');
+                                    buf.content[idx].set_style(sty);
+                                }
+                            }
+                        } else {
+                            for x in area.x..area.x + area.width {
+                                let active = active_rect.map_or(false, |ar| {
+                                    x >= ar.x && x < ar.x + ar.width
+                                    && (sep_y == ar.y + ar.height || sep_y + 1 == ar.y)
+                                });
+                                let sty = if active { active_border_style } else { border_style };
+                                let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize + (x - buf.area.x) as usize;
+                                if idx < buf.content.len() {
+                                    buf.content[idx].set_char('─');
+                                    buf.content[idx].set_style(sty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compute the rectangle of the active pane by following the active_path through the tree.
+fn compute_active_rect(node: &Node, active_path: &[usize], area: Rect) -> Option<Rect> {
+    match node {
+        Node::Leaf(_) => Some(area),
+        Node::Split { kind, sizes, children } => {
+            if active_path.is_empty() || children.is_empty() { return None; }
+            let idx = active_path[0];
+            if idx >= children.len() { return None; }
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1) as u16); children.len()]
+            };
+            let is_horizontal = *kind == LayoutKind::Horizontal;
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            if idx < rects.len() {
+                compute_active_rect(&children[idx], &active_path[1..], rects[idx])
+            } else {
+                None
             }
         }
     }

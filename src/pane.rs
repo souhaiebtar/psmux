@@ -50,7 +50,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     } else {
         build_command(None)
     };
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -75,6 +75,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
                     parser.process(&local[..n]);
                     drop(parser);
                     dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release);
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
@@ -83,7 +84,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     });
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false };
+    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false });
@@ -104,7 +105,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
     let mut shell_cmd = build_raw_command(raw_args);
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -128,6 +129,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
                     parser.process(&local[..n]);
                     drop(parser);
                     dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release);
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
@@ -135,7 +137,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         }
     });
 
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false };
+    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false });
@@ -156,7 +158,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     } else {
         build_command(None)
     };
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
@@ -167,13 +169,13 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         let mut local = [0u8; 65536];
         loop {
             match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); }
+                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release); }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
         }
     });
-    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid: None, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -200,13 +202,16 @@ pub fn detect_shell() -> CommandBuilder {
 }
 
 /// Set TMUX and TMUX_PANE environment variables on a CommandBuilder.
-/// TMUX format: /tmp/psmux-{server_pid}/default,{server_pid},0
+/// TMUX format: /tmp/psmux-{server_pid}/{socket_name},{port},0
 /// TMUX_PANE format: %{pane_id}
-pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>) {
+/// The socket_name component encodes the -L namespace for child process resolution.
+pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>, socket_name: Option<&str>) {
     let server_pid = std::process::id();
     let port = control_port.unwrap_or(0);
+    let sn = socket_name.unwrap_or("default");
     // Format compatible with tmux: <socket_path>,<pid>,<session_idx>
-    builder.env("TMUX", format!("/tmp/psmux-{}/default,{},0", server_pid, port));
+    // We encode the socket name in the path component for -L namespace resolution
+    builder.env("TMUX", format!("/tmp/psmux-{}/{},{},0", server_pid, sn, port));
     builder.env("TMUX_PANE", format!("%{}", pane_id));
 }
 
