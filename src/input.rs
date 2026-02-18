@@ -942,18 +942,97 @@ pub fn move_focus(app: &mut AppState, dir: FocusDir) {
     for (i, (path, _)) in rects.iter().enumerate() { if *path == win.active_path { active_idx = Some(i); break; } }
     let Some(ai) = active_idx else { return; };
     let (_, arect) = &rects[ai];
-    let mut best: Option<(usize, u32)> = None;
+    if let Some(ni) = find_best_pane_in_direction(&rects, ai, arect, dir) {
+        win.active_path = rects[ni].0.clone();
+    }
+}
+
+/// Spatial pane navigation: find the best pane in the given direction.
+/// Prefers panes that overlap on the perpendicular axis (visually adjacent),
+/// then picks the closest by primary-axis gap, tie-broken by perpendicular
+/// center-distance for intuitive navigation in asymmetric layouts.
+pub fn find_best_pane_in_direction(
+    rects: &[(Vec<usize>, Rect)],
+    ai: usize,
+    arect: &Rect,
+    dir: FocusDir,
+) -> Option<usize> {
+    // Center of the active pane (scaled by 2 to avoid fractional math)
+    let acx = arect.x as i32 * 2 + arect.width as i32;
+    let acy = arect.y as i32 * 2 + arect.height as i32;
+
+    // Check whether two 1-D ranges [a_start, a_start+a_len) and [b_start, b_start+b_len) overlap
+    let ranges_overlap = |a_start: u16, a_len: u16, b_start: u16, b_len: u16| -> bool {
+        let a_end = a_start + a_len;
+        let b_end = b_start + b_len;
+        a_start < b_end && b_start < a_end
+    };
+
+    // (index, primary_gap, perp_center_dist, has_perp_overlap)
+    let mut best: Option<(usize, u32, i32, bool)> = None;
+
     for (i, (_, r)) in rects.iter().enumerate() {
         if i == ai { continue; }
-        let candidate = match dir {
-            FocusDir::Left => if r.x + r.width <= arect.x { Some((arect.x - (r.x + r.width)) as u32) } else { None },
-            FocusDir::Right => if r.x >= arect.x + arect.width { Some((r.x - (arect.x + arect.width)) as u32) } else { None },
-            FocusDir::Up => if r.y + r.height <= arect.y { Some((arect.y - (r.y + r.height)) as u32) } else { None },
-            FocusDir::Down => if r.y >= arect.y + arect.height { Some((r.y - (arect.y + arect.height)) as u32) } else { None },
+        // Primary-axis gap: the pane must be in the correct direction
+        let (primary_gap, perp_overlap) = match dir {
+            FocusDir::Left => {
+                if r.x + r.width > arect.x { continue; }
+                let gap = (arect.x - (r.x + r.width)) as u32;
+                let overlap = ranges_overlap(r.y, r.height, arect.y, arect.height);
+                (gap, overlap)
+            }
+            FocusDir::Right => {
+                if r.x < arect.x + arect.width { continue; }
+                let gap = (r.x - (arect.x + arect.width)) as u32;
+                let overlap = ranges_overlap(r.y, r.height, arect.y, arect.height);
+                (gap, overlap)
+            }
+            FocusDir::Up => {
+                if r.y + r.height > arect.y { continue; }
+                let gap = (arect.y - (r.y + r.height)) as u32;
+                let overlap = ranges_overlap(r.x, r.width, arect.x, arect.width);
+                (gap, overlap)
+            }
+            FocusDir::Down => {
+                if r.y < arect.y + arect.height { continue; }
+                let gap = (r.y - (arect.y + arect.height)) as u32;
+                let overlap = ranges_overlap(r.x, r.width, arect.x, arect.width);
+                (gap, overlap)
+            }
         };
-        if let Some(dist) = candidate { if best.map_or(true, |(_,bd)| dist < bd) { best = Some((i, dist)); } }
+
+        // Perpendicular center distance (how far off-center the candidate is)
+        let rcx = r.x as i32 * 2 + r.width as i32;
+        let rcy = r.y as i32 * 2 + r.height as i32;
+        let perp_dist = match dir {
+            FocusDir::Left | FocusDir::Right => (rcy - acy).abs(),
+            FocusDir::Up | FocusDir::Down => (rcx - acx).abs(),
+        };
+
+        let dominated = if let Some((_, bg, bd, bo)) = best {
+            // Prefer: (1) perp-overlapping over non-overlapping,
+            //         (2) smaller primary gap, (3) smaller perp distance
+            if perp_overlap && !bo {
+                false  // new candidate has overlap, current best doesn't → new wins
+            } else if !perp_overlap && bo {
+                true   // current best has overlap, new doesn't → new loses
+            } else if primary_gap < bg {
+                false  // closer on primary axis
+            } else if primary_gap > bg {
+                true   // farther on primary axis
+            } else {
+                perp_dist >= bd  // same gap → pick closer center
+            }
+        } else {
+            false  // no best yet
+        };
+
+        if !dominated {
+            best = Some((i, primary_gap, perp_dist, perp_overlap));
+        }
     }
-    if let Some((ni, _)) = best { win.active_path = rects[ni].0.clone(); }
+
+    best.map(|(idx, _, _, _)| idx)
 }
 
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {

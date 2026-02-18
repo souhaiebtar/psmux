@@ -500,22 +500,8 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
     let Some(ai) = active_idx else { return; };
     let (_, arect) = &rects[ai];
     
-    let mut best: Option<(usize, u32)> = None;
-    for (i, (_, r)) in rects.iter().enumerate() {
-        if i == ai { continue; }
-        let candidate = match dir {
-            FocusDir::Left => if r.x + r.width <= arect.x { Some((arect.x - (r.x + r.width)) as u32) } else { None },
-            FocusDir::Right => if r.x >= arect.x + arect.width { Some((r.x - (arect.x + arect.width)) as u32) } else { None },
-            FocusDir::Up => if r.y + r.height <= arect.y { Some((arect.y - (r.y + r.height)) as u32) } else { None },
-            FocusDir::Down => if r.y >= arect.y + arect.height { Some((r.y - (arect.y + arect.height)) as u32) } else { None },
-        };
-        if let Some(dist) = candidate { 
-            if best.map_or(true, |(_,bd)| dist < bd) { best = Some((i, dist)); } 
-        }
-    }
-    
-    if let Some((ni, _)) = best { 
-        win.active_path = rects[ni].0.clone(); 
+    if let Some(ni) = crate::input::find_best_pane_in_direction(&rects, ai, arect, dir) {
+        win.active_path = rects[ni].0.clone();
     }
 }
 

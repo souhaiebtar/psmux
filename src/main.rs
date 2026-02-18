@@ -118,15 +118,39 @@ fn main() -> io::Result<()> {
         }
     }
     
-    // Find the actual command by skipping -t/-L and their arguments
-    let cmd_args: Vec<&String> = args.iter().skip(1).filter(|a| {
-        if *a == "-t" || *a == "-L" { return false; }
-        // Check if previous arg was -t or -L
-        if let Some(pos) = args.iter().position(|x| x == *a) {
-            if pos > 0 && (args[pos - 1] == "-t" || args[pos - 1] == "-L") { return false; }
+    // Find the actual command by skipping global -t/-L and their arguments.
+    // -t is stripped everywhere (the global handler already set PSMUX_TARGET_SESSION).
+    // -L is only stripped BEFORE the subcommand (global socket namespace flag);
+    // after the subcommand, -L is kept (e.g. select-pane -L, resize-pane -L).
+    let cmd_args: Vec<&String> = {
+        let mut result = Vec::new();
+        let mut i = 1; // skip binary name
+        let mut found_subcommand = false;
+        while i < args.len() {
+            if !found_subcommand {
+                // Before subcommand: skip global flags with values
+                if (args[i] == "-t" || args[i] == "-L") && i + 1 < args.len() {
+                    i += 2; // skip flag and its value
+                    continue;
+                } else if args[i].starts_with('-') {
+                    i += 1; // skip single global flags (e.g. -v, -V)
+                    continue;
+                } else {
+                    found_subcommand = true;
+                    // fall through to push the subcommand name
+                }
+            } else {
+                // After subcommand: strip only -t (and its value)
+                if args[i] == "-t" && i + 1 < args.len() {
+                    i += 2;
+                    continue;
+                }
+            }
+            result.push(&args[i]);
+            i += 1;
         }
-        true
-    }).collect();
+        result
+    };
     
     let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
     
