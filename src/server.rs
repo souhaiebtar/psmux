@@ -1232,6 +1232,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             "set-titles" => if app.set_titles { "on".into() } else { "off".into() },
             "set-titles-string" => app.set_titles_string.clone(),
             "prediction-dimming" => if app.prediction_dimming { "on".into() } else { "off".into() },
+            "cursor-style" => std::env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "bar".to_string()),
+            "cursor-blink" => if std::env::var("PSMUX_CURSOR_BLINK").unwrap_or_else(|_| "1".to_string()) != "0" { "on".into() } else { "off".into() },
             "default-shell" | "default-command" => app.default_shell.clone(),
             "word-separators" => app.word_separators.clone(),
             "pane-border-style" => app.pane_border_style.clone(),
@@ -1531,16 +1533,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } meta_dirty = true; }
-                CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; }
-                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; }
-                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; }
-                CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); state_dirty = true; }
-                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); state_dirty = true; }
-                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); state_dirty = true; }
-                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); state_dirty = true; }
-                CtrlReq::MouseMove(x,y) => { remote_mouse_motion(&mut app, x, y); }
-                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); state_dirty = true; }
-                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); state_dirty = true; }
+                CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; } }
+                CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; } }
+                CtrlReq::MouseDownMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; } }
+                CtrlReq::MouseDrag(x,y) => { if app.mouse_enabled { remote_mouse_drag(&mut app, x, y); state_dirty = true; } }
+                CtrlReq::MouseUp(x,y) => { if app.mouse_enabled { remote_mouse_up(&mut app, x, y); state_dirty = true; } }
+                CtrlReq::MouseUpRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, false); state_dirty = true; } }
+                CtrlReq::MouseUpMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, false); state_dirty = true; } }
+                CtrlReq::MouseMove(x,y) => { if app.mouse_enabled { remote_mouse_motion(&mut app, x, y); } }
+                CtrlReq::ScrollUp(x, y) => { if app.mouse_enabled { remote_scroll_up(&mut app, x, y); state_dirty = true; } }
+                CtrlReq::ScrollDown(x, y) => { if app.mouse_enabled { remote_scroll_down(&mut app, x, y); state_dirty = true; } }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; win.manual_rename = true; meta_dirty = true; hook_event = Some("after-rename-window"); }
@@ -2279,6 +2281,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "window-status-format" => { app.window_status_format = "#I:#W#F".to_string(); }
                             "window-status-current-format" => { app.window_status_current_format = "#I:#W#F".to_string(); }
                             "window-status-separator" => { app.window_status_separator = " ".to_string(); }
+                            "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", "bar"); }
+                            "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", "1"); }
                             _ => {}
                         }
                     }
@@ -2330,6 +2334,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
                     ));
+                    output.push_str(&format!("cursor-style {}\n", std::env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "bar".to_string())));
+                    output.push_str(&format!("cursor-blink {}\n", if std::env::var("PSMUX_CURSOR_BLINK").unwrap_or_else(|_| "1".to_string()) != "0" { "on" } else { "off" }));
                     if !app.default_shell.is_empty() {
                         output.push_str(&format!("default-shell {}\n", app.default_shell));
                     }

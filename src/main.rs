@@ -1259,7 +1259,14 @@ fn main() -> io::Result<()> {
             }
             // set-option / set - Set an option
             "set-option" | "set" => {
-                let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                let cmd_str: String = cmd_args.iter().map(|s| {
+                    let s = s.as_str();
+                    if s.contains(' ') {
+                        format!("\"{}\"", s.replace('"', "\\\""))
+                    } else {
+                        s.to_string()
+                    }
+                }).collect::<Vec<String>>().join(" ");
                 match send_control(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
                     Err(e) if e.to_string().contains("no session") => {

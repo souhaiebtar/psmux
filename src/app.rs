@@ -564,8 +564,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     }
                 }
                 Event::Mouse(me) => {
-                    let area = app.last_window_area;
-                    handle_mouse(&mut app, me, area)?;
+                    if app.mouse_enabled {
+                        let area = app.last_window_area;
+                        handle_mouse(&mut app, me, area)?;
+                    }
                 }
                 Event::Resize(cols, rows) => {
                     if last_resize.elapsed() > Duration::from_millis(50) {
