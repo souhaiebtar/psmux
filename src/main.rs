@@ -657,6 +657,7 @@ fn main() -> io::Result<()> {
             "capture-pane" | "capturep" => {
                 // Parse optional flags - cmd_args[0] is command, start from 1
                 let mut cmd = "capture-pane".to_string();
+                let mut print_stdout = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -678,7 +679,7 @@ fn main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
-                        "-p" => { cmd.push_str(" -p"); }
+                        "-p" => { cmd.push_str(" -p"); print_stdout = true; }
                         "-e" => { cmd.push_str(" -e"); }
                         "-J" => { cmd.push_str(" -J"); }
                         "-b" => {
@@ -692,8 +693,12 @@ fn main() -> io::Result<()> {
                     i += 1;
                 }
                 cmd.push('\n');
-                let resp = send_control_with_response(cmd)?;
-                print!("{}", resp);
+                if print_stdout {
+                    let resp = send_control_with_response(cmd)?;
+                    print!("{}", resp);
+                } else {
+                    send_control(cmd)?;
+                }
                 return Ok(());
             }
             // send-keys - Send keys to a pane (critical for scripting)

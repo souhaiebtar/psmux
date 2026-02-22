@@ -432,20 +432,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // Parse -S start and -E end (negative = scrollback offset, - = entire scrollback)
                         let s_arg = args.windows(2).find(|w| w[0] == "-S").map(|w| w[1]);
                         let e_arg = args.windows(2).find(|w| w[0] == "-E").map(|w| w[1]);
+                        let start: Option<i32> = match s_arg {
+                            Some("-") => Some(0), // entire scrollback start
+                            Some(v) => v.parse::<i32>().ok(),
+                            None => None,
+                        };
+                        let end: Option<i32> = match e_arg {
+                            Some("-") => None, // to end of visible
+                            Some(v) => v.parse::<i32>().ok(),
+                            None => None,
+                        };
                         let (rtx, rrx) = mpsc::channel::<String>();
                         if escape_seqs {
-                            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx));
+                            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end));
                         } else if s_arg.is_some() || e_arg.is_some() {
-                            let start: Option<i32> = match s_arg {
-                                Some("-") => Some(0), // entire scrollback start
-                                Some(v) => v.parse::<i32>().ok(),
-                                None => None,
-                            };
-                            let end: Option<i32> = match e_arg {
-                                Some("-") => None, // to end of visible
-                                Some(v) => v.parse::<i32>().ok(),
-                                None => None,
-                            };
                             let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end));
                         } else {
                             let _ = tx.send(CtrlReq::CapturePane(rtx));
@@ -456,7 +456,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
                             }
                             if print_stdout {
-                                let _ = write!(write_stream, "{}\n", text);
+                                // Write text directly — it already ends with \n from capture
+                                let _ = write_stream.write_all(text.as_bytes());
                                 let _ = write_stream.flush();
                                 if !persistent { break; }
                             } else {
@@ -1446,13 +1447,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::CapturePaneStyled(resp) => {
-                    if let Some(text) = capture_active_pane_styled(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
+                CtrlReq::CapturePaneStyled(resp, s, e) => {
+                    if let Some(text) = capture_active_pane_styled(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
                 CtrlReq::CapturePaneRange(resp, s, e) => {
                     if let Some(text) = capture_active_pane_range(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } meta_dirty = true; }
+                CtrlReq::FocusWindow(wid) => {
+                    // wid is a display index (same as tmux window number), convert to internal array index
+                    if wid >= app.window_base_index {
+                        let internal_idx = wid - app.window_base_index;
+                        if internal_idx < app.windows.len() {
+                            app.active_idx = internal_idx;
+                        }
+                    }
+                    meta_dirty = true;
+                }
                 CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
                 CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); meta_dirty = true; }
                 CtrlReq::SessionInfo(resp) => {

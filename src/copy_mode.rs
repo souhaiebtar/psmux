@@ -491,7 +491,12 @@ pub fn capture_active_pane(app: &mut AppState) -> io::Result<()> {
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
     let screen = parser.screen();
     let mut text = String::new();
-    for r in 0..p.last_rows { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
+    for r in 0..p.last_rows {
+        let mut row = String::new();
+        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+        text.push_str(row.trim_end());
+        text.push('\n');
+    }
     app.paste_buffers.insert(0, text);
     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     Ok(())
@@ -503,7 +508,12 @@ pub fn capture_active_pane_text(app: &mut AppState) -> io::Result<Option<String>
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
     let mut text = String::new();
-    for r in 0..p.last_rows { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
+    for r in 0..p.last_rows {
+        let mut row = String::new();
+        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+        text.push_str(row.trim_end());
+        text.push('\n');
+    }
     Ok(Some(text))
 }
 
@@ -756,17 +766,33 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
         None => p.last_rows.saturating_sub(1),
     };
     let mut text = String::new();
-    for r in start..=end { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
+    for r in start..=end {
+        let mut row = String::new();
+        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+        text.push_str(row.trim_end());
+        text.push('\n');
+    }
     Ok(Some(text))
 }
 
 /// Capture the active pane's screen content with ANSI escape sequences preserved.
-/// This is the `-e` flag for capture-pane.
-pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<String>> {
+/// This is the `-e` flag for capture-pane.  Supports optional start/end range.
+pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<i32>) -> io::Result<Option<String>> {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
+    let rows = p.last_rows as i32;
+    let start_row = match s {
+        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
+        None => 0,
+    };
+    let end_row = match e {
+        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
+        None => p.last_rows.saturating_sub(1),
+    };
     let mut text = String::new();
     let mut prev_fg: Option<vt100::Color> = None;
     let mut prev_bg: Option<vt100::Color> = None;
@@ -775,7 +801,10 @@ pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<Strin
     let mut prev_underline = false;
     let mut prev_inverse = false;
 
-    for r in 0..p.last_rows {
+    for r in start_row..=end_row {
+        // Build the row content, then trim trailing whitespace
+        let mut row_chars: Vec<String> = Vec::new();
+        let mut row_sgr: Vec<Option<String>> = Vec::new();
         let mut any_style_active = false;
         for c in 0..p.last_cols {
             if let Some(cell) = screen.cell(r, c) {
@@ -791,7 +820,7 @@ pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<Strin
                     || bold != prev_bold || italic != prev_italic
                     || underline != prev_underline || inverse != prev_inverse;
 
-                if style_changed {
+                let sgr = if style_changed {
                     let mut params = Vec::new();
                     params.push("0".to_string()); // reset first
                     if bold { params.push("1".to_string()); }
@@ -818,7 +847,6 @@ pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<Strin
                         }
                         vt100::Color::Rgb(r, g, b) => { params.push(format!("48;2;{};{};{}", r, g, b)); }
                     }
-                    text.push_str(&format!("\x1b[{}m", params.join(";")));
                     prev_fg = Some(fg);
                     prev_bg = Some(bg);
                     prev_bold = bold;
@@ -826,11 +854,26 @@ pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<Strin
                     prev_underline = underline;
                     prev_inverse = inverse;
                     any_style_active = true;
-                }
-                text.push_str(&cell.contents().to_string());
+                    Some(format!("\x1b[{}m", params.join(";")))
+                } else {
+                    None
+                };
+                row_sgr.push(sgr);
+                row_chars.push(cell.contents().to_string());
             } else {
-                text.push(' ');
+                row_sgr.push(None);
+                row_chars.push(" ".to_string());
             }
+        }
+        // Find last non-whitespace cell to trim trailing spaces
+        let last_non_ws = row_chars.iter().rposition(|s| !s.is_empty() && s.trim() != "");
+        let trim_end = match last_non_ws {
+            Some(pos) => pos + 1,
+            None => 0,  // entirely empty row
+        };
+        for c in 0..trim_end {
+            if let Some(ref sgr) = row_sgr[c] { text.push_str(sgr); }
+            text.push_str(&row_chars[c]);
         }
         if any_style_active {
             text.push_str("\x1b[0m");

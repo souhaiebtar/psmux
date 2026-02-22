@@ -134,7 +134,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let escape_seqs = args.iter().any(|a| *a == "-e");
                         let (rtx, rrx) = mpsc::channel::<String>();
                         if escape_seqs {
-                            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx));
+                            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start_line, end_line));
                         } else if start_line.is_some() || end_line.is_some() {
                             let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start_line, end_line));
                         } else {
@@ -599,8 +599,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::CapturePaneStyled(resp) => {
-                    if let Some(text) = capture_active_pane_styled(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
+                CtrlReq::CapturePaneStyled(resp, s, e) => {
+                    if let Some(text) = capture_active_pane_styled(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
                 CtrlReq::CapturePaneRange(resp, s, e) => {
                     if let Some(text) = capture_active_pane_range(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
