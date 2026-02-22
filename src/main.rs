@@ -13,6 +13,7 @@ mod layout;
 mod window_ops;
 mod util;
 mod format;
+mod help;
 mod server;
 mod client;
 mod app;

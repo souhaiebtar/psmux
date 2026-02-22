@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::layout::LayoutJson;
+use crate::help;
 use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
@@ -630,62 +631,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     session_renaming = true;
                                 }
                                 KeyCode::Char('?') => {
-                                    // Build key list locally and show overlay
-                                    keys_viewer_lines.clear();
+                                    // Build comprehensive help overlay from help.rs
                                     keys_viewer_scroll = 0;
-
-                                    // Same hardcoded defaults as server.rs ListKeys handler
-                                    let defaults: Vec<(&str, &str)> = vec![
-                                        ("c", "new-window"),
-                                        ("n", "next-window"),
-                                        ("p", "previous-window"),
-                                        ("%", "split-window -h"),
-                                        ("\"", "split-window -v"),
-                                        ("x", "kill-pane"),
-                                        ("d", "detach-client"),
-                                        ("w", "choose-window"),
-                                        (",", "rename-window"),
-                                        ("$", "rename-session"),
-                                        ("space", "next-layout"),
-                                        ("[", "copy-mode"),
-                                        ("]", "paste-buffer"),
-                                        (":", "command-prompt"),
-                                        ("q", "display-panes"),
-                                        ("z", "resize-pane -Z"),
-                                        ("o", "select-pane -t +"),
-                                        (";", "last-pane"),
-                                        ("l", "last-window"),
-                                        ("{", "swap-pane -U"),
-                                        ("}", "swap-pane -D"),
-                                        ("!", "break-pane"),
-                                        ("&", "kill-window"),
-                                        ("Up", "select-pane -U"),
-                                        ("Down", "select-pane -D"),
-                                        ("Left", "select-pane -L"),
-                                        ("Right", "select-pane -R"),
-                                        ("?", "list-keys"),
-                                        ("t", "clock-mode"),
-                                        ("=", "choose-buffer"),
-                                    ];
-
-                                    // Collect user-overridden keys for prefix table
-                                    let overridden_keys: std::collections::HashSet<String> = synced_bindings.iter()
-                                        .filter(|b| b.t == "prefix")
-                                        .map(|b| b.k.clone())
+                                    let user_binds: Vec<(bool, String, String, String)> = synced_bindings
+                                        .iter()
+                                        .map(|b| (b.r, b.t.clone(), b.k.clone(), b.c.clone()))
                                         .collect();
-
-                                    // Add defaults (excluding overridden)
-                                    for (k, cmd) in &defaults {
-                                        if !overridden_keys.contains(*k) {
-                                            keys_viewer_lines.push(format!("bind-key -T prefix {} {}", k, cmd));
-                                        }
-                                    }
-                                    // Add all user bindings
-                                    for b in &synced_bindings {
-                                        let repeat_flag = if b.r { " -r" } else { "" };
-                                        keys_viewer_lines.push(format!("bind-key{} -T {} {} {}", repeat_flag, b.t, b.k, b.c));
-                                    }
-
+                                    keys_viewer_lines = help::build_overlay_lines(&user_binds);
                                     keys_viewer = true;
                                 }
                                 KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
@@ -1778,8 +1730,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 if keys_viewer_scroll > max_scroll { keys_viewer_scroll = max_scroll; }
                 let mut lines: Vec<Line> = Vec::new();
                 for (i, entry) in keys_viewer_lines.iter().enumerate().skip(keys_viewer_scroll).take(visible_h) {
-                    // Highlight the "bind-key" keyword and table name
-                    if let Some(rest) = entry.strip_prefix("bind-key") {
+                    // Highlight section headers, "bind-key" keyword, and plain text differently
+                    if entry.starts_with("──") || entry.starts_with("── ") {
+                        lines.push(Line::from(Span::styled(entry.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                    } else if let Some(rest) = entry.strip_prefix("bind-key") {
                         lines.push(Line::from(vec![
                             Span::styled("bind-key", Style::default().fg(Color::Green)),
                             Span::raw(rest.to_string()),

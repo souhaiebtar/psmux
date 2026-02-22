@@ -81,6 +81,7 @@ use crate::config::*;
 use crate::commands::*;
 use crate::util::*;
 use crate::format::*;
+use crate::help;
 
 /// Complete list of supported tmux-compatible commands (for list-commands).
 const TMUX_COMMANDS: &[&str] = &[
@@ -2269,64 +2270,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                 }
                 CtrlReq::ListKeys(resp) => {
-                    // Build a list of default bindings as (key, command) pairs
-                    let defaults: Vec<(&str, &str)> = vec![
-                        ("c", "new-window"),
-                        ("n", "next-window"),
-                        ("p", "previous-window"),
-                        ("%", "split-window -h"),
-                        ("\"", "split-window -v"),
-                        ("x", "kill-pane"),
-                        ("d", "detach-client"),
-                        ("w", "choose-window"),
-                        (",", "rename-window"),
-                        ("$", "rename-session"),
-                        ("space", "next-layout"),
-                        ("[", "copy-mode"),
-                        ("]", "paste-buffer"),
-                        (":", "command-prompt"),
-                        ("q", "display-panes"),
-                        ("z", "resize-pane -Z"),
-                        ("o", "select-pane -t +"),
-                        (";", "last-pane"),
-                        ("l", "last-window"),
-                        ("{", "swap-pane -U"),
-                        ("}", "swap-pane -D"),
-                        ("!", "break-pane"),
-                        ("&", "kill-window"),
-                        ("Up", "select-pane -U"),
-                        ("Down", "select-pane -D"),
-                        ("Left", "select-pane -L"),
-                        ("Right", "select-pane -R"),
-                        ("?", "list-keys"),
-                        ("t", "clock-mode"),
-                        ("=", "choose-buffer"),
-                    ];
-
-                    // Collect user-overridden key strings for the prefix table
-                    let mut overridden_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    if let Some(prefix_binds) = app.key_tables.get("prefix") {
-                        for bind in prefix_binds {
-                            overridden_keys.insert(format_key_binding(&bind.key));
-                        }
-                    }
-
-                    let mut output = String::new();
-                    // Print defaults, excluding any that have been overridden by user
-                    for (k, cmd) in &defaults {
-                        if !overridden_keys.contains(*k) {
-                            output.push_str(&format!("bind-key -T prefix {} {}\n", k, cmd));
-                        }
-                    }
-                    // Print all user bindings from key_tables
-                    for (table_name, binds) in &app.key_tables {
-                        for bind in binds {
+                    // Build list-keys output from the canonical help module
+                    let user_iter = app.key_tables.iter().flat_map(|(table_name, binds)| {
+                        binds.iter().map(move |bind| {
                             let key_str = format_key_binding(&bind.key);
                             let action_str = format_action(&bind.action);
-                            let repeat_flag = if bind.repeat { " -r" } else { "" };
-                            output.push_str(&format!("bind-key{} -T {} {} {}\n", repeat_flag, table_name, key_str, action_str));
-                        }
-                    }
+                            (table_name.as_str(), key_str, action_str, bind.repeat)
+                        })
+                    });
+                    let output = help::build_list_keys_output(user_iter);
                     let _ = resp.send(output);
                 }
                 CtrlReq::SetOption(option, value) => {
