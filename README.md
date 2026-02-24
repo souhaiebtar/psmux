@@ -6,49 +6,163 @@
 ║   ██╔═══╝ ╚════██║██║╚██╔╝██║██║   ██║ ██╔██╗             ║
 ║   ██║     ███████║██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗            ║
 ║   ╚═╝     ╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝            ║
+║     Born in PowerShell. Made in Rust. 🦀                 ║
 ║          Terminal Multiplexer for Windows                 ║
 ╚═══════════════════════════════════════════════════════════╝
 ```
 
+<p align="center">
+  <strong>The native Windows tmux — born in PowerShell, made in Rust.</strong><br/>
+  Full mouse support · tmux themes · tmux config · 76 commands · blazing fast
+</p>
+
+<p align="center">
+  <a href="#installation">Install</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#key-bindings">Keys</a> ·
+  <a href="#configuration">Config</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#tmux-compatibility">Compatibility</a>
+</p>
+
+---
+
 # psmux
 
-**A terminal multiplexer for Windows** — the tmux alternative you've been waiting for.
+**The real tmux for Windows** — not a port, not a wrapper, not a workaround.
 
-psmux brings tmux-style terminal multiplexing to Windows natively. No WSL, no Cygwin, no compromises. Built in Rust for Windows Terminal, PowerShell, and cmd.exe.
+psmux is a **native Windows terminal multiplexer** built from the ground up in Rust. It uses Windows ConPTY directly, speaks the tmux command language, reads your `.tmux.conf`, and supports tmux themes — all without WSL, Cygwin, or MSYS2.
 
-> 💡 **Tip:** psmux includes `tmux` and `pmux` aliases, so you can use your muscle memory!
+> 💡 **Tip:** psmux ships with `tmux` and `pmux` aliases. Just type `tmux` and it works!
 
 ## Why psmux?
 
-If you've used tmux on Linux/macOS and wished you had something similar on Windows — this is it.
+If you've used tmux on Linux/macOS and wished you had something like it on Windows — **this is it**.
 
-- **Windows-native** — Built specifically for Windows 10/11
-- **Works everywhere** — Windows Terminal, PowerShell, cmd.exe, ConEmu, etc.
-- **No dependencies** — Single binary, just works
-- **tmux-compatible** — Same commands, same keybindings, zero learning curve
-- **Aliases included** — Use `psmux`, `pmux`, or `tmux` command, your choice
+| | psmux | Windows Terminal tabs | WSL + tmux |
+|---|:---:|:---:|:---:|
+| Session persist (detach/reattach) | ✅ | ❌ | ⚠️ WSL only |
+| Synchronized panes | ✅ | ❌ | ✅ |
+| tmux keybindings | ✅ | ❌ | ✅ |
+| Reads `.tmux.conf` | ✅ | ❌ | ✅ |
+| tmux theme support | ✅ | ❌ | ✅ |
+| Native Windows shells | ✅ | ✅ | ❌ |
+| Full mouse support | ✅ | ✅ | ⚠️ Partial |
+| Zero dependencies | ✅ | ✅ | ❌ (needs WSL) |
+| Scriptable (76 commands) | ✅ | ❌ | ✅ |
 
 ![psmux in action - monitoring system info](psmux_sysinfo.gif)
 
+### Highlights
+
+- 🦀 **Made in Rust** — opt-level 3, full LTO, single codegen unit. Maximum performance.
+- 🖱️ **Full mouse support** — click panes, drag-resize borders, scroll, click tabs, select text, right-click copy
+- 🎨 **tmux theme support** — 16 named colors + 256 indexed + 24-bit true color (`#RRGGBB`), 14 style options
+- 📋 **Reads your `.tmux.conf`** — drop-in config compatibility, zero learning curve
+- ⚡ **Blazing fast startup** — sub-100ms session creation, near-zero overhead over shell startup
+- 🔌 **76 tmux-compatible commands** — `bind-key`, `set-option`, `if-shell`, `run-shell`, hooks, and more
+- 🪟 **Windows-native** — ConPTY, Win32 API, works with PowerShell, cmd, bash, WSL, nushell
+- 📦 **Single binary, no dependencies** — install via `cargo`, `winget`, `scoop`, or `choco`
+
 ## Features
 
-- Split panes horizontally and vertically
-- Multiple windows with tabs
-- Session management (attach/detach)
-- Mouse support for resizing panes and clicking tabs
-- Copy mode with vim-like keybindings
-- **Scrollback history** (configurable, default 2000 lines)
-- Synchronized input to multiple panes
-- **Automatic window rename** from foreground process (like tmux)
-- **Status bar** with full tmux format variable support
-- **Theming** — full style customization (fg, bg, bold, dim, italics, etc.)
-- **Hooks** — run commands on events (after-new-window, etc.)
-- **Monitor activity/silence** — flag windows with new output
-- **Layouts** — even-horizontal, even-vertical, main-horizontal, main-vertical, tiled
-- **Format engine** — 100+ tmux-compatible variables and modifiers
-- **Config file** — drop-in compatible with `.tmux.conf`
+### Terminal Multiplexing
+- Split panes horizontally (`Prefix + %`) and vertically (`Prefix + "`)
+- Multiple windows with clickable status-bar tabs
+- Session management — detach (`Prefix + d`) and reattach from anywhere
+- 5 layouts: even-horizontal, even-vertical, main-horizontal, main-vertical, tiled
+
+### Full Mouse Support
+- **Click** any pane to focus it — input goes to the right shell
+- **Drag** pane borders to resize splits interactively
+- **Click** status-bar tabs to switch windows
+- **Scroll wheel** in any pane — scrolls that pane's output
+- **Drag-select** text to copy to clipboard
+- **Right-click** to paste or copy selection
+- **VT mouse forwarding** — apps like vim, htop, and midnight commander get full mouse events
+- **3-layer mouse injection** — VT protocol, VT bridge (for WSL/SSH), and native Win32 MOUSE_EVENT
+
+### tmux Theme & Style Support
+- **14 customizable style options** — status bar, pane borders, messages, copy-mode highlights, popups
+- **Full color spectrum** — 16 named colors, 256 indexed (`colour0`–`colour255`), 24-bit true color (`#RRGGBB`)
+- **Text attributes** — bold, dim, italic, underline, blink, reverse, strikethrough, and more
+- **Status bar** — fully customizable left/right content with format variables
+- **Window tab styling** — separate styles for active, inactive, activity, bell, and last-used tabs
+- Compatible with existing tmux theme configs
+
+### Copy Mode (Vim Keybindings)
+- **53 vi-style key bindings** — motions, selections, search, text objects
+- Visual, line, and **rectangle selection** modes (`v`, `V`, `Ctrl+v`)
+- `/` and `?` search with `n`/`N` navigation
+- `f`/`F`/`t`/`T` character find, `%` bracket matching, `{`/`}` paragraph jump
+- Named registers (`"a`–`"z`), count prefixes, word/WORD variants
+- Mouse drag-select copies to Windows clipboard on release
+
+### Format Engine
+- **126+ tmux-compatible format variables** across sessions, windows, panes, cursor, client, and server
+- Conditionals (`#{?cond,true,false}`), comparisons, boolean logic
+- Regex substitution (`#{s/pat/rep/:var}`), string manipulation
+- Loop iteration (`#{W:fmt}`, `#{P:fmt}`, `#{S:fmt}`) over windows, panes, sessions
+- Truncation, padding, basename, dirname, strftime, shell quoting
+
+### Scripting & Automation
+- **76 tmux-compatible commands** — everything you need for automation
+- `send-keys`, `capture-pane`, `pipe-pane` for CI/CD and DevOps workflows
+- `if-shell` and `run-shell` for conditional config logic
+- **15+ event hooks** — `after-new-window`, `after-split-window`, `client-attached`, etc.
+- Paste buffers, named registers, `display-message` with format variables
+
+### Multi-Shell Support
+- **PowerShell 7** (default), PowerShell 5, cmd.exe
+- **Git Bash**, WSL, nushell, and any Windows executable
+- Sets `TERM=xterm-256color`, `COLORTERM=truecolor` automatically
+- Sets `TMUX` and `TMUX_PANE` env vars for tmux-aware tool compatibility
 
 ![psmux windows and panes](psmux_windows.gif)
+
+## Performance
+
+psmux is built for speed. The Rust release binary is compiled with **opt-level 3**, **full LTO**, and **single codegen unit** — every cycle counts.
+
+| Metric | psmux | Notes |
+|--------|-------|-------|
+| **Session creation** | **< 100ms** | Time for `new-session -d` to return |
+| **New window** | **< 80ms** | Overhead on top of shell startup |
+| **New pane (split)** | **< 80ms** | Same as window — cached shell resolution |
+| **Startup to prompt** | **~shell launch time** | psmux adds near-zero overhead; bottleneck is your shell |
+| **15+ windows** | ✅ Stable | Stress-tested with 15+ rapid windows, 18+ panes, 5 concurrent sessions |
+| **Rapid fire creates** | ✅ No hangs | Burst-create windows/panes without delays or orphaned processes |
+
+### How it's fast
+
+- **Lazy pane resize** — only the active window's panes are resized. Background windows resize on-demand when switched to, avoiding O(n) ConPTY syscalls
+- **Cached shell resolution** — `which` PATH lookups are cached with `OnceLock`, not repeated per spawn
+- **10ms polling** — client-server discovery uses tight 10ms polling for sub-100ms session attach
+- **Early port-file write** — server writes its discovery file *before* spawning the first shell, so the client connects instantly
+- **8KB reader buffers** — small buffer size minimizes mutex contention across pane reader threads
+
+> **Note:** The primary startup bottleneck is your shell (PowerShell 7 takes ~400-1000ms to display a prompt). psmux itself adds < 100ms of overhead. For faster shells like `cmd.exe` or `nushell`, total startup is near-instant.
+
+## tmux Compatibility
+
+psmux is the most tmux-compatible terminal multiplexer on Windows:
+
+| Feature | Support |
+|---------|---------|
+| Commands | **76** tmux commands implemented |
+| Format variables | **126+** variables with full modifier support |
+| Config file | Reads `~/.tmux.conf` directly |
+| Key bindings | `bind-key`/`unbind-key` with key tables |
+| Hooks | 15+ event hooks (`after-new-window`, etc.) |
+| Status bar | Full format engine with conditionals and loops |
+| Themes | 14 style options, 24-bit color, text attributes |
+| Layouts | 5 layouts (even-h, even-v, main-h, main-v, tiled) |
+| Copy mode | 53 vim keybindings, search, registers |
+| Targets | `session:window.pane`, `%id`, `@id` syntax |
+| `if-shell` / `run-shell` | ✅ Conditional config logic |
+| Paste buffers | ✅ Full buffer management |
+
+**Your existing `.tmux.conf` works.** psmux reads it automatically — just install and go.
 
 ## Requirements
 
@@ -169,30 +283,35 @@ Default prefix: `Ctrl+b` (same as tmux)
 
 ### Copy/Scroll Mode
 
-Enter copy mode with `Prefix + [` or `Prefix + {` to scroll through terminal history:
+Enter copy mode with `Prefix + [` to scroll through terminal history with **53 vim-style keybindings**:
 
 | Key | Action |
 |-----|--------|
-| `↑` / `k` | Move cursor / scroll up 1 line |
-| `↓` / `j` | Move cursor / scroll down 1 line |
-| `PageUp` / `Ctrl+b` | Scroll up 10 lines |
-| `PageDown` / `Ctrl+f` | Scroll down 10 lines |
-| `Ctrl+u` | Scroll up half page |
-| `Ctrl+d` | Scroll down half page |
-| `g` | Jump to top of scrollback |
-| `G` | Jump to bottom |
-| `←` / `h` | Move cursor left |
-| `→` / `l` | Move cursor right |
-| `w` | Move to next word |
-| `b` | Move to previous word |
-| `e` | Move to end of word |
-| `f{char}` | Find character forward |
-| `F{char}` | Find character backward |
-| `0` | Move to start of line |
-| `$` | Move to end of line |
-| `v` | Start selection |
-| `y` | Yank (copy) selection |
-| `Mouse drag + release` | Select text and copy to clipboard |
+| `↑` / `k` | Move cursor / scroll up |
+| `↓` / `j` | Move cursor / scroll down |
+| `h` / `l` | Move cursor left / right |
+| `w` / `b` / `e` | Next word / prev word / end of word |
+| `W` / `B` / `E` | WORD variants (whitespace-delimited) |
+| `0` / `$` / `^` | Start / end / first non-blank of line |
+| `g` / `G` | Jump to top / bottom of scrollback |
+| `H` / `M` / `L` | Top / middle / bottom of screen |
+| `Ctrl+u` / `Ctrl+d` | Scroll half page up / down |
+| `Ctrl+b` / `Ctrl+f` | Scroll full page up / down |
+| `f{char}` / `F{char}` | Find char forward / backward |
+| `t{char}` / `T{char}` | Till char forward / backward |
+| `%` | Jump to matching bracket |
+| `{` / `}` | Previous / next paragraph |
+| `/` / `?` | Search forward / backward |
+| `n` / `N` | Next / previous match |
+| `v` | Begin selection |
+| `V` | Line selection |
+| `Ctrl+v` | Rectangle selection |
+| `o` | Swap selection ends |
+| `y` / `Enter` | Yank (copy) selection |
+| `D` | Copy to end of line |
+| `"a`–`"z` | Named registers |
+| `1`–`9` | Count prefix for motions |
+| `Mouse drag` | Select text → copies to clipboard on release |
 | `Esc` / `q` | Exit copy mode |
 
 When in copy mode:
@@ -554,11 +673,34 @@ MIT
 
 ## About psmux
 
-**psmux** (PowerShell Multiplexer) is a terminal multiplexer built specifically for Windows. It is an alternative to tmux for Windows users who want terminal multiplexing without WSL or Cygwin.
+**psmux** (PowerShell Multiplexer) is a terminal multiplexer **born in PowerShell, made in Rust** — built from scratch for Windows. It's not a tmux port. It's not a compatibility layer. It's a native Windows application that speaks fluent tmux.
+
+psmux exists because Windows developers deserve the same terminal multiplexing experience that Linux and macOS users have enjoyed for decades — without being forced into WSL, Cygwin, or MSYS2.
+
+### What makes psmux different
+
+- **Native Windows binary** — uses ConPTY directly, no POSIX translation layer
+- **Full tmux command compatibility** — 76 commands, 126+ format variables, reads `.tmux.conf`
+- **Full mouse support** — 3-layer injection system handles native shells, TUI apps, and WSL/SSH seamlessly
+- **Theme support** — bring your tmux themes, they work here
+- **Performance-optimized Rust** — opt-level 3, LTO, cached everything, sub-100ms startup
+- **Single binary** — `psmux.exe` (also installs as `pmux.exe` and `tmux.exe`) — no runtime dependencies
+
+### Star History
+
+If psmux helps your Windows workflow, consider giving it a ⭐ on GitHub — it helps others find it!
+
+### Contributing
+
+Contributions are welcome! Whether it's:
+- 🐛 Bug reports and feature requests via [GitHub Issues](https://github.com/marlocarlo/psmux/issues)
+- 💻 Pull requests for fixes and features
+- 📖 Documentation improvements
+- 🧪 Test scripts and compatibility reports
 
 ### Keywords
 
-terminal multiplexer, tmux for windows, tmux alternative, tmux windows, windows terminal multiplexer, powershell multiplexer, split terminal windows, multiple terminals, terminal tabs, pane splitting, session management, windows terminal, powershell terminal, cmd terminal, rust terminal, console multiplexer, terminal emulator, windows console, cli tool, command line, devtools, developer tools, productivity, windows 10, windows 11, psmux, pmux
+terminal multiplexer, tmux for windows, tmux alternative, tmux windows, windows terminal multiplexer, powershell multiplexer, split terminal windows, multiple terminals, terminal tabs, pane splitting, session management, windows terminal, powershell terminal, cmd terminal, rust terminal, console multiplexer, terminal emulator, windows console, cli tool, command line, devtools, developer tools, productivity, windows 10, windows 11, psmux, pmux, conpty, tmux themes, tmux config, mouse support, copy mode, vim keybindings, rust windows, native windows tmux, tmux clone, terminal panes, powerline, powershell 7, pwsh, winget, scoop, chocolatey, cargo install
 
 ### Related Projects
 
@@ -569,13 +711,31 @@ terminal multiplexer, tmux for windows, tmux alternative, tmux windows, windows 
 ### FAQ
 
 **Q: Is psmux cross-platform?**  
-A: No. psmux is built exclusively for Windows. For Linux/macOS, use tmux.
+A: No. psmux is built exclusively for Windows using the Windows ConPTY API. For Linux/macOS, use tmux — psmux is the Windows counterpart.
 
 **Q: Does psmux work with Windows Terminal?**  
 A: Yes! psmux works great with Windows Terminal, PowerShell, cmd.exe, ConEmu, and other Windows terminal emulators.
 
 **Q: Why use psmux instead of Windows Terminal tabs?**  
-A: psmux offers session persistence (detach/reattach), synchronized input to multiple panes, and tmux-compatible keybindings.
+A: psmux offers session persistence (detach/reattach), synchronized input to multiple panes, full tmux command scripting, hooks, format engine, and tmux-compatible keybindings. Windows Terminal tabs can't do any of that.
+
+**Q: Can I use my existing `.tmux.conf`?**  
+A: Yes! psmux reads `~/.tmux.conf` automatically. Most tmux config options, key bindings, and style settings work as-is.
+
+**Q: Can I use tmux themes?**  
+A: Yes. psmux supports 14 style options with 24-bit true color, 256 indexed colors, and text attributes (bold, italic, dim, etc.). Most tmux theme configs are compatible.
 
 **Q: Can I use tmux commands with psmux?**  
-A: Yes! psmux includes `tmux` and `pmux` aliases. Commands like `tmux new-session`, `tmux attach`, `tmux ls` all work.
+A: Yes! psmux includes a `tmux` alias. Commands like `tmux new-session`, `tmux attach`, `tmux ls`, `tmux split-window` all work — 76 commands in total.
+
+**Q: How fast is psmux?**  
+A: Session creation takes < 100ms. New windows/panes add < 80ms overhead. The bottleneck is your shell's startup time, not psmux. Compiled with opt-level 3 and full LTO.
+
+**Q: Does psmux support mouse?**  
+A: Full mouse support — click to focus panes, drag to resize borders, scroll wheel, click status-bar tabs, drag-select text, right-click copy. Plus VT mouse forwarding for TUI apps like vim, htop, and midnight commander.
+
+**Q: What shells does psmux support?**  
+A: PowerShell 7 (default), PowerShell 5, cmd.exe, Git Bash, WSL, nushell, and any Windows executable. Change with `set -g default-shell <shell>`.
+
+**Q: Is it stable for daily use?**  
+A: Yes. psmux is stress-tested with 15+ rapid windows, 18+ concurrent panes, 5 concurrent sessions, kill+recreate cycles, and sustained load — all with zero hangs or resource leaks.
