@@ -1517,8 +1517,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     meta_dirty = true;
                 }
-                CtrlReq::FocusPane(pid) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
-                CtrlReq::FocusPaneByIndex(idx) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_index(app, idx); }); meta_dirty = true; }
+                CtrlReq::FocusPane(pid) => {
+                    let old_path = app.windows[app.active_idx].active_path.clone();
+                    switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); });
+                    if app.windows[app.active_idx].active_path != old_path { unzoom_if_zoomed(&mut app); }
+                    meta_dirty = true;
+                }
+                CtrlReq::FocusPaneByIndex(idx) => {
+                    let old_path = app.windows[app.active_idx].active_path.clone();
+                    switch_with_copy_save(&mut app, |app| { focus_pane_by_index(app, idx); });
+                    if app.windows[app.active_idx].active_path != old_path { unzoom_if_zoomed(&mut app); }
+                    meta_dirty = true;
+                }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { " (attached)" } else { "" };
                     let windows = app.windows.len();
@@ -1660,7 +1670,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::FocusPaneCmd(pid) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
+                CtrlReq::FocusPaneCmd(pid) => {
+                    let old_path = app.windows[app.active_idx].active_path.clone();
+                    switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); });
+                    if app.windows[app.active_idx].active_path != old_path { unzoom_if_zoomed(&mut app); }
+                    meta_dirty = true;
+                }
                 CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); resize_all_panes(&mut app); meta_dirty = true; }
                 CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; } }
                 CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; } }
@@ -2022,26 +2037,32 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SelectPane(dir) => {
                     // Auto-unzoom when navigating to another pane (tmux behavior).
-                    // This prevents the desync where active pane changes but
-                    // the viewport stays on the zoomed pane.  (fixes #46)
-                    let was_zoomed = unzoom_if_zoomed(&mut app);
-                    let _ = was_zoomed; // suppress unused warning
+                    // For directional nav: unzoom first so compute_rects uses
+                    // real geometry, then re-zoom only if focus didn't change.
+                    // For other cases: only unzoom if focus actually changes.
+                    // (fixes #46)
                     match dir.as_str() {
                         "U" | "D" | "L" | "R" => {
                             let focus_dir = match dir.as_str() {
                                 "U" => FocusDir::Up, "D" => FocusDir::Down,
                                 "L" => FocusDir::Left, _ => FocusDir::Right,
                             };
+                            let was_zoomed = unzoom_if_zoomed(&mut app);
+                            let old_path = app.windows[app.active_idx].active_path.clone();
                             switch_with_copy_save(&mut app, |app| {
-                                let old = app.windows[app.active_idx].active_path.clone();
                                 move_focus(app, focus_dir);
-                                if app.windows[app.active_idx].active_path != old {
-                                    app.last_pane_path = old;
-                                }
                             });
+                            if app.windows[app.active_idx].active_path != old_path {
+                                // Focus changed — stay unzoomed (tmux behavior)
+                                app.last_pane_path = old_path;
+                            } else if was_zoomed {
+                                // No pane in that direction — re-zoom
+                                toggle_zoom(&mut app);
+                            }
                         }
                         "last" => {
                             // select-pane -l: switch to last active pane
+                            let old_path = app.windows[app.active_idx].active_path.clone();
                             switch_with_copy_save(&mut app, |app| {
                                 let win = &mut app.windows[app.active_idx];
                                 if !app.last_pane_path.is_empty() {
@@ -2050,6 +2071,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     app.last_pane_path = tmp;
                                 }
                             });
+                            if app.windows[app.active_idx].active_path != old_path {
+                                unzoom_if_zoomed(&mut app);
+                            }
                         }
                         "mark" => {
                             // select-pane -m: mark the current pane
@@ -2060,6 +2084,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         "next" => {
                             // select-pane next: cycle to next pane (like Prefix+o / tmux -t :.+)
+                            let old_path = app.windows[app.active_idx].active_path.clone();
                             switch_with_copy_save(&mut app, |app| {
                                 let win = &app.windows[app.active_idx];
                                 let mut pane_paths = Vec::new();
@@ -2073,9 +2098,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     win.active_path = new_path;
                                 }
                             });
+                            if app.windows[app.active_idx].active_path != old_path {
+                                unzoom_if_zoomed(&mut app);
+                            }
                         }
                         "prev" => {
                             // select-pane prev: cycle to previous pane (tmux -t :.-)
+                            let old_path = app.windows[app.active_idx].active_path.clone();
                             switch_with_copy_save(&mut app, |app| {
                                 let win = &app.windows[app.active_idx];
                                 let mut pane_paths = Vec::new();
@@ -2089,6 +2118,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     win.active_path = new_path;
                                 }
                             });
+                            if app.windows[app.active_idx].active_path != old_path {
+                                unzoom_if_zoomed(&mut app);
+                            }
                         }
                         "unmark" => {
                             // select-pane -M: clear the marked pane

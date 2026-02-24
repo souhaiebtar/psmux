@@ -212,6 +212,54 @@ if ($desyncCount -eq 0) {
 }
 
 # ============================================================
+# TEST 4: ZOOM PRESERVED WHEN NO PANE IN DIRECTION (tmux parity)
+# ============================================================
+Write-Host ""
+Write-Host ("=" * 60)
+Write-Host "  TEST 4: ZOOM PRESERVED ON NO-OP NAVIGATION"
+Write-Host ("=" * 60)
+
+Write-Test "4. Zoom stays active when navigating with no pane in that direction"
+
+# With horizontal split (pane 0 left, pane 1 right):
+# Select pane 0, zoom it, then try select-pane -L (no pane further left)
+Psmux select-pane -t "${SESSION}:.0" | Out-Null
+Start-Sleep -Milliseconds 500
+
+# Zoom must be off first
+$z = Query -Target $SESSION -Fmt '#{window_zoomed_flag}'
+if ($z -match "1") {
+    Psmux resize-pane -Z -t $SESSION | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
+# Now zoom pane 0
+Psmux resize-pane -Z -t $SESSION | Out-Null
+Start-Sleep -Milliseconds 500
+
+$z4 = Query -Target $SESSION -Fmt '#{window_zoomed_flag}'
+$a4 = Query -Target $SESSION -Fmt '#{pane_index}'
+Write-Info "  Before nav: zoomed=$z4, active_pane=$a4"
+
+# Try to move left — no pane there, zoom should stay
+Psmux select-pane -L -t $SESSION | Out-Null
+Start-Sleep -Milliseconds 500
+
+$z4after = Query -Target $SESSION -Fmt '#{window_zoomed_flag}'
+$a4after = Query -Target $SESSION -Fmt '#{pane_index}'
+Write-Info "  After select-pane -L: zoomed=$z4after, active_pane=$a4after"
+
+if ($z4after -match "1" -and $a4after -eq $a4) {
+    Write-Pass "Zoom preserved when no pane in that direction (tmux parity)"
+} else {
+    Write-Fail "Zoom was cancelled on no-op navigation (tmux: should stay zoomed)"
+}
+
+# Clean up: unzoom
+Psmux resize-pane -Z -t $SESSION | Out-Null
+Start-Sleep -Milliseconds 300
+
+# ============================================================
 # CLEANUP
 # ============================================================
 Write-Host ""
