@@ -37,6 +37,9 @@ pub struct Pane {
     /// When true, the child's console input has VTI set, meaning VT mouse
     /// sequences can be delivered.  Refreshed every 2 seconds.
     pub vti_mode_cache: Option<(Instant, bool)>,
+    /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
+    /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
+    pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,

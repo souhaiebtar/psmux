@@ -110,7 +110,7 @@ If you've used tmux on Linux/macOS and wished you had something like it on Windo
 | Zero dependencies | ✅ | ✅ | ❌ (needs WSL) |
 | Scriptable (76 commands) | ✅ | ❌ | ✅ |
 
-![psmux in action - monitoring system info](psmux_sysinfo.gif)
+![psmux in action](demo.gif)
 
 Split panes, multiple windows, session persistence, 76 commands, full mouse, tmux themes, 126+ format variables, 53 vim copy-mode keys. Full details: **[docs/features.md](docs/features.md)**
 

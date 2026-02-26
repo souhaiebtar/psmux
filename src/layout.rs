@@ -52,6 +52,8 @@ pub enum LayoutJson {
         cursor_col: u16,
         #[serde(default)]
         alternate_screen: bool,
+        #[serde(default)]
+        cursor_shape: u8,
         active: bool,
         copy_mode: bool,
         scroll_offset: usize,
@@ -99,6 +101,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     return LayoutJson::Leaf {
                         id: p.id, rows: p.last_rows, cols: p.last_cols,
                         cursor_row: 0, cursor_col: 0, alternate_screen: false,
+                        cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                         active: *cur_path == active_path, copy_mode: false,
                         scroll_offset: 0,
                         sel_start_row: None, sel_start_col: None,
@@ -253,6 +256,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     cursor_row: cr,
                     cursor_col: cc,
                     alternate_screen,
+                    cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                     active: false,
                     copy_mode: false,
                     scroll_offset: 0,

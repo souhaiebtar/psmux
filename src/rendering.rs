@@ -53,13 +53,17 @@ pub fn dim_predictions_enabled() -> bool {
 // ─── Cursor ─────────────────────────────────────────────────────────────────
 
 pub fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {
-    let style = env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "bar".to_string());
+    let style = env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "default".to_string());
     let blink = env::var("PSMUX_CURSOR_BLINK").unwrap_or_else(|_| "1".to_string()) != "0";
     let code = match style.as_str() {
         "block" => if blink { 1 } else { 2 },
         "underline" => if blink { 3 } else { 4 },
         "bar" | "beam" => if blink { 5 } else { 6 },
-        _ => if blink { 5 } else { 6 },
+        // "default" or anything else: send \x1b[0 q to reset cursor to
+        // the terminal emulator's configured shape.  This lets child apps
+        // (e.g. Claude) that set their own cursor via DECSCUSR look correct
+        // because ConPTY forwards DECSCUSR to the hosting terminal directly.
+        _ => 0,
     };
     execute!(out, Print(format!("\x1b[{} q", code)))?;
     Ok(())

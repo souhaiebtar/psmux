@@ -716,8 +716,10 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let cs_writer = cursor_shape.clone();
     
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer);
     
     let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -727,6 +729,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.child = child;
     pane.term = term;
     pane.data_version = data_version;
+    pane.cursor_shape = cursor_shape;
     pane.child_pid = None;
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;

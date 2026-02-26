@@ -569,6 +569,29 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
         })?;
 
+        // Forward active pane's cursor shape (DECSCUSR) to the real terminal.
+        // Write directly to stdout (not through ratatui backend) to avoid
+        // any buffering interference with the next draw cycle.
+        {
+            let win = &app.windows[app.active_idx];
+            if let Some(pane) = crate::tree::active_pane(&win.root, &win.active_path) {
+                let shape = pane.cursor_shape.load(std::sync::atomic::Ordering::Relaxed);
+                if shape >= 1 && shape <= 6 {
+                    use crossterm::cursor::SetCursorStyle;
+                    let style = match shape {
+                        1 => SetCursorStyle::BlinkingBlock,
+                        2 => SetCursorStyle::SteadyBlock,
+                        3 => SetCursorStyle::BlinkingUnderScore,
+                        4 => SetCursorStyle::SteadyUnderScore,
+                        5 => SetCursorStyle::BlinkingBar,
+                        6 => SetCursorStyle::SteadyBar,
+                        _ => SetCursorStyle::DefaultUserShape,
+                    };
+                    let _ = crossterm::execute!(std::io::stdout(), style);
+                }
+            }
+        }
+
         if let Mode::PaneChooser { opened_at } = &app.mode {
             if opened_at.elapsed() > Duration::from_millis(1500) { app.mode = Mode::Passthrough; }
         }

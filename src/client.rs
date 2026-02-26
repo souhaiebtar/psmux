@@ -1401,6 +1401,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         cursor_row,
                         cursor_col,
                         alternate_screen,
+                        cursor_shape: _,
                         active,
                         copy_mode,
                         scroll_offset,
@@ -1960,6 +1961,34 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 f.render_widget(para, overlay.inner(oa));
             }
         })?;
+
+        // Forward active pane's cursor shape (DECSCUSR) to the real terminal
+        {
+            fn find_active_cursor_shape(node: &LayoutJson) -> Option<u8> {
+                match node {
+                    LayoutJson::Leaf { active, cursor_shape, .. } => {
+                        if *active && *cursor_shape > 0 && *cursor_shape <= 6 { Some(*cursor_shape) } else { None }
+                    }
+                    LayoutJson::Split { children, .. } => {
+                        children.iter().find_map(find_active_cursor_shape)
+                    }
+                }
+            }
+            if let Some(shape) = find_active_cursor_shape(&root) {
+                use crossterm::cursor::SetCursorStyle;
+                let style = match shape {
+                    1 => SetCursorStyle::BlinkingBlock,
+                    2 => SetCursorStyle::SteadyBlock,
+                    3 => SetCursorStyle::BlinkingUnderScore,
+                    4 => SetCursorStyle::SteadyUnderScore,
+                    5 => SetCursorStyle::BlinkingBar,
+                    6 => SetCursorStyle::SteadyBar,
+                    _ => SetCursorStyle::DefaultUserShape,
+                };
+                let _ = crossterm::execute!(std::io::stdout(), style);
+            }
+        }
+
         let _render_us = _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128);
         last_dump_time = Instant::now();
         // Latency log: measure full cycle from key-send to render-complete
