@@ -38,6 +38,8 @@ psmux is a **native Windows terminal multiplexer** built from the ground up in R
 
 > 💡 **Tip:** psmux ships with `tmux` and `pmux` aliases. Just type `tmux` and it works!
 
+![psmux in action](demo.gif)
+
 ## Installation
 
 ### Using WinGet
@@ -109,8 +111,6 @@ If you've used tmux on Linux/macOS and wished you had something like it on Windo
 | Full mouse support | ✅ | ✅ | ⚠️ Partial |
 | Zero dependencies | ✅ | ✅ | ❌ (needs WSL) |
 | Scriptable (76 commands) | ✅ | ❌ | ✅ |
-
-![psmux in action](demo.gif)
 
 Split panes, multiple windows, session persistence, 76 commands, full mouse, tmux themes, 126+ format variables, 53 vim copy-mode keys. Full details: **[docs/features.md](docs/features.md)**
 
