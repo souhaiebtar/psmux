@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use portable_pty::native_pty_system;
 use ratatui::prelude::*;
 
-use crate::types::{AppState, Mode, FocusDir, LayoutKind, DragState, Node};
+use crate::types::{AppState, Mode, FocusDir, LayoutKind, DragState, Node, Pane};
 use crate::tree::{active_pane, active_pane_mut, compute_rects, compute_split_borders,
     split_sizes_at, adjust_split_sizes, path_exists, resize_all_panes};
 use crate::pane::{create_window, split_active};
@@ -1157,6 +1157,44 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
     (col, row)
 }
 
+/// Forward a mouse event to the child pane.
+///
+/// If the child has mouse protocol enabled (TUI app running), write VT mouse
+/// sequences directly to the ConPTY input pipe (pane.writer).  Modern TUI
+/// apps (crossterm, etc.) use VT input mode (ReadFile + ENABLE_VIRTUAL_TERMINAL_INPUT)
+/// and receive these directly through stdin.  If VT input mode is off, ConPTY
+/// parses the VT and converts to MOUSE_EVENT records for ReadConsoleInputW apps.
+///
+/// When mouse protocol is NOT enabled (shell prompt), use Win32 MOUSE_EVENT
+/// injection as a harmless fallback (most programs ignore it).
+fn forward_mouse_to_pane(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16, button_state: u32, event_flags: u32) {
+    forward_mouse_to_pane_ex(pane, area, abs_x, abs_y, button_state, event_flags, 0xff, false);
+}
+
+/// Extended version that also carries the VT button code and press flag for
+/// generating accurate VT mouse sequences.
+fn forward_mouse_to_pane_ex(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16,
+                             button_state: u32, event_flags: u32,
+                             _vt_button: u8, _press: bool) {
+    let col = abs_x as i16 - area.x as i16;
+    let row = abs_y as i16 - area.y as i16;
+
+    // Native ConPTY child — always use Win32 MOUSE_EVENT injection.
+    // All native Windows console apps that want mouse use ReadConsoleInputW
+    // with ENABLE_MOUSE_INPUT — they read MOUSE_EVENT records directly.
+    // VT SGR mouse via pane.writer doesn't work reliably: ConPTY apps
+    // read INPUT_RECORDs, not raw VT from stdin.  VTI (ENABLE_VIRTUAL_
+    // TERMINAL_INPUT) is NOT a mouse indicator — it only means the app
+    // parses VT keyboard input.  Node.js enables VTI after user types,
+    // which would then cause SGR mouse garbage.
+    if pane.child_pid.is_none() {
+        pane.child_pid = crate::platform::mouse_inject::get_child_pid(&*pane.child);
+    }
+    if let Some(pid) = pane.child_pid {
+        crate::platform::mouse_inject::send_mouse_event(pid, col, row, button_state, event_flags, true);
+    }
+}
+
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
     use crossterm::event::{MouseEventKind, MouseButton};
 
@@ -1263,47 +1301,35 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 }
             }
 
-            // Forward left-click to child pane
+            // Forward left-click to child pane.
             if !on_border {
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let col = me.column.saturating_sub(area.x + 1) as i16;
-                        let row = me.row.saturating_sub(area.y + 1) as i16;
-                        // Check if child has requested VT mouse protocol
-                        let (mode, enc) = {
-                            if let Ok(parser) = active.term.lock() {
-                                let s = parser.screen();
-                                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
-                            } else {
-                                (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
-                            }
-                        };
-                        if mode != vt100::MouseProtocolMode::None {
-                            let vt_col = (col + 1).max(1) as u16;
-                            let vt_row = (row + 1).max(1) as u16;
-                            write_mouse_event(&mut active.writer, 0, vt_col, vt_row, true, enc);
-                        } else {
-                            if active.child_pid.is_none() {
-                                active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
-                            }
-                            if let Some(pid) = active.child_pid {
-                                crate::platform::mouse_inject::send_mouse_event(
-                                    pid, col, row,
-                                    crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
-                                    true,
-                                );
-                            }
-                        }
+                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                            crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
+                            0, true); // SGR button 0 = left, press
                     }
                 }
             }
 
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            // Right-click not forwarded - reserved for psmux context menu
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                        crate::platform::mouse_inject::RIGHTMOST_BUTTON_PRESSED, 0,
+                        2, true); // SGR button 2 = right, press
+                }
+            }
         }
         MouseEventKind::Down(MouseButton::Middle) => {
-            // Middle-click not forwarded - reserved for paste
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                        crate::platform::mouse_inject::FROM_LEFT_2ND_BUTTON_PRESSED, 0,
+                        1, true); // SGR button 1 = middle, press
+                }
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             let was_dragging = app.drag.is_some();
@@ -1311,66 +1337,38 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             if was_dragging {
                 resize_all_panes(app);
             } else if let Some(area) = active_area {
-                // Forward mouse release
                 if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    let col = me.column.saturating_sub(area.x + 1) as i16;
-                    let row = me.row.saturating_sub(area.y + 1) as i16;
-                    let (mode, enc) = {
-                        if let Ok(parser) = active.term.lock() {
-                            let s = parser.screen();
-                            (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
-                        } else {
-                            (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
-                        }
-                    };
-                    if mode != vt100::MouseProtocolMode::None {
-                        let vt_col = (col + 1).max(1) as u16;
-                        let vt_row = (row + 1).max(1) as u16;
-                        write_mouse_event(&mut active.writer, 0, vt_col, vt_row, false, enc);
-                    } else if let Some(pid) = active.child_pid {
-                        crate::platform::mouse_inject::send_mouse_event(pid, col, row, 0, 0, true);
-                    }
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
+                        0, false); // SGR button 0 = left, release
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Right) => {
-            // Not forwarded
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
+                        2, false); // SGR button 2 = right, release
+                }
+            }
         }
         MouseEventKind::Up(MouseButton::Middle) => {
-            // Not forwarded
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
+                        1, false); // SGR button 1 = middle, release
+                }
+            }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
             } else {
-                // Forward drag to child pane
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let col = me.column.saturating_sub(area.x + 1) as i16;
-                        let row = me.row.saturating_sub(area.y + 1) as i16;
-                        let (mode, enc) = {
-                            if let Ok(parser) = active.term.lock() {
-                                let s = parser.screen();
-                                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
-                            } else {
-                                (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
-                            }
-                        };
-                        if mode != vt100::MouseProtocolMode::None {
-                            let vt_col = (col + 1).max(1) as u16;
-                            let vt_row = (row + 1).max(1) as u16;
-                            // button 0 + 32 = drag modifier
-                            write_mouse_event(&mut active.writer, 32, vt_col, vt_row, true, enc);
-                        } else {
-                            if let Some(pid) = active.child_pid {
-                                crate::platform::mouse_inject::send_mouse_event(
-                                    pid, col, row,
-                                    crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
-                                    crate::platform::mouse_inject::MOUSE_MOVED,
-                                    true,
-                                );
-                            }
-                        }
+                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                            crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
+                            crate::platform::mouse_inject::MOUSE_MOVED,
+                            32, true); // SGR button 32 = left-drag
                     }
                 }
             }
@@ -1388,9 +1386,14 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 win.active_path = path.clone();
                 active_area = Some(*area);
             }
-            let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let _ = write!(active.writer, "\x1b[<64;{};{}M", col, row);
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let wheel_delta: i16 = 120;
+                    let button_state = ((wheel_delta as i32) << 16) as u32;
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                        button_state, crate::platform::mouse_inject::MOUSE_WHEELED,
+                        64, true); // SGR button 64 = scroll-up
+                }
             }
         }
         MouseEventKind::ScrollDown => {
@@ -1402,9 +1405,14 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 win.active_path = path.clone();
                 active_area = Some(*area);
             }
-            let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let _ = write!(active.writer, "\x1b[<65;{};{}M", col, row);
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let wheel_delta: i16 = -120;
+                    let button_state = ((wheel_delta as i32) << 16) as u32;
+                    forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                        button_state, crate::platform::mouse_inject::MOUSE_WHEELED,
+                        65, true); // SGR button 65 = scroll-down
+                }
             }
         }
         _ => {}

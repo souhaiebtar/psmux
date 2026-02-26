@@ -326,7 +326,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     if p.last_title_check.elapsed().as_millis() < 1000 { continue; }
                                     p.last_title_check = std::time::Instant::now();
                                     if p.child_pid.is_none() {
-                                        p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
+                                        p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                     }
                                     let new_name = if let Some(pid) = p.child_pid {
                                         crate::platform::process_info::get_foreground_process_name(pid)
@@ -1647,6 +1647,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                                 let pair = pty_sys.openpty(pty_size).ok()?;
                                 let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                                if let Ok(dir) = std::env::current_dir() { cmd_builder.cwd(dir); }
                                 if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &command]); } else { cmd_builder.args(["-c", &command]); }
                                 let child = pair.slave.spawn_command(cmd_builder).ok()?;
                                 // Close the slave handle immediately – required for ConPTY.

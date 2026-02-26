@@ -102,11 +102,11 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     spawn_reader_thread(reader, term_reader, dv_writer);
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, vti_mode_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -150,11 +150,11 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
 
     spawn_reader_thread(reader, term_reader, dv_writer);
 
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, vti_mode_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -251,11 +251,11 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
     spawn_reader_thread(reader, term_reader, dv_writer);
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, vti_mode_cache: None, copy_state: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -296,12 +296,17 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
 }
 
 pub fn build_command(command: Option<&str>) -> CommandBuilder {
+    // Capture CWD early — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder, so we must set it
+    // explicitly to honour the caller's working directory.
+    let cwd = std::env::current_dir().ok();
     if let Some(cmd) = command {
         let shell = cached_shell().map(|s| s.to_string());
         
         match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -315,6 +320,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             }
             None => {
                 let mut builder = CommandBuilder::new("pwsh.exe");
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -337,6 +343,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
         match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -347,6 +354,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             }
             None => {
                 let mut builder = CommandBuilder::new("pwsh.exe");
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -390,6 +398,9 @@ pub fn build_default_shell(shell_path: &str) -> CommandBuilder {
 
     let lower = resolved.to_lowercase();
     let mut builder = CommandBuilder::new(&resolved);
+    // Set CWD explicitly — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder.
+    if let Ok(dir) = std::env::current_dir() { builder.cwd(dir); }
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.env("PSMUX_SESSION", "1");
@@ -423,6 +434,9 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
     }
     let program = &raw_args[0];
     let mut builder = CommandBuilder::new(program);
+    // Set CWD explicitly — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder.
+    if let Ok(dir) = std::env::current_dir() { builder.cwd(dir); }
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.env("PSMUX_SESSION", "1");

@@ -530,6 +530,7 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                         let pair = pty_sys.openpty(pty_size).ok()?;
                         let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                        if let Ok(dir) = std::env::current_dir() { cmd_builder.cwd(dir); }
                         if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &rest]); } else { cmd_builder.args(["-c", &rest]); }
                         let child = pair.slave.spawn_command(cmd_builder).ok()?;
                         // Close the slave handle immediately – required for ConPTY.

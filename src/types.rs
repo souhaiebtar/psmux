@@ -33,6 +33,10 @@ pub struct Pane {
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
+    /// Cached ENABLE_VIRTUAL_TERMINAL_INPUT query result (for mouse injection).
+    /// When true, the child's console input has VTI set, meaning VT mouse
+    /// sequences can be delivered.  Refreshed every 2 seconds.
+    pub vti_mode_cache: Option<(Instant, bool)>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,

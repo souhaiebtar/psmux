@@ -266,30 +266,97 @@ pub mod mouse_inject {
     const ENABLE_MOUSE_INPUT: u32         = 0x0010;
     const ENABLE_EXTENDED_FLAGS: u32      = 0x0080;
     const ENABLE_QUICK_EDIT_MODE: u32     = 0x0040;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 
     #[inline]
-    fn debug_log(_msg: &str) {
-        // Debug logging disabled for performance.
-        // To re-enable: write to $TEMP/psmux_mouse_debug.log
+    fn debug_log(msg: &str) {
+        // Write to mouse_debug.log when PSMUX_MOUSE_DEBUG=1 is set.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CHECKED: AtomicBool = AtomicBool::new(false);
+        static ENABLED: AtomicBool = AtomicBool::new(false);
+
+        if !CHECKED.swap(true, Ordering::Relaxed) {
+            let on = std::env::var("PSMUX_MOUSE_DEBUG").map_or(false, |v| v == "1" || v == "true");
+            ENABLED.store(on, Ordering::Relaxed);
+        }
+        if !ENABLED.load(Ordering::Relaxed) { return; }
+
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+        let path = format!("{}/.psmux/mouse_debug.log", home);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[platform] {}", msg);
+        }
     }
 
     /// Extract the process ID from a portable_pty::Child trait object.
     ///
-    /// SAFETY: On Windows with ConPTY (portable_pty 0.2), the concrete type behind
-    /// `dyn Child` is `WinChild { proc: OwnedHandle }` where OwnedHandle wraps a
-    /// single Windows HANDLE. We read the HANDLE and call GetProcessId.
-    pub unsafe fn get_child_pid(child: &dyn portable_pty::Child) -> Option<u32> {
-        let data_ptr = child as *const dyn portable_pty::Child as *const u8;
-        let handle = *(data_ptr as *const isize);
-        debug_log(&format!("get_child_pid: data_ptr={:p} handle=0x{:X}", data_ptr, handle));
-        if handle == 0 || handle == -1 {
-            debug_log("get_child_pid: INVALID handle");
-            return None;
+    /// Uses the `Child::process_id()` trait method provided by portable-pty 0.9+.
+    pub fn get_child_pid(child: &dyn portable_pty::Child) -> Option<u32> {
+        child.process_id()
+    }
+
+    /// Query whether the child process's console input has
+    /// ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200) set.
+    ///
+    /// When this flag is ON, the process uses VT-based input processing
+    /// (crossterm, ratatui apps).  VT mouse sequences written to the ConPTY
+    /// input pipe are passed through as KEY_EVENT records, and the app's VT
+    /// parser handles them.  If the flag is OFF (e.g. Node.js libuv raw mode
+    /// which sets only ENABLE_WINDOW_INPUT), VT mouse sequences should NOT
+    /// be written because the app cannot parse them and they appear as garbage.
+    pub fn query_vti_enabled(child_pid: u32) -> Option<bool> {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                debug_log(&format!("query_vti_enabled: AttachConsole({}) FAILED", child_pid));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                debug_log("query_vti_enabled: CreateFileW(CONIN$) FAILED");
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+            }
+            let mut mode: u32 = 0;
+            let ok = GetConsoleMode(handle as *mut c_void, &mut mode);
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+
+            if ok == 0 {
+                debug_log("query_vti_enabled: GetConsoleMode FAILED");
+                return None;
+            }
+
+            let vti = (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0;
+            debug_log(&format!("query_vti_enabled: pid={} mode=0x{:04X} VTI={}", child_pid, mode, vti));
+            Some(vti)
         }
-        let pid = GetProcessId(handle);
-        let err = GetLastError();
-        debug_log(&format!("get_child_pid: GetProcessId(0x{:X}) => pid={} err={}", handle, pid, err));
-        if pid == 0 { None } else { Some(pid) }
     }
 
     /// Inject a mouse event into a child process's console input buffer.
@@ -536,9 +603,10 @@ pub mod mouse_inject {
 
 #[cfg(not(windows))]
 pub mod mouse_inject {
-    pub unsafe fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
+    pub fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
     pub fn send_mouse_event(_pid: u32, _col: i16, _row: i16, _btn: u32, _flags: u32, _reattach: bool) -> bool { false }
     pub fn send_vt_sequence(_pid: u32, _sequence: &[u8]) -> bool { false }
+    pub fn query_vti_enabled(_pid: u32) -> Option<bool> { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +702,7 @@ pub mod process_kill {
     /// This mirrors how tmux on Linux sends SIGKILL to the pane's process group.
     pub fn kill_process_tree(child: &mut Box<dyn portable_pty::Child>) {
         // Try to get the PID
-        let pid = unsafe { super::mouse_inject::get_child_pid(child.as_ref()) };
+        let pid = super::mouse_inject::get_child_pid(child.as_ref());
 
         if let Some(root_pid) = pid {
             // Collect all descendants, kill them leaf-first (reverse order)

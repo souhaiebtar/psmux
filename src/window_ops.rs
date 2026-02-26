@@ -51,7 +51,7 @@ fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
 }
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
-fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+pub fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
@@ -76,7 +76,7 @@ fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u1
 /// that ReadConsoleInput returns.  This works for apps like pstop, Far Manager, etc.
 fn inject_mouse(pane: &mut Pane, col: i16, row: i16, button_state: u32, event_flags: u32) -> bool {
     if pane.child_pid.is_none() {
-        pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
     }
     if let Some(pid) = pane.child_pid {
         mouse_inject::send_mouse_event(pid, col, row, button_state, event_flags, false)
@@ -92,16 +92,6 @@ fn is_vt_bridge(name: &str) -> bool {
     lower.contains("wsl") || lower.contains("ssh")
 }
 
-/// Query the pane's vt100 parser for the child's mouse protocol mode and encoding.
-fn pane_mouse_protocol(pane: &Pane) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
-    if let Ok(parser) = pane.term.lock() {
-        let s = parser.screen();
-        (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
-    } else {
-        (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
-    }
-}
-
 /// Check if the pane is likely running a fullscreen TUI app (htop, vim, etc.)
 /// by detecting alternate screen buffer usage.
 ///
@@ -109,7 +99,7 @@ fn pane_mouse_protocol(pane: &Pane) -> (vt100::MouseProtocolMode, vt100::MousePr
 /// so `screen.alternate_screen()` is always false.  Use the same heuristic
 /// as layout.rs: if the last row of the screen has non-blank content, the
 /// pane is running a fullscreen app.
-fn is_fullscreen_tui(pane: &Pane) -> bool {
+pub(crate) fn is_fullscreen_tui(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
         let screen = parser.screen();
         // Fast check: if the parser reports alternate screen, trust it
@@ -163,7 +153,7 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
     }
     // Ensure child_pid is resolved
     if pane.child_pid.is_none() {
-        pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
     }
     let result = if let Some(pid) = pane.child_pid {
         crate::platform::process_info::has_vt_bridge_descendant(pid)
@@ -177,9 +167,8 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
 /// Inject a mouse event into a pane using the best available method.
 ///
 /// Strategy:
-///   1. If the vt100 parser detected mouse protocol (child sent DECSET 1000h),
-///      use VT injection with the child's requested encoding.
-///   2. If the process tree contains a VT bridge (wsl.exe, ssh.exe, etc.)
+///
+///   1. If the process tree contains a VT bridge (wsl.exe, ssh.exe, etc.)
 ///      AND a fullscreen TUI app is running (alternate screen buffer active),
 ///      inject SGR mouse as KEY_EVENT records via WriteConsoleInputW.
 ///      This bypasses ConPTY entirely — the raw escape sequence characters
@@ -187,37 +176,16 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
 ///      When not in fullscreen mode (bash prompt), skip VT injection to
 ///      prevent garbage characters.  Fall back to Win32 MOUSE_EVENT which
 ///      is harmlessly ignored by wsl.exe.
-///   3. Otherwise (native console apps like pstop), use Win32 console injection
-///      which directly writes MOUSE_EVENT records to the console input buffer.
-fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
+///   2. For native ConPTY children: always inject Win32 MOUSE_EVENT records
+///      via WriteConsoleInputW.  Crossterm/ratatui apps read MOUSE_EVENT
+///      records through ReadConsoleInputW (they enable ENABLE_MOUSE_INPUT).
+///      Node.js/Ink apps (claude) and shells ignore MOUSE_EVENT — harmless.
+///      NOTE: ENABLE_VIRTUAL_TERMINAL_INPUT is NOT a reliable indicator of
+///      mouse support — it only means the app parses VT keyboard input
+///      (arrow keys, function keys).  Node.js enables VTI after the user
+///      starts typing, but never enables mouse tracking.
+pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
                           button_state: u32, event_flags: u32, win_name: &str) {
-    // Read mouse protocol mode under parser lock and write VT sequence
-    // atomically to prevent TOCTOU race where the child disables mouse
-    // between the check and the write (which would cause escape sequences
-    // to appear as visible text in the pane).
-    let vt_injected = if let Ok(parser) = pane.term.lock() {
-        let s = parser.screen();
-        let mode = s.mouse_protocol_mode();
-        let enc = s.mouse_protocol_encoding();
-        if mode != vt100::MouseProtocolMode::None {
-            let vt_col = (col + 1).max(1) as u16;
-            let vt_row = (row + 1).max(1) as u16;
-            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} mode={:?} enc={:?} -> VT injection",
-                col, row, vt_button, press, win_name, mode, enc));
-            // Hold parser lock during write to prevent reader thread from
-            // updating mode while we're mid-write.
-            drop(parser); // release lock before PTY write to avoid deadlock
-            write_mouse_event_remote(&mut pane.writer, vt_button, vt_col, vt_row, press, enc);
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if vt_injected { return; }
-
     let vt_bridge = detect_vt_bridge(pane);
 
     if vt_bridge {
@@ -235,7 +203,7 @@ fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, pre
             let sgr_seq = format!("\x1b[<{};{};{}{}", vt_button, vt_col, vt_row, ch);
             mouse_log(&format!("  -> Console VT injection (KEY_EVENTs): seq={:?}", sgr_seq));
             if pane.child_pid.is_none() {
-                pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+                pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
             }
             if let Some(pid) = pane.child_pid {
                 let ok = mouse_inject::send_vt_sequence(pid, sgr_seq.as_bytes());
@@ -250,8 +218,21 @@ fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, pre
             mouse_log(&format!("  -> Win32 inject result: {}", ok));
         }
     } else {
-        // Native console app — Win32 console injection only
-        mouse_log(&format!("inject_mouse_combined: col={} row={} win={} -> Win32 native", col, row, win_name));
+        // Native ConPTY child — always use Win32 MOUSE_EVENT injection.
+        //
+        // All native Windows console apps that want mouse input use
+        // ReadConsoleInputW with ENABLE_MOUSE_INPUT — they read MOUSE_EVENT
+        // records directly.  This includes crossterm/ratatui (pstop) and
+        // Node.js/Ink (claude).  VT SGR mouse sequences written to the ConPTY
+        // input pipe would only work if the app reads raw VT from stdin,
+        // but native ConPTY apps read INPUT_RECORDs instead.
+        //
+        // NOTE: We previously tried using ENABLE_VIRTUAL_TERMINAL_INPUT (VTI)
+        // as a heuristic for mouse support, but VTI only indicates VT keyboard
+        // input parsing — Node.js enables VTI after the user types, then
+        // SGR mouse sequences appear as garbage.
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} -> Win32 MOUSE_EVENT (native ConPTY)",
+            col, row, vt_button, press, win_name));
         let ok = inject_mouse(pane, col, row, button_state, event_flags);
         mouse_log(&format!("  -> Win32 inject result: {}", ok));
     }
@@ -747,6 +728,8 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.term = term;
     pane.data_version = data_version;
     pane.child_pid = None;
+    pane.vt_bridge_cache = None;
+    pane.vti_mode_cache = None;
     pane.dead = false;
     
     Ok(())

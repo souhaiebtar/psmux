@@ -11,7 +11,7 @@ use crate::layout::LayoutJson;
 use crate::help;
 use crate::util::{WinTree, base64_encode};
 use crate::session::read_session_key;
-use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect};
+use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
@@ -116,6 +116,16 @@ fn extract_selection_text(
     }
 
     result
+}
+
+/// Check if the active pane is running a fullscreen TUI app (alternate screen).
+/// Used to decide whether right-click should paste (shell prompt) or forward
+/// as a mouse event to the child (TUI app like htop, Claude Code, etc.).
+fn active_pane_in_alt_screen(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Leaf { active, alternate_screen, .. } => *active && *alternate_screen,
+        LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_alt_screen(c)),
+    }
 }
 
 /// Check if screen coordinates (x, y) fall on a separator line in the layout.
@@ -1015,10 +1025,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 }
                             }
                             MouseEventKind::Down(MouseButton::Right) => {
-                                // pwsh-style: right-click with active selection → copy + clear
-                                // right-click without selection → paste from clipboard
-                                if rsel_start.is_some() && rsel_dragged {
-                                    // Copy selection to clipboard and clear it
+                                // Check if active pane is running a TUI app (alternate screen).
+                                // TUI apps (htop, Claude Code, etc.) expect right-click as a
+                                // mouse event, NOT clipboard paste.
+                                let tui_active = if !prev_dump_buf.is_empty() {
+                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                        .map(|s| active_pane_in_alt_screen(&s.layout))
+                                        .unwrap_or(false)
+                                } else { false };
+
+                                if tui_active {
+                                    // Forward right-click to server → inject_mouse_combined
+                                    // handles Win32 MOUSE_EVENT injection to ConPTY.
+                                    cmd_batch.push(format!("mouse-down-right {} {}\n", me.column, me.row));
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                } else if rsel_start.is_some() && rsel_dragged {
+                                    // pwsh-style: right-click with active selection → copy + clear
                                     if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
                                         if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
                                             let text = extract_selection_text(
@@ -1037,7 +1061,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     rsel_dragged = false;
                                     selection_changed = true;
                                 } else {
-                                    // No selection — paste from clipboard
+                                    // No selection, no TUI — paste from clipboard (pwsh-style)
                                     rsel_start = None;
                                     rsel_end = None;
                                     selection_changed = true;
@@ -1649,6 +1673,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
 
             let active_rect = compute_active_rect_json(&root, content_chunk);
             render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, active_rect, &mode_style_str);
+            fix_border_intersections(f.buffer_mut());
 
             // ── Left-click drag text selection overlay ────────────────
             if let (Some(s), Some(e)) = (sel_s, sel_e) {
