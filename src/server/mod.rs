@@ -122,6 +122,33 @@ fn spawn_warm_server(app: &AppState) {
     }
 }
 
+fn compute_effective_client_size(app: &AppState) -> Option<(u16, u16)> {
+    if app.client_sizes.is_empty() {
+        return None;
+    }
+    match app.window_size.as_str() {
+        "smallest" => Some((
+            app.client_sizes.values().map(|s| s.0).min().unwrap(),
+            app.client_sizes.values().map(|s| s.1).min().unwrap(),
+        )),
+        "largest" => Some((
+            app.client_sizes.values().map(|s| s.0).max().unwrap(),
+            app.client_sizes.values().map(|s| s.1).max().unwrap(),
+        )),
+        _ => {
+            if let Some(cid) = app.latest_client_id {
+                if let Some(&size) = app.client_sizes.get(&cid) {
+                    return Some(size);
+                }
+            }
+            Some((
+                app.client_sizes.values().map(|s| s.0).min().unwrap(),
+                app.client_sizes.values().map(|s| s.1).min().unwrap(),
+            ))
+        }
+    }
+}
+
 pub fn run_server(
     session_name: String,
     socket_name: Option<String>,
@@ -797,12 +824,26 @@ pub fn run_server(
                             );
                             let _ = resp.send(line);
                         }
-                        CtrlReq::ClientAttach => {
+                        CtrlReq::ClientAttach(cid) => {
                             app.attached_clients = app.attached_clients.saturating_add(1);
+                            app.latest_client_id = Some(cid);
                             hook_event = Some("client-attached");
                         }
-                        CtrlReq::ClientDetach => {
+                        CtrlReq::ClientDetach(cid) => {
                             app.attached_clients = app.attached_clients.saturating_sub(1);
+                            app.client_sizes.remove(&cid);
+                            if app.latest_client_id == Some(cid) {
+                                app.latest_client_id = None;
+                            }
+                            if let Some((w, h)) = compute_effective_client_size(&app) {
+                                app.last_window_area = Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: w,
+                                    height: h,
+                                };
+                                resize_all_panes(&mut app);
+                            }
                             hook_event = Some("client-detached");
                             if app.attached_clients == 0 && app.destroy_unattached {
                                 // 仅在没有可用 pane 时才跟随最后客户端 detach 退出；
@@ -1068,12 +1109,15 @@ pub fn run_server(
                                 _ => crate::types::SelectionMode::Rect,
                             };
                         }
-                        CtrlReq::ClientSize(w, h) => {
+                        CtrlReq::ClientSize(cid, w, h) => {
+                            app.client_sizes.insert(cid, (w, h));
+                            app.latest_client_id = Some(cid);
+                            let (ew, eh) = compute_effective_client_size(&app).unwrap_or((w, h));
                             app.last_window_area = Rect {
                                 x: 0,
                                 y: 0,
-                                width: w,
-                                height: h,
+                                width: ew,
+                                height: eh,
                             };
                             resize_all_panes(&mut app);
                             // Respawn warm pane at the new terminal dimensions so
@@ -1083,7 +1127,7 @@ pub fn run_server(
                             let need_respawn = app
                                 .warm_pane
                                 .as_ref()
-                                .map_or(true, |wp| wp.rows != h || wp.cols != w);
+                                .map_or(true, |wp| wp.rows != eh || wp.cols != ew);
                             if need_respawn {
                                 if let Some(mut old) = app.warm_pane.take() {
                                     old.child.kill().ok();
